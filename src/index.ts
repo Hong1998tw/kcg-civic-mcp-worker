@@ -296,7 +296,7 @@ async function buildCivicEnvelope<T>(
   provenance: {
     source_id: string;
     source_url: string;
-    source_type: "ckan" | "openapi" | "rss" | "crawler";
+    source_type: "ckan" | "openapi" | "rss" | "crawler" | "csv" | "r2";
     agency: string;
     published_at?: string;
   },
@@ -1404,8 +1404,13 @@ async function executeCivicTool(
               summary,
               {
                 source_id: "kcg_budget_summary",
-                source_url: resourceUrl,
-                source_type: "openapi",
+                source_url: resourceResult.sourceUrl,
+                source_type:
+                  resourceResult.format === "json"
+                    ? "openapi"
+                    : resourceResult.sourceUrl.startsWith("r2://")
+                      ? "r2"
+                      : "csv",
                 agency: "高雄市政府主計處",
               },
               {
