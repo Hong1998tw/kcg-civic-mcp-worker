@@ -6,7 +6,7 @@
 - **資料容錯**：官方端點 ➔ 官方下載資源 ➔ Cloudflare R2 災備，並具備 `provenance` 審計追溯；demo snapshot 必須明確開啟，不會被冒充為官方全集。
 
 ## 2. 議會模組升級：ASP.NET WebForms 動態即時請求
-針對高雄市議會資訊系統（`cissearch.kcc.gov.tw`）的動態特性，後續架構將由「靜態 R2 快照」轉型為「即時動態請求鏈」：
+針對高雄市議會資訊系統（`cissearch.kcc.gov.tw`）的動態特性，目前採「即時動態請求鏈」，並以 R2 儲存議事錄文字層快取：
 1. **GET Token**：無狀態取得動態 `__VIEWSTATE` 與 `__EVENTVALIDATION`。
 2. **POST Query**：將屆次、會期與關鍵字送出，解析出核心識別碼 `ProposalSN`。
 3. **Detail & Attachments**：透過 `ProposalSN` 串接詳細頁路由與 `GetAttachmentList.ashx` 取得附件清單。
