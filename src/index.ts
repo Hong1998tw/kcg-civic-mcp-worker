@@ -31,7 +31,7 @@ function checkAuthorized(request: Request, env: Env): boolean {
   const validSecrets = [env.MCP_ACCESS_KEY, env.AUTH_TOKEN].filter(Boolean);
   if (validSecrets.length === 0) {
     const host = new URL(request.url).hostname;
-    return isLocalHost(host) && (env.MCP_ALLOW_ANONYMOUS === undefined || isTruthy(env.MCP_ALLOW_ANONYMOUS));
+    return isLocalHost(host) && isTruthy(env.MCP_ALLOW_ANONYMOUS);
   }
 
   const url = new URL(request.url);
