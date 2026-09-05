@@ -48,6 +48,187 @@ const RSS_CHANNELS: Record<string, string> = {
  * 共用工具
  * ========================================================= */
 
+
+/* =========================================================
+ * 高雄市官方 Resource 取得器
+ *
+ * 優先使用：
+ *   1. 高雄 OpenAPI JSON
+ *
+ * 若 Cloudflare Workers 無法連線至 OpenAPI（例如 HTTP 522），
+ * 自動 fallback：
+ *   2. 高雄市政府資料開放平台官方 CSV
+ *
+ * CSV URL：
+ *   https://data.kcg.gov.tw/File/directDownload/{resource_uuid}
+ * ========================================================= */
+
+function parseCsvLine(line: string): string[] {
+  const result: string[] = [];
+  let current = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i];
+
+    if (char === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        current += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      continue;
+    }
+
+    if (char === "," && !inQuotes) {
+      result.push(current);
+      current = "";
+      continue;
+    }
+
+    current += char;
+  }
+
+  result.push(current);
+  return result;
+}
+
+function parseCsvRecords(csv: string): Record<string, string>[] {
+  const normalized = csv
+    .replace(/^\uFEFF/, "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n");
+
+  const lines = normalized
+    .split("\n")
+    .filter((line) => line.trim() !== "");
+
+  if (lines.length === 0) {
+    return [];
+  }
+
+  const headers = parseCsvLine(lines[0]).map((header) =>
+    header.trim()
+  );
+
+  return lines.slice(1).map((line) => {
+    const values = parseCsvLine(line);
+    const record: Record<string, string> = {};
+
+    headers.forEach((header, index) => {
+      record[header] = values[index] ?? "";
+    });
+
+    return record;
+  });
+}
+
+function extractResourceUuid(resourceUrl: string): string {
+  const match = resourceUrl.match(
+    /([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})/i
+  );
+
+  return match?.[1] ?? "";
+}
+
+async function fetchKcgResourceRecords(
+  resourceUrl: string
+): Promise<{
+  records: any[];
+  sourceUrl: string;
+  format: "json" | "csv";
+}> {
+  const primaryUrl = String(resourceUrl || "").trim();
+
+  if (!primaryUrl) {
+    throw new Error("Resource URL 為空");
+  }
+
+  let primaryError = "";
+
+  try {
+    const response = await fetch(primaryUrl, {
+      headers: {
+        "User-Agent": "Kaohsiung-Civic-MCP/1.0",
+        "Accept": "application/json",
+      },
+    });
+
+    if (response.ok) {
+      const raw = (await response.json()) as any;
+
+      const records =
+        Array.isArray(raw)
+          ? raw
+          : Array.isArray(raw?.data)
+            ? raw.data
+            : [];
+
+      return {
+        records,
+        sourceUrl: primaryUrl,
+        format: "json",
+      };
+    }
+
+    primaryError = `HTTP ${response.status}`;
+  } catch (error) {
+    primaryError =
+      error instanceof Error
+        ? error.message
+        : String(error);
+  }
+
+  const uuid = extractResourceUuid(primaryUrl);
+
+  if (!uuid) {
+    throw new Error(
+      `Resource JSON 請求失敗 (${primaryError})，且無法解析 Resource UUID`
+    );
+  }
+
+  const csvUrl =
+    `https://data.kcg.gov.tw/File/directDownload/${uuid}`;
+
+  try {
+    const csvResponse = await fetch(csvUrl, {
+      headers: {
+        "User-Agent": "Kaohsiung-Civic-MCP/1.0",
+        "Accept": "text/csv,*/*",
+      },
+    });
+
+    if (!csvResponse.ok) {
+      throw new Error(
+        `HTTP ${csvResponse.status}`
+      );
+    }
+
+    const csvText = await csvResponse.text();
+    const records = parseCsvRecords(csvText);
+
+    if (records.length === 0) {
+      throw new Error("CSV 沒有資料紀錄");
+    }
+
+    return {
+      records,
+      sourceUrl: csvUrl,
+      format: "csv",
+    };
+  } catch (error) {
+    const csvError =
+      error instanceof Error
+        ? error.message
+        : String(error);
+
+    throw new Error(
+      `Resource JSON 請求失敗 (${primaryError})；官方 CSV fallback 也失敗 (${csvError})`
+    );
+  }
+}
+
 async function calculateHash(content: string): Promise<string> {
   const msgUint8 = new TextEncoder().encode(content);
 
@@ -695,26 +876,11 @@ async function executeCivicTool(
         );
       }
 
-      const dataResponse = await fetch(resourceUrl, {
-        headers: {
-          "User-Agent": "Kaohsiung-Civic-MCP/1.0",
-          "Accept": "application/json",
-        },
-      });
+      const resourceResult =
+        await fetchKcgResourceRecords(resourceUrl);
 
-      if (!dataResponse.ok) {
-        throw new Error(
-          `${year} 年度預算 Resource 請求失敗 (HTTP ${dataResponse.status})`
-        );
-      }
-
-      const raw = await dataResponse.json() as any;
       const records =
-        Array.isArray(raw)
-          ? raw
-          : Array.isArray(raw?.data)
-            ? raw.data
-            : [];
+        resourceResult.records;
 
       const normalized = records
         .map((record: any) => {
@@ -885,26 +1051,11 @@ async function executeCivicTool(
           );
         }
 
-        const response = await fetch(resourceUrl, {
-          headers: {
-            "User-Agent": "Kaohsiung-Civic-MCP/1.0",
-            "Accept": "application/json",
-          },
-        });
+        const resourceResult =
+          await fetchKcgResourceRecords(resourceUrl);
 
-        if (!response.ok) {
-          throw new Error(
-            `${targetYear} 年度預算 Resource 請求失敗 (HTTP ${response.status})`
-          );
-        }
-
-        const raw = await response.json() as any;
         const records =
-          Array.isArray(raw)
-            ? raw
-            : Array.isArray(raw?.data)
-              ? raw.data
-              : [];
+          resourceResult.records;
 
         return {
           records,
@@ -1097,26 +1248,11 @@ async function executeCivicTool(
         matched.resourceDownloadUrl ?? ""
       ).trim();
 
-      const response = await fetch(resourceUrl, {
-        headers: {
-          "User-Agent": "Kaohsiung-Civic-MCP/1.0",
-          "Accept": "application/json",
-        },
-      });
+      const resourceResult =
+        await fetchKcgResourceRecords(resourceUrl);
 
-      if (!response.ok) {
-        throw new Error(
-          `${year} 年度預算 Resource 請求失敗 (HTTP ${response.status})`
-        );
-      }
-
-      const raw = await response.json() as any;
       const records =
-        Array.isArray(raw)
-          ? raw
-          : Array.isArray(raw?.data)
-            ? raw.data
-            : [];
+        resourceResult.records;
 
       const getName = (record: any) =>
         String(
