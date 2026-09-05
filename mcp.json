@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "kcg-civic": {
+      "url": "https://kcg-civic-mcp-worker.lihong.workers.dev/mcp",
+      "headers": {
+        "Authorization": "Bearer <YOUR_AUTH_TOKEN>"
+      }
+    },
+    "kcg-civic-sse": {
+      "url": "https://kcg-civic-mcp-worker.lihong.workers.dev/mcp?token=<YOUR_AUTH_TOKEN>"
+    }
+  }
+}
