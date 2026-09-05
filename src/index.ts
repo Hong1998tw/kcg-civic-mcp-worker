@@ -1,10 +1,5 @@
 import { Env } from "./models/types";
-import { BUDGET_TOOLS } from "./tools/budget.tools";
-import { LAW_TOOLS } from "./tools/laws.tools";
-import { COUNCIL_TOOLS } from "./tools/council.tools";
-import { NEWS_TOOLS } from "./tools/news.tools";
-
-const ALL_TOOLS = [...BUDGET_TOOLS, ...LAW_TOOLS, ...COUNCIL_TOOLS, ...NEWS_TOOLS];
+import { TOOL_REGISTRY } from "./mcp/tools";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -12,13 +7,20 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization, mcp-session-id",
 };
 
-function checkAuthorized(request: Request, env: Env): boolean {
-  if (!env.AUTH_TOKEN) return true;
+function checkAuthorized(request: Request, env: any): boolean {
+  const validSecrets = [env.MCP_ACCESS_KEY, env.AUTH_TOKEN].filter(Boolean);
+  if (validSecrets.length === 0) return true;
+
   const url = new URL(request.url);
-  if (url.searchParams.get("token") === env.AUTH_TOKEN) return true;
+  const pathParts = url.pathname.split("/").filter(Boolean);
+  const pathSecret = pathParts.length > 1 && pathParts[0] === "mcp" ? pathParts[1] : null;
+  const querySecret = url.searchParams.get("key") || url.searchParams.get("token");
   const authHeader = request.headers.get("Authorization") || "";
-  const [scheme, token] = authHeader.split(" ");
-  return scheme === "Bearer" && token === env.AUTH_TOKEN;
+  const headerSecret = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : null;
+
+  return validSecrets.some(
+    (s) => s === pathSecret || s === querySecret || s === headerSecret
+  );
 }
 
 async function processRpc(body: any, env: Env) {
@@ -44,7 +46,7 @@ async function processRpc(body: any, env: Env) {
       jsonrpc: "2.0",
       id,
       result: {
-        tools: ALL_TOOLS.map((t) => ({
+        tools: TOOL_REGISTRY.map((t) => ({
           name: t.name,
           description: t.description,
           inputSchema: t.inputSchema,
@@ -55,7 +57,7 @@ async function processRpc(body: any, env: Env) {
   }
 
   if (method === "tools/call") {
-    const tool = ALL_TOOLS.find((t) => t.name === params.name);
+    const tool = TOOL_REGISTRY.find((t) => t.name === params.name);
     if (!tool) {
       return { jsonrpc: "2.0", id, error: { code: -32601, message: `未知的工具: ${params.name}` } };
     }
@@ -89,7 +91,7 @@ export default {
 
     // 1. Web Standards SSE Transport
     if (request.method === "GET") {
-      if (url.pathname === "/mcp" || url.pathname === "/sse" || url.pathname === "/") {
+      if (url.pathname.startsWith("/mcp") || url.pathname === "/sse" || url.pathname === "/") {
         const { readable, writable } = new TransformStream();
         const writer = writable.getWriter();
         const encoder = new TextEncoder();

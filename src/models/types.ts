@@ -1,4 +1,5 @@
 export interface Env {
+  MCP_ACCESS_KEY?: string;
   AUTH_TOKEN?: string;
   kcg_civic_data: R2Bucket;
   [key: string]: any;
