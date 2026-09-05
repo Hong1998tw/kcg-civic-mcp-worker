@@ -1,51 +1,69 @@
 import { Env, Provenance } from "../models/types";
 import { calculateSha256 } from "../utils/crypto";
 
+const MEMORY_CACHE = new Map<string, { rawContent: string; provenance: Provenance; expiresAt: number }>();
+const CACHE_TTL_MS = 1000 * 60 * 60 * 24;
+
 export async function fetchBudgetRawData(
   year: number,
   datasetId: number,
   resourceUuid: string,
   env: Env
 ): Promise<{ rawContent: string; provenance: Provenance }> {
+  const cacheKey = `budget:${year}:${datasetId}`;
+  const now = Date.now();
+
+  const cached = MEMORY_CACHE.get(cacheKey);
+  if (cached && cached.expiresAt > now) {
+    return { rawContent: cached.rawContent, provenance: cached.provenance };
+  }
+
   const agency = "高雄市政府主計處";
 
-  // 1. 第一順位：高雄市政府 OpenAPI
+  // 1. 第一順位：OpenAPI（逾時 1200ms）
   try {
     const openApiUrl = `https://openapi.kcg.gov.tw/Api/Service/Get/${resourceUuid}`;
-    const resp = await fetch(openApiUrl, { headers: { Accept: "application/json" } });
+    const resp = await fetch(openApiUrl, {
+      headers: { Accept: "application/json" },
+      signal: AbortSignal.timeout(1200),
+    });
     if (resp.ok) {
       const text = await resp.text();
-      return {
+      const result = {
         rawContent: text,
         provenance: {
           source_id: datasetId,
           source_url: openApiUrl,
-          source_type: "openapi",
+          source_type: "openapi" as const,
           agency,
           retrieved_at: new Date().toISOString(),
           content_hash: await calculateSha256(text),
         },
       };
+      MEMORY_CACHE.set(cacheKey, { ...result, expiresAt: now + CACHE_TTL_MS });
+      return result;
     }
   } catch (_) {}
 
-  // 2. 第二順位：官方開放平台 CSV 直載
+  // 2. 第二順位：官方 CSV 直載（逾時 1200ms）
   try {
     const csvUrl = `https://data.kcg.gov.tw/File/directDownload/${resourceUuid}`;
-    const resp = await fetch(csvUrl);
+    const resp = await fetch(csvUrl, { signal: AbortSignal.timeout(1200) });
     if (resp.ok) {
       const text = await resp.text();
-      return {
+      const result = {
         rawContent: text,
         provenance: {
           source_id: datasetId,
           source_url: csvUrl,
-          source_type: "csv_direct",
+          source_type: "csv_direct" as const,
           agency,
           retrieved_at: new Date().toISOString(),
           content_hash: await calculateSha256(text),
         },
       };
+      MEMORY_CACHE.set(cacheKey, { ...result, expiresAt: now + CACHE_TTL_MS });
+      return result;
     }
   } catch (_) {}
 
@@ -57,15 +75,17 @@ export async function fetchBudgetRawData(
   }
 
   const text = await r2Object.text();
-  return {
+  const result = {
     rawContent: text,
     provenance: {
       source_id: datasetId,
       source_url: `r2://kcg-civic-data/${r2Key}`,
-      source_type: "r2",
+      source_type: "r2" as const,
       agency,
       retrieved_at: new Date().toISOString(),
       content_hash: await calculateSha256(text),
     },
   };
+  MEMORY_CACHE.set(cacheKey, { ...result, expiresAt: now + CACHE_TTL_MS });
+  return result;
 }

@@ -2,6 +2,8 @@ import { ToolDefinition } from "../models/types";
 import { fetchBudgetRawData } from "../adapters/budget.adapter";
 import { buildEnvelope } from "../utils/envelope";
 
+const SUMMARY_CACHE = new Map<number, any>();
+
 const PROVENANCE_SCHEMA = {
   type: "object",
   properties: {
@@ -51,6 +53,10 @@ export const BUDGET_TOOLS: ToolDefinition[] = [
     },
     handler: async (args, env) => {
       const year = args.year || 115;
+      if (SUMMARY_CACHE.has(year)) {
+        return SUMMARY_CACHE.get(year);
+      }
+
       const { rawContent, provenance } = await fetchBudgetRawData(
         year,
         101174,
@@ -76,7 +82,7 @@ export const BUDGET_TOOLS: ToolDefinition[] = [
         }
       }
 
-      return buildEnvelope(
+      const result = buildEnvelope(
         {
           year,
           agency_count: agencyCount,
@@ -88,6 +94,9 @@ export const BUDGET_TOOLS: ToolDefinition[] = [
         provenance,
         { dataset_id: 101174, year, unit: "新臺幣千元" }
       );
+
+      SUMMARY_CACHE.set(year, result);
+      return result;
     },
   },
 ];
