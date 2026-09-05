@@ -11,6 +11,9 @@ export interface AttachmentItem {
 const KCC_BASE_URL = "https://cissearch.kcc.gov.tw";
 
 export async function getProposalAttachments(proposalSn: string) {
+  if (!/^\d+$/.test(String(proposalSn || "").trim())) {
+    throw new Error("proposal_sn 必須是數字流水號");
+  }
   const tokens = await fetchWebFormsTokens();
 
   const url =

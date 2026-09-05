@@ -15,10 +15,14 @@ export function extractTokensFromHtml(
   const extract = (name: string) => {
     const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const re = new RegExp(
-      `<input[^>]*name="${escaped}"[^>]*value="([^"]*)"`,
+      `<input\\b[^>]*name=["']${escaped}["'][^>]*value=["']([^"']*)["']`,
       "i",
     );
-    return html.match(re)?.[1] ?? "";
+    const reverse = new RegExp(
+      `<input\\b[^>]*value=["']([^"']*)["'][^>]*name=["']${escaped}["']`,
+      "i",
+    );
+    return re.exec(html)?.[1] ?? reverse.exec(html)?.[1] ?? "";
   };
 
   return {
@@ -48,7 +52,8 @@ export async function fetchWebFormsTokens(
 
   const html = await resp.text();
 
-  const cookies = resp.headers.getSetCookie?.() ?? [];
+  const cookies = resp.headers.getSetCookie?.() ??
+    (resp.headers.get("set-cookie") ? [resp.headers.get("set-cookie") as string] : []);
   const cookieHeader = cookies.map((x) => x.split(";")[0]).join("; ");
 
   return extractTokensFromHtml(html, cookieHeader);

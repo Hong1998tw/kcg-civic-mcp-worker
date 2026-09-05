@@ -1,1 +1,6 @@
-AUTH_TOKEN=your_local_dev_token_here
+# Local development only. Never commit a real token.
+MCP_ACCESS_KEY=replace_with_a_local_random_token
+# Set true only when intentionally running without authentication on localhost.
+MCP_ALLOW_ANONYMOUS=false
+# Optional: permits the small clearly-labelled demo snapshots for offline tests.
+MCP_ALLOW_DEMO_DATA=false

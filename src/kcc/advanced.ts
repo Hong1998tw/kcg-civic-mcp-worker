@@ -1,137 +1,125 @@
 import { searchKccProposals, ProposalSearchArgs } from "./search";
 import { getKccProposal } from "./proposal";
+import { searchKccMeetingRecords } from "./meeting";
+
+export const KCC_PORTAL_URL = "https://cissearch.kcc.gov.tw";
 
 export async function getCouncilSchedule(period = "07", session = "0704") {
+  const records = await searchKccMeetingRecords({ period, session });
   return {
     period,
     session,
-    meeting_title: "高雄市議會第4屆第7次定期大會",
-    schedule: [
-      { date: "115-05-20", item: "大會開幕及市長施政報告與質詢" },
-      { date: "115-05-21 ~ 115-06-05", item: "市政總質詢" },
-      { date: "115-06-06 ~ 115-06-20", item: "各委員會分組審查與業務質詢" },
-      { date: "115-06-21 ~ 115-06-25", item: "議案二、三讀決議及大會閉幕" }
-    ]
+    official_url: `${KCC_PORTAL_URL}/System/meetingrecord/default.aspx`,
+    schedule: records.records.map((record) => ({
+      record_id: record.record_id,
+      date: record.date,
+      meeting: record.meeting,
+      record_type: record.record_type,
+      pdf_url: record.pdf_url,
+    })),
+    total: records.total,
+    notice: "議事日程以官方議事錄查詢結果為準；本工具不補造未公布的日期。",
   };
 }
 
 export async function getCouncilorInfo(name: string) {
-  const councilorMap: Record<string, any> = {
-    "陳慧文": { district: "第9選區（鳳山區）", party: "民主進步黨", committee: "社政委員會" },
-    "張博洋": { district: "第7選區（三民區）", party: "台灣基進", committee: "警消衛環委員會" },
-    "邱俊憲": { district: "第11選區（仁武、大社、大樹、鳥松）", party: "民主進步黨", committee: "教育委員會" },
-    "白喬茵": { district: "第4選區（左營、楠梓）", party: "中國國民黨", committee: "教育委員會" },
-    "郭建盟": { district: "第8選區（前金、新興、苓雅）", party: "民主進步黨", committee: "財經委員會" },
-    "黃柏霖": { district: "第7選區（三民區）", party: "中國國民黨", committee: "教育委員會" },
-  };
-
-  const info = councilorMap[name.trim()] || {
-    district: "高雄市議會議員",
-    party: "現任議員",
-    committee: "委員會審查"
-  };
-
+  const normalized = String(name || "").trim();
+  if (!normalized || normalized.length > 50) throw new Error("請提供有效的議員姓名");
+  // The official proposal portal can confirm searchable activity, but it does not
+  // expose a stable public profile API for district/party/committee in this worker.
+  // Return unknown fields explicitly instead of inventing biographical data.
   return {
-    name: name.trim(),
+    name: normalized,
     term: 4,
-    status: "現任議員",
-    ...info,
+    status: "需以官方議員名錄核對",
+    district: null,
+    party: null,
+    committee: null,
+    official_url: `${KCC_PORTAL_URL}/System/Proposal/Default.aspx`,
+    notice: "目前官方公開查詢介面未提供可穩定擷取的議員名錄欄位；已避免回傳未驗證的選區、政黨或委員會資料。",
   };
 }
 
-export async function getCouncilorProposals(councilor: string, period = "07", session = "0704") {
-  const result = await searchKccProposals({
-    councilor,
-    period,
-    session,
-    meeting: "07040700",
-  });
-
-  return {
-    councilor,
-    period,
-    session,
-    returned_count: result.returned_count,
-    total_count: result.total_count,
-    is_complete: result.is_complete,
-    notice: result.notice,
-    official_url: result.official_url,
-    proposals: result.proposals,
-  };
+export async function getCouncilorProposals(
+  councilor: string,
+  period = "07",
+  session = "0704",
+  meeting?: string,
+) {
+  const name = String(councilor || "").trim();
+  if (!name) throw new Error("councilor 不可為空");
+  const result = await searchKccProposals({ councilor: name, period, session, meeting });
+  return { councilor: name, period, session, ...result };
 }
 
 export async function getProposalResult(proposalSn: string, detailUrl?: string) {
   const proposal = await getKccProposal(proposalSn, detailUrl);
+  const review = proposal.review;
   return {
     proposal_sn: proposal.proposal_sn,
     number: proposal.number,
     category: proposal.category,
     subject: proposal.subject,
-    review: proposal.review,
-    status: proposal.review.second_reading_resolution || proposal.review.committee_opinion ? "已審查" : "審查中"
+    review,
+    status: review.third_reading_session || review.second_reading_resolution
+      ? "已完成議會審議"
+      : review.committee_opinion || review.first_reading
+        ? "已進入審議程序"
+        : "官方頁面未載明審議結果",
+    detail_url: proposal.detail_url,
   };
 }
 
-export async function searchTemporaryProposals(args: ProposalSearchArgs) {
-  return await searchKccProposals({
-    ...args,
-    meeting: args.meeting || "07040700",
-  });
+export async function searchTemporaryProposals(args: ProposalSearchArgs = {}) {
+  // Do not silently force a meeting code. An explicit meeting supplied by the
+  // caller is respected; otherwise the official search covers the selected scope.
+  return searchKccProposals({ ...args });
 }
 
 export async function searchCommittees(committeeName?: string) {
   const committees = [
-    { name: "社政委員會", scope: "主管社會局、勞工局、原住民事務委員會等政務與議案審查" },
-    { name: "教育委員會", scope: "主管教育局、文化局、運動發展局、新聞局等政務與議案審查" },
-    { name: "工務委員會", scope: "主管工務局、水利局、都市發展局等公共工程與建設審查" },
-    { name: "民政委員會", scope: "主管民政局、法制局、研考會、衛生局等行政法制" },
-    { name: "財經委員會", scope: "主管財政局、經發局、觀光局、農業局、捷運局等重大建設與預算" },
-    { name: "警消衛環委員會", scope: "主管警察局、消防局、環保局等治安防救災政務" },
+    { name: "民政委員會", scope: "民政、法制及行政業務" },
+    { name: "財經委員會", scope: "財政、經濟發展、觀光及農業業務" },
+    { name: "教育委員會", scope: "教育、文化及體育業務" },
+    { name: "工務委員會", scope: "工務、水利及都市發展業務" },
+    { name: "警消衛環委員會", scope: "警政、消防、衛生及環境業務" },
+    { name: "社政委員會", scope: "社會、勞工及原住民族業務" },
   ];
-
-  const filtered = committeeName
-    ? committees.filter(c => c.name.includes(committeeName.trim()))
-    : committees;
-
+  const query = String(committeeName || "").trim();
+  const filtered = query ? committees.filter((c) => c.name.includes(query) || c.scope.includes(query)) : committees;
   return {
     total: filtered.length,
     committees: filtered,
+    official_url: `${KCC_PORTAL_URL}/System/Committee/Default.aspx`,
+    notice: "委員會名稱與職掌以高雄市議會最新公告為準。",
   };
 }
 
 export async function searchSpeeches(args: { keyword?: string; speaker?: string }) {
+  const keyword = String(args.keyword || "").trim();
+  const speaker = String(args.speaker || "").trim();
+  if (!keyword && !speaker) throw new Error("請提供 keyword 或 speaker");
   return {
-    keyword: args.keyword || "",
-    speaker: args.speaker || "",
-    total: 1,
-    speeches: [
-      {
-        speaker: args.speaker || "陳慧文",
-        meeting: "第4屆第7次定期大會大會審議",
-        date: "115-05-26",
-        content_summary: `針對${args.keyword || "博愛卡折抵復康巴士等身心障礙福利政策"}向市府提出口頭質詢與政策建議。`,
-      }
-    ]
+    keyword,
+    speaker,
+    total: 0,
+    speeches: [],
+    official_url: `${KCC_PORTAL_URL}/System/meetingrecord/default.aspx`,
+    notice: "發言逐字內容請使用 kcc_search_meeting_record_content；本工具不回傳未經議事錄核對的摘要。",
   };
 }
 
 export async function getProposalRelations(proposalSn: string) {
   const target = await getKccProposal(proposalSn);
-  const primarySigner = target.co_signers.split(/[、,，\s]+/)[0];
-
-  const related = await searchKccProposals({
-    councilor: primarySigner || undefined,
-    period: "07",
-    session: "0704",
-    meeting: "07040700",
-  });
-
+  const query = target.subject.trim().slice(0, 80);
+  const related = query ? await searchKccProposals({ keyword: query }) : null;
   return {
     proposal_sn: proposalSn,
     subject: target.subject,
     category: target.category,
     co_signers: target.co_signers,
-    related_count: related.proposals.length,
-    related_proposals: related.proposals.filter(p => p.proposal_sn !== proposalSn).slice(0, 5),
+    related_count: related?.proposals.filter((p) => p.proposal_sn !== proposalSn).length || 0,
+    related_proposals: related?.proposals.filter((p) => p.proposal_sn !== proposalSn).slice(0, 5) || [],
+    notice: related?.notice || "以案由關鍵字比對官方查詢結果；不推論未被官方資料支持的關聯。",
   };
 }

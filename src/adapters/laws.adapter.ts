@@ -1,5 +1,6 @@
 import { Env, Provenance } from "../models/types";
 import { calculateSha256 } from "../utils/crypto";
+import { isTruthy } from "../utils/envelope";
 
 export interface LawArticle {
   article_no: string;
@@ -38,7 +39,10 @@ export async function fetchLawsData(env: Env): Promise<{ laws: LawRecord[]; prov
     });
     if (resp.ok) {
       const text = await resp.text();
-      const laws: LawRecord[] = JSON.parse(text);
+      const parsed = JSON.parse(text);
+      if (!Array.isArray(parsed)) throw new Error("law schema");
+      const laws: LawRecord[] = parsed.filter((law: any) => law && typeof law.law_id === "string" && typeof law.law_name === "string" && Array.isArray(law.articles));
+      if (laws.length === 0) throw new Error("empty law data");
       const provenance: Provenance = {
         source_id: sourceId,
         source_url: officialPortal,
@@ -55,16 +59,19 @@ export async function fetchLawsData(env: Env): Promise<{ laws: LawRecord[]; prov
   // 2. 第二順位：Cloudflare R2 備援 (laws/kcg_laws.json)
   const r2Key = "laws/kcg_laws.json";
   let rawContent = "";
+  let usedDemo = false;
 
-  try {
-    const r2Object = await env.kcg_civic_data.get(r2Key);
-    if (r2Object) {
-      rawContent = await r2Object.text();
-    }
-  } catch (_) {}
+  if (env.kcg_civic_data) {
+    try {
+      const r2Object = await env.kcg_civic_data.get(r2Key);
+      if (r2Object) rawContent = await r2Object.text();
+    } catch (_) {}
+  }
 
-  // 災備與冷啟動內建資料（附帶官方 outlaw 網址）
-  if (!rawContent) {
+  // Demo data is opt-in; without it, report the unavailable source rather than
+  // returning a small invented subset of the law database.
+  if (!rawContent && isTruthy(env.MCP_ALLOW_DEMO_DATA)) {
+    usedDemo = true;
     rawContent = JSON.stringify([
       {
         law_id: "KCG-LAW-001",
@@ -93,11 +100,21 @@ export async function fetchLawsData(env: Env): Promise<{ laws: LawRecord[]; prov
     ]);
   }
 
-  const laws: LawRecord[] = JSON.parse(rawContent);
+  if (!rawContent) throw new Error("無法取得法規資料：官方端點與 R2 備援皆不可用");
+
+  let laws: LawRecord[];
+  try {
+    const parsed = JSON.parse(rawContent);
+    if (!Array.isArray(parsed)) throw new Error("schema");
+    laws = parsed.filter((law: any) => law && typeof law.law_id === "string" && typeof law.law_name === "string" && Array.isArray(law.articles));
+    if (laws.length === 0) throw new Error("empty");
+  } catch {
+    throw new Error("法規資料格式無效");
+  }
   const provenance: Provenance = {
     source_id: sourceId,
     source_url: `r2://kcg-civic-data/${r2Key}`,
-    source_type: "r2",
+    source_type: usedDemo ? "fallback" : "r2",
     agency,
     retrieved_at: new Date().toISOString(),
     content_hash: await calculateSha256(rawContent),

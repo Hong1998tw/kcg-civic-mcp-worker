@@ -59,7 +59,7 @@ async function main() {
     throw new Error("搜尋結果內容為空");
   }
   const searchData = JSON.parse(searchContentText);
-  const firstProposal = searchData.proposals?.[0];
+  const firstProposal = searchData.data?.proposals?.[0];
 
   if (!firstProposal) {
     console.warn("⚠️ 查無議案資料，跳過後續詳情與附件測試。");

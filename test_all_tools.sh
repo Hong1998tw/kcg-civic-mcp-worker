@@ -4,7 +4,7 @@ set -e
 ENDPOINT="${1:-https://kcg-civic-mcp-worker.lihong.workers.dev/mcp}"
 TOKEN="${AUTH_TOKEN:-}"
 
-echo "=== 開始驗證高雄市公民資料 MCP (預算、法規、議會、新聞全模組) ==="
+echo "=== 開始驗證高雄市公民資料 MCP v1.0.0 ==="
 echo "目標端點: $ENDPOINT"
 
 TOTAL_TESTS=0
@@ -41,9 +41,9 @@ run_test() {
   status=$(echo "$raw_text" | jq -r '.status // empty')
   source_type=$(echo "$raw_text" | jq -r '.provenance.source_type // empty')
 
-  if [ "$status" = "success" ]; then
+  if [ "$status" = "success" ] || [ "$status" = "partial" ]; then
     PASSED_TESTS=$((PASSED_TESTS + 1))
-    echo "✅ 成功 (來源: $source_type)"
+    echo "✅ 回應有效 (狀態: $status；來源: $source_type)"
   else
     echo "❌ Envelope 結構不符"
   fi
@@ -53,6 +53,10 @@ tool_count=$(curl -s -X POST "$ENDPOINT" \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $TOKEN" \
   -d '{"jsonrpc":"2.0","id":100,"method":"tools/list"}' | jq -r '.result.tools | length')
+if [ "$tool_count" -lt 21 ]; then
+  echo "❌ 工具數量不足：$tool_count（預期至少 21）"
+  exit 1
+fi
 echo "✅ tools/list 取得成功 (已註冊 $tool_count 個工具)"
 
 # 抽測 7 項工具
@@ -63,6 +67,8 @@ run_test 4 "get_kcg_council_meetings"           '{"term":4}'
 run_test 5 "search_kcg_council_interpellations" '{"keyword":"輕軌"}'
 run_test 6 "get_kcg_latest_news"                '{"limit":5}'
 run_test 7 "search_kcg_news"                    '{"keyword":"綠能"}'
+run_test 8 "kcc_search_proposals"               '{"keyword":"AI","period":"07","session":"0704","meeting":"07040800"}'
+run_test 9 "kcc_search_committees"              '{"committee_name":"工務"}'
 
 echo "=========================================================="
 echo "驗證結果: $PASSED_TESTS / $TOTAL_TESTS 通過"

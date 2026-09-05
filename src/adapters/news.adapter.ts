@@ -1,5 +1,6 @@
 import { Env, Provenance } from "../models/types";
 import { calculateSha256 } from "../utils/crypto";
+import { isTruthy } from "../utils/envelope";
 
 export interface NewsItem {
   news_id: string;
@@ -32,7 +33,10 @@ export async function fetchNewsData(env: Env): Promise<{ news: NewsItem[]; prove
     });
     if (resp.ok) {
       const text = await resp.text();
-      const news: NewsItem[] = JSON.parse(text);
+      const parsed = JSON.parse(text);
+      if (!Array.isArray(parsed)) throw new Error("news schema");
+      const news: NewsItem[] = parsed.filter((item: any) => item && typeof item.news_id === "string" && typeof item.title === "string");
+      if (news.length === 0) throw new Error("empty news data");
       const provenance: Provenance = {
         source_id: sourceId,
         source_url: upstreamUrl,
@@ -49,16 +53,18 @@ export async function fetchNewsData(env: Env): Promise<{ news: NewsItem[]; prove
   // 2. 第二順位：Cloudflare R2 備援 (news/kcg_news.json)
   const r2Key = "news/kcg_news.json";
   let rawContent = "";
+  let usedDemo = false;
 
-  try {
-    const r2Object = await env.kcg_civic_data.get(r2Key);
-    if (r2Object) {
-      rawContent = await r2Object.text();
-    }
-  } catch (_) {}
+  if (env.kcg_civic_data) {
+    try {
+      const r2Object = await env.kcg_civic_data.get(r2Key);
+      if (r2Object) rawContent = await r2Object.text();
+    } catch (_) {}
+  }
 
-  // 災備內建新聞資料
-  if (!rawContent) {
+  // Demo data is opt-in; never label a tiny hand-written sample as latest news.
+  if (!rawContent && isTruthy(env.MCP_ALLOW_DEMO_DATA)) {
+    usedDemo = true;
     rawContent = JSON.stringify([
       {
         news_id: "NEWS-202609-001",
@@ -81,11 +87,21 @@ export async function fetchNewsData(env: Env): Promise<{ news: NewsItem[]; prove
     ]);
   }
 
-  const news: NewsItem[] = JSON.parse(rawContent);
+  if (!rawContent) throw new Error("無法取得新聞資料：官方端點與 R2 備援皆不可用");
+
+  let news: NewsItem[];
+  try {
+    const parsed = JSON.parse(rawContent);
+    if (!Array.isArray(parsed)) throw new Error("schema");
+    news = parsed.filter((item: any) => item && typeof item.news_id === "string" && typeof item.title === "string");
+    if (news.length === 0) throw new Error("empty");
+  } catch {
+    throw new Error("新聞資料格式無效");
+  }
   const provenance: Provenance = {
     source_id: sourceId,
     source_url: `r2://kcg-civic-data/${r2Key}`,
-    source_type: "r2",
+    source_type: usedDemo ? "fallback" : "r2",
     agency,
     retrieved_at: new Date().toISOString(),
     content_hash: await calculateSha256(rawContent),

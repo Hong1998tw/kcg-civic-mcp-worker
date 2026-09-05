@@ -1,13 +1,14 @@
 import { ToolDefinition } from "../models/types";
 import { fetchNewsData } from "../adapters/news.adapter";
 import { buildEnvelope } from "../utils/envelope";
+import { boundedLimit } from "../utils/envelope";
 
 const PROVENANCE_SCHEMA = {
   type: "object",
   properties: {
     source_id: { type: ["string", "number"] },
     source_url: { type: "string" },
-    source_type: { type: "string", enum: ["openapi", "csv_direct", "r2", "cache"] },
+    source_type: { type: "string", enum: ["openapi", "csv_direct", "official_web", "r2", "cache", "fallback"] },
     agency: { type: "string" },
     retrieved_at: { type: "string" },
     content_hash: { type: "string" },
@@ -55,9 +56,11 @@ export const NEWS_TOOLS: ToolDefinition[] = [
       required: ["status", "provider", "updated_at", "provenance", "data"],
     },
     handler: async (args, env) => {
-      const agency = args.agency?.trim();
-      const category = args.category?.trim();
-      const limit = typeof args.limit === "number" ? args.limit : 10;
+      const agency = args.agency ? String(args.agency).trim() : undefined;
+      const category = args.category ? String(args.category).trim() : undefined;
+      const limit = boundedLimit(args.limit, 10, 100);
+      if (agency && agency.length > 100) throw new Error("agency 長度不可超過 100 字元");
+      if (category && category.length > 100) throw new Error("category 長度不可超過 100 字元");
 
       const { news, provenance } = await fetchNewsData(env);
 
@@ -115,8 +118,9 @@ export const NEWS_TOOLS: ToolDefinition[] = [
       required: ["status", "provider", "updated_at", "provenance", "data"],
     },
     handler: async (args, env) => {
-      const keyword = (args.keyword || "").trim();
-      const limit = typeof args.limit === "number" ? args.limit : 10;
+      const keyword = String(args.keyword || "").trim();
+      if (!keyword || keyword.length > 200) throw new Error("keyword 不可為空且不得超過 200 字元");
+      const limit = boundedLimit(args.limit, 10, 100);
 
       const { news, provenance } = await fetchNewsData(env);
 

@@ -1,5 +1,6 @@
 import { Env, Provenance } from "../models/types";
 import { calculateSha256 } from "../utils/crypto";
+import { isTruthy } from "../utils/envelope";
 
 export interface CouncilMeeting {
   meeting_id: string;
@@ -46,7 +47,9 @@ export async function fetchCouncilData(env: Env): Promise<{ data: CouncilData; p
     });
     if (resp.ok) {
       const text = await resp.text();
-      const data: CouncilData = JSON.parse(text);
+      const parsed = JSON.parse(text) as Partial<CouncilData>;
+      if (!Array.isArray(parsed.meetings) || !Array.isArray(parsed.interpellations)) throw new Error("council schema");
+      const data = parsed as CouncilData;
       const provenance: Provenance = {
         source_id: sourceId,
         source_url: upstreamUrl,
@@ -63,16 +66,19 @@ export async function fetchCouncilData(env: Env): Promise<{ data: CouncilData; p
   // 2. 第二順位：Cloudflare R2 備援 (council/council_data.json)
   const r2Key = "council/council_data.json";
   let rawContent = "";
+  let usedDemo = false;
 
-  try {
-    const r2Object = await env.kcg_civic_data.get(r2Key);
-    if (r2Object) {
-      rawContent = await r2Object.text();
-    }
-  } catch (_) {}
+  if (env.kcg_civic_data) {
+    try {
+      const r2Object = await env.kcg_civic_data.get(r2Key);
+      if (r2Object) rawContent = await r2Object.text();
+    } catch (_) {}
+  }
 
-  // 災備與冷啟動內建資料
-  if (!rawContent) {
+  // Demo data is opt-in. Production must never present fabricated council
+  // records as official data when upstream and R2 are unavailable.
+  if (!rawContent && isTruthy(env.MCP_ALLOW_DEMO_DATA)) {
+    usedDemo = true;
     rawContent = JSON.stringify({
       meetings: [
         {
@@ -115,11 +121,20 @@ export async function fetchCouncilData(env: Env): Promise<{ data: CouncilData; p
     });
   }
 
-  const data: CouncilData = JSON.parse(rawContent);
+  if (!rawContent) throw new Error("無法取得議會資料：官方端點與 R2 備援皆不可用");
+
+  let data: CouncilData;
+  try {
+    const parsed = JSON.parse(rawContent) as Partial<CouncilData>;
+    if (!Array.isArray(parsed.meetings) || !Array.isArray(parsed.interpellations)) throw new Error("schema");
+    data = parsed as CouncilData;
+  } catch {
+    throw new Error("議會資料格式無效");
+  }
   const provenance: Provenance = {
     source_id: sourceId,
     source_url: `r2://kcg-civic-data/${r2Key}`,
-    source_type: "r2",
+    source_type: usedDemo ? "fallback" : "r2",
     agency,
     retrieved_at: new Date().toISOString(),
     content_hash: await calculateSha256(rawContent),

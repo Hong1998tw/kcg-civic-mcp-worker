@@ -1,15 +1,16 @@
 import { ToolDefinition } from "../models/types";
-import { fetchBudgetRawData } from "../adapters/budget.adapter";
+import { fetchBudgetRawData, parseCsvLine } from "../adapters/budget.adapter";
 import { buildEnvelope } from "../utils/envelope";
 
-const SUMMARY_CACHE = new Map<number, any>();
+const SUMMARY_CACHE = new Map<number, { result: any; expiresAt: number }>();
+const SUMMARY_CACHE_TTL_MS = 1000 * 60 * 60;
 
 const PROVENANCE_SCHEMA = {
   type: "object",
   properties: {
     source_id: { type: ["string", "number"] },
     source_url: { type: "string" },
-    source_type: { type: "string", enum: ["openapi", "csv_direct", "r2", "cache"] },
+    source_type: { type: "string", enum: ["openapi", "csv_direct", "official_web", "r2", "cache", "fallback"] },
     agency: { type: "string" },
     retrieved_at: { type: "string" },
     content_hash: { type: "string" },
@@ -42,7 +43,7 @@ export const BUDGET_TOOLS: ToolDefinition[] = [
             year: { type: "number" },
             agency_count: { type: "number" },
             agency_sum_budget_thousand_twd: { type: "number" },
-            official_total_budget_thousand_twd: { type: "number" },
+            official_total_budget_thousand_twd: { type: ["number", "null"], description: "原始資料明載之總額；未明載時為 null" },
             highest: { type: "object" },
             lowest: { type: "object" },
           },
@@ -52,9 +53,11 @@ export const BUDGET_TOOLS: ToolDefinition[] = [
       required: ["status", "provider", "updated_at", "provenance", "data"],
     },
     handler: async (args, env) => {
-      const year = args.year || 115;
-      if (SUMMARY_CACHE.has(year)) {
-        return SUMMARY_CACHE.get(year);
+      const year = args.year === undefined ? 115 : Number(args.year);
+      if (!Number.isInteger(year) || year < 1 || year > 999) throw new Error("year 必須是有效的民國年度");
+      const cached = SUMMARY_CACHE.get(year);
+      if (cached && cached.expiresAt > Date.now()) {
+        return cached.result;
       }
 
       const { rawContent, provenance } = await fetchBudgetRawData(
@@ -64,16 +67,20 @@ export const BUDGET_TOOLS: ToolDefinition[] = [
         env
       );
 
-      const lines = rawContent.split("\n").filter((l) => l.trim().length > 0);
+      const lines = rawContent.split(/\r?\n/).filter((l) => l.trim().length > 0);
       let agencySum = 0;
       let agencyCount = 0;
+      let officialTotal: number | null = null;
       let highest = { record_type: "agency", account_name: "", budget_thousand_twd: 0 };
       let lowest = { record_type: "agency", account_name: "", budget_thousand_twd: Number.MAX_SAFE_INTEGER };
 
       for (let i = 1; i < lines.length; i++) {
-        const cols = lines[i].split(",").map((c) => c.trim().replace(/^"|"$/g, ""));
-        const name = cols[0];
+        const cols = parseCsvLine(lines[i]);
+        const name = cols[0]?.replace(/^\uFEFF/, "");
         const val = parseInt(cols[1]?.replace(/[^\d]/g, ""), 10);
+        if (val && name && (name.includes("合計") || name.includes("總額") || name.includes("總計"))) {
+          officialTotal = val;
+        }
         if (!isNaN(val) && name && !name.includes("合計") && !name.includes("總額")) {
           agencyCount++;
           agencySum += val;
@@ -87,7 +94,7 @@ export const BUDGET_TOOLS: ToolDefinition[] = [
           year,
           agency_count: agencyCount,
           agency_sum_budget_thousand_twd: agencySum,
-          official_total_budget_thousand_twd: 197823502,
+        official_total_budget_thousand_twd: officialTotal,
           highest,
           lowest,
         },
@@ -95,7 +102,7 @@ export const BUDGET_TOOLS: ToolDefinition[] = [
         { dataset_id: 101174, year, unit: "新臺幣千元" }
       );
 
-      SUMMARY_CACHE.set(year, result);
+      SUMMARY_CACHE.set(year, { result, expiresAt: Date.now() + SUMMARY_CACHE_TTL_MS });
       return result;
     },
   },

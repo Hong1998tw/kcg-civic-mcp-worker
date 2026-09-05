@@ -41,7 +41,7 @@ function stripHtml(value: string): string {
 }
 
 export async function searchKccMeetingRecords(
-  args: MeetingRecordSearchArgs,
+  args: MeetingRecordSearchArgs = {},
 ): Promise<{
   total: number;
   keyword: string;
@@ -49,10 +49,14 @@ export async function searchKccMeetingRecords(
 }> {
   const tokens = await fetchWebFormsTokens(KCC_MEETING_RECORD_URL);
 
-  const period = args.period || "07";
-  const session = args.session || "";
+  const period = (args.period || "07").trim();
+  const session = (args.session || "").trim();
   const meeting = args.meeting || "";
   const keyword = (args.keyword || "").trim();
+  if (!/^\d{2,4}$/.test(period)) throw new Error("period 格式無效");
+  if (session && !/^\d{4}$/.test(session)) throw new Error("session 必須是 4 位官方代碼");
+  if (meeting && !/^\d{8}$/.test(meeting)) throw new Error("meeting 必須是 8 位官方代碼");
+  if (keyword.length > 200) throw new Error("keyword 長度不可超過 200 字元");
 
   const formData = new URLSearchParams();
   formData.append("__EVENTTARGET", "ctl00$ContentPlaceHolder1$btnSearch");
@@ -107,7 +111,7 @@ export async function searchKccMeetingRecords(
     // 嚴格判定：必須包含 .pdf 檔案連結才視為有效會議紀錄列
     if (!row.includes(".pdf")) continue;
 
-    const hrefMatch = row.match(/href=["']([^"']+\.pdf)["']/i);
+    const hrefMatch = row.match(/href=["']([^"']+\.pdf(?:\?[^"']*)?)["']/i);
     if (!hrefMatch) continue;
 
     const cells = row.match(/<t[dh][^>]*>[\s\S]*?<\/t[dh]>/gi) ?? [];
@@ -117,8 +121,13 @@ export async function searchKccMeetingRecords(
     const date = values[1] || "";
     const meetingTitle = values[2] || "";
 
-    const rawPath = decodeHtml(hrefMatch[1]).replace(/^\/+/, "");
-    const absolutePdfUrl = `${KCC_BASE_URL}/${rawPath}`;
+    const rawPath = decodeHtml(hrefMatch[1]);
+    let absolutePdfUrl: string;
+    try {
+      const parsed = new URL(rawPath, KCC_BASE_URL);
+      if (parsed.protocol !== "https:" || parsed.hostname !== "cissearch.kcc.gov.tw") continue;
+      absolutePdfUrl = parsed.toString();
+    } catch { continue; }
 
     // 從 /Upload/Attachment/MeetingRecord/{record_id}/... 擷取 record_id
     const idMatch = rawPath.match(/MeetingRecord\/(\d+)\//i);

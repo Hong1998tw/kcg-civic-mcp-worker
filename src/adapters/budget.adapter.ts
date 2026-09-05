@@ -4,6 +4,22 @@ import { calculateSha256 } from "../utils/crypto";
 const MEMORY_CACHE = new Map<string, { rawContent: string; provenance: Provenance; expiresAt: number }>();
 const CACHE_TTL_MS = 1000 * 60 * 60 * 24;
 
+export function parseCsvLine(line: string): string[] {
+  const cells: string[] = [];
+  let cell = "";
+  let quoted = false;
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i];
+    if (char === '"') {
+      if (quoted && line[i + 1] === '"') { cell += '"'; i++; }
+      else quoted = !quoted;
+    } else if (char === "," && !quoted) { cells.push(cell.trim()); cell = ""; }
+    else cell += char;
+  }
+  cells.push(cell.trim());
+  return cells;
+}
+
 export async function fetchBudgetRawData(
   year: number,
   datasetId: number,
@@ -69,7 +85,7 @@ export async function fetchBudgetRawData(
 
   // 3. 第三順位：Cloudflare R2 備援
   const r2Key = `budget/${year}/${datasetId}.csv`;
-  const r2Object = await env.kcg_civic_data.get(r2Key);
+  const r2Object = env.kcg_civic_data ? await env.kcg_civic_data.get(r2Key) : null;
   if (!r2Object) {
     throw new Error(`無法取得預算資料：OpenAPI 與 CSV 直載失敗，且 R2 (r2://${r2Key}) 無此備援資料`);
   }

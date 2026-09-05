@@ -1,4 +1,5 @@
 import { ToolDefinition } from "../models/types";
+import { buildKccEnvelope } from "../utils/envelope";
 import { searchKccProposals } from "../kcc/search";
 import { getKccProposal } from "../kcc/proposal";
 import { getProposalAttachments } from "../kcc/attachment";
@@ -15,6 +16,14 @@ import {
   getProposalRelations,
 } from "../kcc/advanced";
 
+const KCC_PORTAL_URL = "https://cissearch.kcc.gov.tw";
+const KCC_PROPOSAL_URL = `${KCC_PORTAL_URL}/System/Proposal/Default.aspx`;
+const KCC_RECORD_URL = `${KCC_PORTAL_URL}/System/meetingrecord/default.aspx`;
+
+function kccEnvelope<T>(data: T, sourceUrl = KCC_PROPOSAL_URL, meta: Record<string, any> = {}) {
+  return buildKccEnvelope(data, sourceUrl, meta);
+}
+
 export const PROPOSAL_TOOLS: ToolDefinition[] = [
   {
     name: "kcc_search_proposals",
@@ -27,6 +36,7 @@ export const PROPOSAL_TOOLS: ToolDefinition[] = [
         period: { type: "string", description: "屆次代碼" },
         session: { type: "string", description: "會期代碼" },
         meeting: { type: "string", description: "會議代碼" },
+        meeting_number: { type: ["string", "number"], description: "選填，官方頁面顯示的第幾次會議；由官方選項解析代碼" },
         councilor: { type: "string", description: "提案議員中文姓名" },
         category: {
           type: "string",
@@ -54,7 +64,7 @@ export const PROPOSAL_TOOLS: ToolDefinition[] = [
         proposals: { type: "array" },
       },
     },
-    handler: async (args: any) => await searchKccProposals(args || {}),
+    handler: async (args: any) => kccEnvelope(await searchKccProposals(args || {}), KCC_PROPOSAL_URL, { query: args || {} }),
   },
   {
     name: "kcc_get_proposal",
@@ -75,7 +85,7 @@ export const PROPOSAL_TOOLS: ToolDefinition[] = [
         explanation: { type: "string" },
       },
     },
-    handler: async (args: any) => await getKccProposal(args?.proposal_sn, args?.detail_url),
+    handler: async (args: any) => kccEnvelope(await getKccProposal(args?.proposal_sn, args?.detail_url)),
   },
   {
     name: "kcc_get_attachments",
@@ -94,7 +104,7 @@ export const PROPOSAL_TOOLS: ToolDefinition[] = [
         attachments: { type: "array" },
       },
     },
-    handler: async (args: any) => await getProposalAttachments(args?.proposal_sn),
+    handler: async (args: any) => kccEnvelope(await getProposalAttachments(args?.proposal_sn), `${KCC_PORTAL_URL}/Common/GetAttachmentList.ashx`),
   },
   {
     name: "kcc_search_meeting_records",
@@ -115,7 +125,7 @@ export const PROPOSAL_TOOLS: ToolDefinition[] = [
         records: { type: "array" },
       },
     },
-    handler: async (args: any) => await searchKccMeetingRecords(args || {}),
+    handler: async (args: any) => kccEnvelope(await searchKccMeetingRecords(args || {}), KCC_RECORD_URL, { query: args || {} }),
   },
   {
     name: "kcc_get_schedule",
@@ -135,7 +145,7 @@ export const PROPOSAL_TOOLS: ToolDefinition[] = [
         schedule: { type: "array" },
       },
     },
-    handler: async (args: any) => await getCouncilSchedule(args?.period, args?.session),
+    handler: async (args: any) => kccEnvelope(await getCouncilSchedule(args?.period, args?.session), KCC_RECORD_URL),
   },
   {
     name: "kcc_get_councilor",
@@ -156,7 +166,7 @@ export const PROPOSAL_TOOLS: ToolDefinition[] = [
         committee: { type: "string" },
       },
     },
-    handler: async (args: any) => await getCouncilorInfo(args?.name),
+    handler: async (args: any) => kccEnvelope(await getCouncilorInfo(args?.name)),
   },
   {
     name: "kcc_get_councilor_proposals",
@@ -168,6 +178,7 @@ export const PROPOSAL_TOOLS: ToolDefinition[] = [
         councilor: { type: "string", description: "議員中文姓名" },
         period: { type: "string", description: "屆次代碼" },
         session: { type: "string", description: "會期代碼" },
+        meeting: { type: "string", description: "選填，8 位官方會議代碼" },
       },
       required: ["councilor"],
     },
@@ -184,7 +195,7 @@ export const PROPOSAL_TOOLS: ToolDefinition[] = [
       },
     },
     handler: async (args: any) =>
-      await getCouncilorProposals(args?.councilor, args?.period, args?.session),
+      kccEnvelope(await getCouncilorProposals(args?.councilor, args?.period, args?.session, args?.meeting), KCC_PROPOSAL_URL),
   },
   {
     name: "kcc_get_proposal_result",
@@ -206,7 +217,7 @@ export const PROPOSAL_TOOLS: ToolDefinition[] = [
       },
     },
     handler: async (args: any) =>
-      await getProposalResult(args?.proposal_sn, args?.detail_url),
+      kccEnvelope(await getProposalResult(args?.proposal_sn, args?.detail_url)),
   },
   {
     name: "kcc_search_temporary_proposals",
@@ -230,7 +241,7 @@ export const PROPOSAL_TOOLS: ToolDefinition[] = [
         proposals: { type: "array" },
       },
     },
-    handler: async (args: any) => await searchTemporaryProposals(args || {}),
+    handler: async (args: any) => kccEnvelope(await searchTemporaryProposals(args || {}), KCC_PROPOSAL_URL, { query: args || {} }),
   },
   {
     name: "kcc_search_committees",
@@ -248,7 +259,7 @@ export const PROPOSAL_TOOLS: ToolDefinition[] = [
         committees: { type: "array" },
       },
     },
-    handler: async (args: any) => await searchCommittees(args?.committee_name),
+    handler: async (args: any) => kccEnvelope(await searchCommittees(args?.committee_name), `${KCC_PORTAL_URL}/System/Committee/Default.aspx`),
   },
   {
     name: "kcc_search_speeches",
@@ -267,7 +278,7 @@ export const PROPOSAL_TOOLS: ToolDefinition[] = [
         speeches: { type: "array" },
       },
     },
-    handler: async (args: any) => await searchSpeeches(args || {}),
+    handler: async (args: any) => kccEnvelope(await searchSpeeches(args || {}), KCC_RECORD_URL, { query: args || {} }),
   },
   {
     name: "kcc_get_proposal_relations",
@@ -287,7 +298,7 @@ export const PROPOSAL_TOOLS: ToolDefinition[] = [
         related_proposals: { type: "array" },
       },
     },
-    handler: async (args: any) => await getProposalRelations(args?.proposal_sn),
+    handler: async (args: any) => kccEnvelope(await getProposalRelations(args?.proposal_sn)),
   },
   {
     name: "kcc_get_meeting_record",
@@ -316,7 +327,7 @@ export const PROPOSAL_TOOLS: ToolDefinition[] = [
       },
     },
     handler: async (args: any, env: any) =>
-      await getMeetingRecordContent(args || {}, env),
+      kccEnvelope(await getMeetingRecordContent(args || {}, env), KCC_RECORD_URL),
   },
   {
     name: "kcc_search_meeting_record_content",
@@ -356,6 +367,22 @@ export const PROPOSAL_TOOLS: ToolDefinition[] = [
       },
     },
     handler: async (args: any, env: any) =>
-      await searchMeetingRecordsContent(args || {}, env),
+      kccEnvelope(await searchMeetingRecordsContent(args || {}, env), KCC_RECORD_URL),
   },
 ];
+
+// Every tool exposes the same top-level contract. The detailed payload remains
+// under `data`, allowing clients to handle live KCC and snapshot tools uniformly.
+const KCC_ENVELOPE_SCHEMA = {
+  type: "object",
+  properties: {
+    status: { type: "string", enum: ["success", "error", "partial"] },
+    provider: { type: "string" },
+    updated_at: { type: "string" },
+    provenance: { type: "object" },
+    meta: { type: "object" },
+    data: {},
+  },
+  required: ["status", "provider", "updated_at", "provenance", "meta", "data"],
+};
+for (const tool of PROPOSAL_TOOLS) tool.outputSchema = KCC_ENVELOPE_SCHEMA;

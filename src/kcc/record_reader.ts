@@ -40,6 +40,13 @@ interface CachedMeetingRecord {
   cached_at: string;
 }
 
+function isCachedMeetingRecord(value: unknown): value is CachedMeetingRecord {
+  const item = value as Partial<CachedMeetingRecord> | null;
+  return !!item && typeof item.record_id === "string" && typeof item.pdf_url === "string" &&
+    typeof item.total_pages === "number" && Array.isArray(item.pages) &&
+    item.pages.every((page) => page && typeof page.page === "number" && typeof page.text === "string");
+}
+
 const USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/154.0.0.0 Safari/537.36";
 
@@ -90,7 +97,12 @@ export async function getMeetingRecordContent(
   args: MeetingRecordContentArgs,
   env?: any,
 ): Promise<MeetingRecordContentResult> {
+  if (!args || typeof args.record_id !== "string") throw new Error("record_id 必須是文字識別碼");
   const recordId = args.record_id.trim();
+  if (!/^\d+$/.test(recordId)) throw new Error("record_id 必須是數字識別碼");
+  if (recordId.length > 20) throw new Error("record_id 格式無效");
+  if (args.keyword && args.keyword.length > 200) throw new Error("keyword 長度不可超過 200 字元");
+  if (args.page !== undefined && (!Number.isInteger(args.page) || args.page < 1)) throw new Error("page 必須是正整數");
   const cacheKey = `meeting_records/${recordId}.json`;
   let recordData: CachedMeetingRecord | null = null;
   let fromCache = false;
@@ -100,8 +112,16 @@ export async function getMeetingRecordContent(
     try {
       const cachedObject = await env.kcg_civic_data.get(cacheKey);
       if (cachedObject) {
-        recordData = (await cachedObject.json()) as CachedMeetingRecord;
-        fromCache = true;
+        const cached = await cachedObject.json();
+        if (isCachedMeetingRecord(cached) && (() => {
+          try {
+            const cachedUrl = new URL(cached.pdf_url);
+            return cachedUrl.protocol === "https:" && cachedUrl.hostname === "cissearch.kcc.gov.tw";
+          } catch { return false; }
+        })()) {
+          recordData = cached;
+          fromCache = true;
+        }
       }
     } catch {
       // 容錯降級處理
@@ -121,7 +141,14 @@ export async function getMeetingRecordContent(
       pdfUrl = found.pdf_url;
     }
 
-    const resp = await fetch(pdfUrl, {
+    if (!pdfUrl) throw new Error(`找不到 record_id 為 ${recordId} 的議事錄 PDF 連結`);
+
+    let parsedPdfUrl: URL;
+    try { parsedPdfUrl = new URL(pdfUrl); } catch { throw new Error("pdf_url 格式無效"); }
+    if (parsedPdfUrl.protocol !== "https:" || parsedPdfUrl.hostname !== "cissearch.kcc.gov.tw") {
+      throw new Error("pdf_url 僅允許高雄市議會官方網域");
+    }
+    const resp = await fetch(parsedPdfUrl.toString(), {
       headers: { "User-Agent": USER_AGENT },
       signal: AbortSignal.timeout(15000),
     });
@@ -130,7 +157,11 @@ export async function getMeetingRecordContent(
       throw new Error(`下載議事錄 PDF 失敗: HTTP ${resp.status}`);
     }
 
+    const declaredLength = Number(resp.headers.get("content-length") || "0");
+    if (declaredLength > 25 * 1024 * 1024) throw new Error("議事錄 PDF 超過 25 MB 大小上限");
+
     const buffer = await resp.arrayBuffer();
+    if (buffer.byteLength > 25 * 1024 * 1024) throw new Error("議事錄 PDF 超過 25 MB 大小上限");
     const { text, totalPages } = await extractText(new Uint8Array(buffer), {
       mergePages: false,
     });
@@ -143,7 +174,7 @@ export async function getMeetingRecordContent(
 
     recordData = {
       record_id: recordId,
-      pdf_url: pdfUrl,
+      pdf_url: parsedPdfUrl.toString(),
       total_pages: totalPages,
       pages,
       cached_at: new Date().toISOString(),
@@ -211,7 +242,9 @@ export async function searchMeetingRecordsContent(
     throw new Error("請提供欲檢索之關鍵字 (keyword)");
   }
 
-  const limit = Math.min(Math.max(args.limit_records || 8, 1), 15);
+  const requestedLimit = args.limit_records === undefined ? 8 : Number(args.limit_records);
+  if (!Number.isInteger(requestedLimit) || requestedLimit < 1) throw new Error("limit_records 必須是正整數");
+  const limit = Math.min(requestedLimit, 15);
   const searchRes = await searchKccMeetingRecords({
     period: args.period,
     session: args.session,
@@ -220,31 +253,17 @@ export async function searchMeetingRecordsContent(
   const recordsToScan = searchRes.records.slice(0, limit);
   const matchedRecords: any[] = [];
 
-  for (const rec of recordsToScan) {
-    try {
-      const detail = await getMeetingRecordContent(
-        {
-          record_id: rec.record_id,
-          pdf_url: rec.pdf_url,
-          keyword,
-        },
-        env,
-      );
-
-      if (detail.matched_pages_count > 0) {
-        matchedRecords.push({
-          record_id: rec.record_id,
-          meeting: rec.meeting,
-          date: rec.date,
-          pdf_url: rec.pdf_url,
-          from_cache: detail.from_cache,
-          matched_pages_count: detail.matched_pages_count,
-          matches: detail.matches,
-        });
-      }
-    } catch {
-      // 單場解析異常不中斷整體批次檢索
-    }
+  // Limit concurrent PDF work so one request cannot exhaust Worker memory/CPU.
+  for (let index = 0; index < recordsToScan.length; index += 3) {
+    const batch = recordsToScan.slice(index, index + 3);
+    const results = await Promise.all(batch.map(async (rec) => {
+      try {
+        const detail = await getMeetingRecordContent({ record_id: rec.record_id, pdf_url: rec.pdf_url, keyword }, env);
+        if (detail.matched_pages_count === 0) return null;
+        return { record_id: rec.record_id, meeting: rec.meeting, date: rec.date, pdf_url: rec.pdf_url, from_cache: detail.from_cache, matched_pages_count: detail.matched_pages_count, matches: detail.matches };
+      } catch { return null; }
+    }));
+    matchedRecords.push(...results.filter((item): item is NonNullable<typeof item> => item !== null));
   }
 
   return {

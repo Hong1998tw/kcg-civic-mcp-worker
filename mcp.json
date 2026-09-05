@@ -1,13 +1,16 @@
 {
   "mcpServers": {
-    "kcg-civic": {
+    "高雄市公民資料": {
       "url": "https://kcg-civic-mcp-worker.lihong.workers.dev/mcp",
       "headers": {
         "Authorization": "Bearer <YOUR_AUTH_TOKEN>"
       }
     },
-    "kcg-civic-sse": {
-      "url": "https://kcg-civic-mcp-worker.lihong.workers.dev/mcp?token=<YOUR_AUTH_TOKEN>"
+    "高雄市公民資料 SSE": {
+      "url": "https://kcg-civic-mcp-worker.lihong.workers.dev/mcp",
+      "headers": {
+        "Authorization": "Bearer <YOUR_AUTH_TOKEN>"
+      }
     }
   }
 }

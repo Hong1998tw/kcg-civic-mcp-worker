@@ -1,13 +1,14 @@
 import { ToolDefinition } from "../models/types";
 import { fetchCouncilData } from "../adapters/council.adapter";
 import { buildEnvelope } from "../utils/envelope";
+import { boundedLimit } from "../utils/envelope";
 
 const PROVENANCE_SCHEMA = {
   type: "object",
   properties: {
     source_id: { type: ["string", "number"] },
     source_url: { type: "string" },
-    source_type: { type: "string", enum: ["openapi", "csv_direct", "r2", "cache"] },
+    source_type: { type: "string", enum: ["openapi", "csv_direct", "official_web", "r2", "cache", "fallback"] },
     agency: { type: "string" },
     retrieved_at: { type: "string" },
     content_hash: { type: "string" },
@@ -54,9 +55,11 @@ export const COUNCIL_TOOLS: ToolDefinition[] = [
       required: ["status", "provider", "updated_at", "provenance", "data"],
     },
     handler: async (args, env) => {
-      const term = typeof args.term === "number" ? args.term : 4;
-      const sessionPeriod = typeof args.session_period === "number" ? args.session_period : undefined;
-      const limit = typeof args.limit === "number" ? args.limit : 10;
+      const term = args.term === undefined ? 4 : Number(args.term);
+      if (!Number.isInteger(term) || term < 1) throw new Error("term 必須是正整數");
+      const sessionPeriod = args.session_period === undefined ? undefined : Number(args.session_period);
+      if (sessionPeriod !== undefined && (!Number.isInteger(sessionPeriod) || sessionPeriod < 1)) throw new Error("session_period 必須是正整數");
+      const limit = boundedLimit(args.limit, 10, 100);
 
       const { data, provenance } = await fetchCouncilData(env);
 
@@ -111,9 +114,11 @@ export const COUNCIL_TOOLS: ToolDefinition[] = [
       required: ["status", "provider", "updated_at", "provenance", "data"],
     },
     handler: async (args, env) => {
-      const keyword = (args.keyword || "").trim();
-      const legislator = args.legislator_name?.trim();
-      const limit = typeof args.limit === "number" ? args.limit : 10;
+      const keyword = String(args.keyword || "").trim();
+      const legislator = args.legislator_name ? String(args.legislator_name).trim() : undefined;
+      if (!keyword || keyword.length > 200) throw new Error("keyword 不可為空且不得超過 200 字元");
+      if (legislator && legislator.length > 100) throw new Error("legislator_name 長度不可超過 100 字元");
+      const limit = boundedLimit(args.limit, 10, 100);
 
       const { data, provenance } = await fetchCouncilData(env);
 

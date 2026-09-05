@@ -147,13 +147,25 @@ export async function getKccProposal(
   proposalSn: string,
   detailUrl?: string,
 ): Promise<KccProposal> {
+  if (!/^\d+$/.test(String(proposalSn || "").trim())) {
+    throw new Error("proposal_sn 必須是數字流水號");
+  }
   const cleanPath = (
     detailUrl || `Detail.aspx?s=${encodeURIComponent(proposalSn)}`
   ).trim();
 
-  const absoluteUrl = cleanPath.startsWith("http")
-    ? cleanPath
-    : `${KCC_BASE_URL}/System/Proposal/${cleanPath.replace(/^\/+/, "")}`;
+  let absoluteUrl: string;
+  try {
+    absoluteUrl = cleanPath.startsWith("http")
+      ? new URL(cleanPath).toString()
+      : new URL(`/System/Proposal/${cleanPath.replace(/^\/+/, "")}`, KCC_BASE_URL).toString();
+  } catch {
+    throw new Error("議案詳情 URL 格式無效");
+  }
+  const parsedUrl = new URL(absoluteUrl);
+  if (parsedUrl.protocol !== "https:" || parsedUrl.hostname !== "cissearch.kcc.gov.tw" || parsedUrl.pathname !== "/System/Proposal/Detail.aspx") {
+    throw new Error("議案詳情 URL 僅允許高雄市議會官方 Detail.aspx");
+  }
 
   const resp = await fetch(absoluteUrl, {
     headers: {
