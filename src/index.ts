@@ -21,6 +21,8 @@
 
 export interface Env {
   AUTH_TOKEN?: string;
+
+  kcg_civic_data: R2Bucket;
   [key: string]: unknown;
 }
 
@@ -133,7 +135,9 @@ function extractResourceUuid(resourceUrl: string): string {
 }
 
 async function fetchKcgResourceRecords(
-  resourceUrl: string
+  resourceUrl: string,
+  env?: Env,
+  r2Key?: string
 ): Promise<{
   records: any[];
   sourceUrl: string;
@@ -147,6 +151,7 @@ async function fetchKcgResourceRecords(
 
   let primaryError = "";
 
+  // 1. 官方 OpenAPI JSON
   try {
     const response = await fetch(primaryUrl, {
       headers: {
@@ -180,6 +185,7 @@ async function fetchKcgResourceRecords(
         : String(error);
   }
 
+  // 2. 官方 CSV directDownload
   const uuid = extractResourceUuid(primaryUrl);
 
   if (!uuid) {
@@ -191,6 +197,8 @@ async function fetchKcgResourceRecords(
   const csvUrl =
     `https://data.kcg.gov.tw/File/directDownload/${uuid}`;
 
+  let csvError = "";
+
   try {
     const csvResponse = await fetch(csvUrl, {
       headers: {
@@ -200,9 +208,7 @@ async function fetchKcgResourceRecords(
     });
 
     if (!csvResponse.ok) {
-      throw new Error(
-        `HTTP ${csvResponse.status}`
-      );
+      throw new Error(`HTTP ${csvResponse.status}`);
     }
 
     const csvText = await csvResponse.text();
@@ -218,15 +224,54 @@ async function fetchKcgResourceRecords(
       format: "csv",
     };
   } catch (error) {
-    const csvError =
+    csvError =
       error instanceof Error
         ? error.message
         : String(error);
-
-    throw new Error(
-      `Resource JSON 請求失敗 (${primaryError})；官方 CSV fallback 也失敗 (${csvError})`
-    );
   }
+
+  // 3. Cloudflare R2
+  if (env && r2Key) {
+    try {
+      const object =
+        await env.kcg_civic_data.get(r2Key);
+
+      if (!object) {
+        throw new Error(
+          `R2 找不到物件：${r2Key}`
+        );
+      }
+
+      const csvText = await object.text();
+      const records = parseCsvRecords(csvText);
+
+      if (records.length === 0) {
+        throw new Error(
+          "R2 CSV 沒有資料紀錄"
+        );
+      }
+
+      return {
+        records,
+        sourceUrl:
+          `r2://kcg-civic-data/${r2Key}`,
+        format: "csv",
+      };
+    } catch (error) {
+      const r2Error =
+        error instanceof Error
+          ? error.message
+          : String(error);
+
+      throw new Error(
+        `Resource JSON 請求失敗 (${primaryError})；官方 CSV fallback 也失敗 (${csvError})；R2 fallback 失敗 (${r2Error})`
+      );
+    }
+  }
+
+  throw new Error(
+    `Resource JSON 請求失敗 (${primaryError})；官方 CSV fallback 也失敗 (${csvError})`
+  );
 }
 
 async function calculateHash(content: string): Promise<string> {
@@ -792,7 +837,8 @@ export const TOOL_REGISTRY = [
 
 async function executeCivicTool(
   name: string,
-  args: Record<string, unknown> = {}
+  args: Record<string, unknown> = {},
+  env?: Env
 ) {
   switch (name) {
     /* -----------------------------------------------------
@@ -1249,7 +1295,11 @@ async function executeCivicTool(
       ).trim();
 
       const resourceResult =
-        await fetchKcgResourceRecords(resourceUrl);
+        await fetchKcgResourceRecords(
+          resourceUrl,
+          env,
+          `budget/${year}/101174.csv`
+        );
 
       const records =
         resourceResult.records;
@@ -1391,7 +1441,8 @@ async function executeCivicTool(
           year,
           keyword,
           limit,
-        }
+        },
+        env
       );
 
       return rankResult;
@@ -1458,7 +1509,8 @@ async function executeCivicTool(
               keyword,
               start_year: startYear,
               end_year: endYear,
-            }
+            },
+            env
           );
 
           return {
@@ -3597,7 +3649,8 @@ async function processRpc(
       const result =
         await executeCivicTool(
           toolName,
-          argumentsObject
+          argumentsObject,
+          env
         );
 
       return {

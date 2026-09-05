@@ -1,7 +1,16 @@
 {
-  "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "kcg-civic-mcp-worker",
-  "main": "src/index.ts",
-  "compatibility_date": "2026-09-01",
-  "compatibility_flags": ["nodejs_compat"]
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "kcg-civic-mcp-worker",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-09-01",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"r2_buckets": [
+		{
+			"bucket_name": "kcg-civic-data",
+			"binding": "kcg_civic_data",
+			"remote": true
+		}
+	]
 }
