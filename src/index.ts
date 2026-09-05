@@ -24,10 +24,6 @@ export interface Env {
   [key: string]: unknown;
 }
 
-const CKAN_API_BASES = [
-  "https://data.kcg.gov.tw/api/3",
-  "https://data.kcg.gov.tw/api",
-];
 const OPENAPI_BASE = "https://openapi.kcg.gov.tw/Api/Service/Get";
 const DATAGOV_API_BASE = "https://data.gov.tw/api/v2/rest";
 
