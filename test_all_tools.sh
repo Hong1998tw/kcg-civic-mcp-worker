@@ -4,7 +4,7 @@ set -e
 ENDPOINT="${1:-https://kcg-civic-mcp-worker.lihong.workers.dev/mcp}"
 TOKEN="${AUTH_TOKEN:-}"
 
-echo "=== 開始驗證高雄市公民資料 MCP (含預算與法規) ==="
+echo "=== 開始驗證高雄市公民資料 MCP (預算、法規、議會全模組) ==="
 echo "目標端點: $ENDPOINT"
 
 TOTAL_TESTS=0
@@ -16,7 +16,7 @@ run_test() {
   local args="$3"
   TOTAL_TESTS=$((TOTAL_TESTS + 1))
 
-  printf "[%02d] 測試 %-28s ... " "$id" "$tool"
+  printf "[%02d/05] 測試 %-35s ... " "$id" "$tool"
 
   response=$(curl -s -w "\n%{http_code}" -X POST "$ENDPOINT" \
     -H "Content-Type: application/json" \
@@ -49,18 +49,19 @@ run_test() {
   fi
 }
 
-# 檢測 tools/list 包含的工具數量
 tool_count=$(curl -s -X POST "$ENDPOINT" \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $TOKEN" \
   -d '{"jsonrpc":"2.0","id":100,"method":"tools/list"}' | jq -r '.result.tools | length')
-echo "✅ tools/list 取得成功 (共 $tool_count 個工具)"
+echo "✅ tools/list 取得成功 (已註冊 $tool_count 個工具)"
 
-# 核心工具抽測
-run_test 1 "get_kcg_budget_summary" '{"year":115}'
-run_test 2 "search_kcg_laws"         '{"keyword":"自治條例"}'
-run_test 3 "get_kcg_law_detail"      '{"law_id":"KCG-LAW-001"}'
+# 執行 5 項核心工具抽驗
+run_test 1 "get_kcg_budget_summary"            '{"year":115}'
+run_test 2 "search_kcg_laws"                    '{"keyword":"自治條例"}'
+run_test 3 "get_kcg_law_detail"                 '{"law_id":"KCG-LAW-001"}'
+run_test 4 "get_kcg_council_meetings"           '{"term":4}'
+run_test 5 "search_kcg_council_interpellations" '{"keyword":"輕軌"}'
 
-echo "=========================================="
-echo "結果: $PASSED_TESTS / $TOTAL_TESTS 通過"
+echo "=========================================================="
+echo "驗證結果: $PASSED_TESTS / $TOTAL_TESTS 通過"
 [ "$PASSED_TESTS" -eq "$TOTAL_TESTS" ] && exit 0 || exit 1
