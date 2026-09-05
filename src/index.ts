@@ -23,6 +23,10 @@ function isLocalHost(host: string): boolean {
   return host === "localhost" || host === "127.0.0.1" || host === "[::1]";
 }
 
+function isMcpPath(pathname: string): boolean {
+  return pathname === "/mcp" || pathname.startsWith("/mcp/");
+}
+
 function checkAuthorized(request: Request, env: Env): boolean {
   const validSecrets = [env.MCP_ACCESS_KEY, env.AUTH_TOKEN].filter(Boolean);
   if (validSecrets.length === 0) {
@@ -32,7 +36,7 @@ function checkAuthorized(request: Request, env: Env): boolean {
 
   const url = new URL(request.url);
   const pathParts = url.pathname.split("/").filter(Boolean);
-  const pathSecret = pathParts.length > 1 && pathParts[0] === "mcp" ? pathParts[1] : null;
+  const pathSecret = pathParts.length === 2 && pathParts[0] === "mcp" ? pathParts[1] : null;
   const querySecret = url.searchParams.get("key") || url.searchParams.get("token");
   const authHeader = request.headers.get("Authorization") || "";
   const headerSecret = /^Bearer\s+/i.test(authHeader) ? authHeader.replace(/^Bearer\s+/i, "").trim() : null;
@@ -120,7 +124,7 @@ export default {
 
     // 1. Web Standards SSE Transport
     if (request.method === "GET") {
-      if (url.pathname.startsWith("/mcp") || url.pathname === "/sse" || url.pathname === "/") {
+      if (isMcpPath(url.pathname) || url.pathname === "/sse" || url.pathname === "/") {
         const { readable, writable } = new TransformStream();
         const writer = writable.getWriter();
         const encoder = new TextEncoder();
@@ -143,6 +147,7 @@ export default {
 
     // 2. HTTP POST JSON-RPC 2.0
     if (request.method === "POST") {
+      if (!isMcpPath(url.pathname)) return new Response("Not Found", { status: 404, headers: CORS_HEADERS });
       try {
         const contentLength = Number(request.headers.get("content-length") || "0");
         if (contentLength > 1024 * 1024) {
