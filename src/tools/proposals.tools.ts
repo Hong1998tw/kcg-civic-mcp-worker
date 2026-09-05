@@ -278,7 +278,7 @@ export const PROPOSAL_TOOLS: ToolDefinition[] = [
         speeches: { type: "array" },
       },
     },
-    handler: async (args: any) => kccEnvelope(await searchSpeeches(args || {}), KCC_RECORD_URL, { query: args || {} }),
+    handler: async (args: any, env: any) => kccEnvelope(await searchSpeeches(args || {}, env), KCC_RECORD_URL, { query: args || {} }),
   },
   {
     name: "kcc_get_proposal_relations",

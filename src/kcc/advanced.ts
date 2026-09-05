@@ -1,6 +1,7 @@
 import { searchKccProposals, ProposalSearchArgs } from "./search";
 import { getKccProposal } from "./proposal";
 import { searchKccMeetingRecords } from "./meeting";
+import { searchMeetingRecordsContent } from "./record_reader";
 
 export const KCC_PORTAL_URL = "https://cissearch.kcc.gov.tw";
 
@@ -95,17 +96,29 @@ export async function searchCommittees(committeeName?: string) {
   };
 }
 
-export async function searchSpeeches(args: { keyword?: string; speaker?: string }) {
+export async function searchSpeeches(args: { keyword?: string; speaker?: string }, env?: any) {
   const keyword = String(args.keyword || "").trim();
   const speaker = String(args.speaker || "").trim();
   if (!keyword && !speaker) throw new Error("請提供 keyword 或 speaker");
+  const content = await searchMeetingRecordsContent({ keyword: speaker || keyword, limit_records: 5 }, env);
+  const speeches = content.records.flatMap((record) => record.matches.flatMap((match) =>
+    match.snippets.map((snippet) => ({
+      speaker: speaker || null,
+      meeting: record.meeting,
+      date: record.date,
+      record_id: record.record_id,
+      page: match.page,
+      content_summary: snippet,
+    }))));
   return {
     keyword,
     speaker,
-    total: 0,
-    speeches: [],
+    total: speeches.length,
+    speeches,
     official_url: `${KCC_PORTAL_URL}/System/meetingrecord/default.aspx`,
-    notice: "發言逐字內容請使用 kcc_search_meeting_record_content；本工具不回傳未經議事錄核對的摘要。",
+    notice: speaker
+      ? "依議事錄 PDF 文字層命中結果回傳；speaker 只作為查詢關鍵字，不代表官方已標註發言者欄位。"
+      : "依議事錄 PDF 文字層命中結果回傳。",
   };
 }
 
