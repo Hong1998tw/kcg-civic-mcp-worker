@@ -18,7 +18,7 @@ const PROVENANCE_SCHEMA = {
 export const LAW_TOOLS: ToolDefinition[] = [
   {
     name: "search_kcg_laws",
-    description: "依關鍵字與分類搜尋高雄市主管法規清單與法條摘要",
+    description: "依關鍵字與分類搜尋高雄市主管法規清單、法條摘要及官方查詢系統連結",
     inputSchema: {
       type: "object",
       properties: {
@@ -45,9 +45,10 @@ export const LAW_TOOLS: ToolDefinition[] = [
               law_name: { type: "string" },
               category: { type: "string" },
               published_at: { type: "string" },
+              official_url: { type: "string" },
               matched_articles: { type: "array" },
             },
-            required: ["law_id", "law_name", "category", "published_at"],
+            required: ["law_id", "law_name", "category", "published_at", "official_url"],
           },
         },
       },
@@ -73,12 +74,14 @@ export const LAW_TOOLS: ToolDefinition[] = [
           law_name: l.law_name,
           category: l.category,
           published_at: l.published_at,
+          official_url: l.official_url,
           matched_articles: l.articles
             .filter((a) => a.content.includes(keyword))
             .map((a) => `${a.article_no}: ${a.content.slice(0, 80)}...`),
         }));
 
       return buildEnvelope(matched, provenance, {
+        portal_url: "https://outlaw.kcg.gov.tw/index.aspx",
         query_keyword: keyword,
         query_category: category || "all",
         total_matched: matched.length,
@@ -87,12 +90,12 @@ export const LAW_TOOLS: ToolDefinition[] = [
   },
   {
     name: "get_kcg_law_detail",
-    description: "依據法規代碼 (law_id) 或法規名稱查詢特定高雄市自治法規之完整條文與沿革",
+    description: "依據法規代碼或名稱查詢特定高雄市自治法規之完整條文、沿革與官方查驗網址",
     inputSchema: {
       type: "object",
       properties: {
         law_id: { type: "string", description: "法規代碼（例如：KCG-LAW-001）" },
-        law_name: { type: "string", description: "法規完整名稱或精準關鍵字" },
+        law_name: { type: "string", description: "法規完整名稱或關鍵字" },
       },
     },
     outputSchema: {
@@ -110,6 +113,7 @@ export const LAW_TOOLS: ToolDefinition[] = [
             law_name: { type: "string" },
             category: { type: "string" },
             published_at: { type: "string" },
+            official_url: { type: "string" },
             history: { type: "string" },
             articles_count: { type: "number" },
             articles: {
@@ -124,7 +128,7 @@ export const LAW_TOOLS: ToolDefinition[] = [
               },
             },
           },
-          required: ["law_id", "law_name", "category", "published_at", "articles"],
+          required: ["law_id", "law_name", "category", "published_at", "official_url", "articles"],
         },
       },
       required: ["status", "provider", "updated_at", "provenance", "data"],
@@ -150,7 +154,11 @@ export const LAW_TOOLS: ToolDefinition[] = [
           articles_count: target.articles.length,
         },
         provenance,
-        { query_id: law_id, query_name: law_name }
+        {
+          portal_url: "https://outlaw.kcg.gov.tw/index.aspx",
+          query_id: law_id,
+          query_name: law_name,
+        }
       );
     },
   },

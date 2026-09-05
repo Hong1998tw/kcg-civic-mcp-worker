@@ -2,8 +2,9 @@ import { Env } from "./models/types";
 import { BUDGET_TOOLS } from "./tools/budget.tools";
 import { LAW_TOOLS } from "./tools/laws.tools";
 import { COUNCIL_TOOLS } from "./tools/council.tools";
+import { NEWS_TOOLS } from "./tools/news.tools";
 
-const ALL_TOOLS = [...BUDGET_TOOLS, ...LAW_TOOLS, ...COUNCIL_TOOLS];
+const ALL_TOOLS = [...BUDGET_TOOLS, ...LAW_TOOLS, ...COUNCIL_TOOLS, ...NEWS_TOOLS];
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -30,7 +31,7 @@ async function processRpc(body: any, env: Env) {
       result: {
         protocolVersion: "2024-11-05",
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: "kcg-civic-mcp-worker", version: "0.4.0" },
+        serverInfo: { name: "kcg-civic-mcp-worker", version: "0.5.0" },
       },
     };
   }

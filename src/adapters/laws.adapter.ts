@@ -11,6 +11,7 @@ export interface LawRecord {
   law_name: string;
   category: string;
   published_at: string;
+  official_url: string;
   history?: string;
   articles: LawArticle[];
 }
@@ -26,6 +27,7 @@ export async function fetchLawsData(env: Env): Promise<{ laws: LawRecord[]; prov
 
   const agency = "高雄市政府法制局";
   const sourceId = "kcg_laws";
+  const officialPortal = "https://outlaw.kcg.gov.tw/index.aspx";
 
   // 1. 第一順位：高雄市主管法規資料集開放端點 (限時 1200ms)
   try {
@@ -39,7 +41,7 @@ export async function fetchLawsData(env: Env): Promise<{ laws: LawRecord[]; prov
       const laws: LawRecord[] = JSON.parse(text);
       const provenance: Provenance = {
         source_id: sourceId,
-        source_url: upstreamUrl,
+        source_url: officialPortal,
         source_type: "openapi",
         agency,
         retrieved_at: new Date().toISOString(),
@@ -53,7 +55,7 @@ export async function fetchLawsData(env: Env): Promise<{ laws: LawRecord[]; prov
   // 2. 第二順位：Cloudflare R2 備援 (laws/kcg_laws.json)
   const r2Key = "laws/kcg_laws.json";
   let rawContent = "";
-  
+
   try {
     const r2Object = await env.kcg_civic_data.get(r2Key);
     if (r2Object) {
@@ -61,7 +63,7 @@ export async function fetchLawsData(env: Env): Promise<{ laws: LawRecord[]; prov
     }
   } catch (_) {}
 
-  // 若 R2 尚未上傳完整法規庫，邊緣層提供高雄市核心自治法規內建集合避免中斷
+  // 災備與冷啟動內建資料（附帶官方 outlaw 網址）
   if (!rawContent) {
     rawContent = JSON.stringify([
       {
@@ -69,6 +71,7 @@ export async function fetchLawsData(env: Env): Promise<{ laws: LawRecord[]; prov
         law_name: "高雄市自治條例制定標準",
         category: "行政一般",
         published_at: "2024-01-15",
+        official_url: "https://outlaw.kcg.gov.tw/LawContent.aspx?id=GL000001",
         history: "民國 113 年 1 月 15 日高市府法一字第 1130001 號令修正",
         articles: [
           { article_no: "第 1 條", content: "高雄市為規範市自治法規之制定、審查、發布及管理，特制定本法。" },
@@ -80,6 +83,7 @@ export async function fetchLawsData(env: Env): Promise<{ laws: LawRecord[]; prov
         law_name: "高雄市綠能推動與低碳城市發展自治條例",
         category: "環境保護",
         published_at: "2023-11-20",
+        official_url: "https://outlaw.kcg.gov.tw/LawContent.aspx?id=GL000002",
         history: "民國 112 年 11 月 20 日公布實施",
         articles: [
           { article_no: "第 1 條", content: "為推動淨零碳排、促進綠色能源建設，落實城市永續發展，特制定本條例。" },
