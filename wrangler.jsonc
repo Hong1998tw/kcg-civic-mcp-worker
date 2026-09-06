@@ -6,6 +6,11 @@
 	"compatibility_flags": [
 		"nodejs_compat"
 	],
+	"secrets": {
+		"required": [
+			"AUTH_TOKEN"
+		]
+	},
 	"r2_buckets": [
 		{
 			"bucket_name": "kcg-civic-data",
