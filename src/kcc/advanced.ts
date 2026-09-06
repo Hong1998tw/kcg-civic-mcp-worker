@@ -100,7 +100,50 @@ export async function searchSpeeches(args: { keyword?: string; speaker?: string 
   const keyword = String(args.keyword || "").trim();
   const speaker = String(args.speaker || "").trim();
   if (!keyword && !speaker) throw new Error("請提供 keyword 或 speaker");
-  const content = await searchMeetingRecordsContent({ keyword: speaker || keyword, limit_records: 5 }, env);
+
+  const recordUrl = `${KCC_PORTAL_URL}/System/meetingrecord/default.aspx`;
+
+  if (keyword && speaker) {
+    const [speakerContent, keywordContent] = await Promise.all([
+      searchMeetingRecordsContent({ keyword: speaker, limit_records: 5 }, env),
+      searchMeetingRecordsContent({ keyword, limit_records: 5 }, env),
+    ]);
+
+    const keywordPages = new Map<string, { snippets: string[] }>();
+    for (const record of keywordContent.records) {
+      for (const match of record.matches) {
+        keywordPages.set(`${record.record_id}:${match.page}`, { snippets: match.snippets });
+      }
+    }
+
+    const speeches = speakerContent.records.flatMap((record) =>
+      record.matches.flatMap((match) => {
+        const keywordMatch = keywordPages.get(`${record.record_id}:${match.page}`);
+        if (!keywordMatch) return [];
+        const snippets = [...new Set([...match.snippets, ...keywordMatch.snippets])].slice(0, 4);
+        return [{
+          speaker,
+          meeting: record.meeting,
+          date: record.date,
+          record_id: record.record_id,
+          page: match.page,
+          content_summary: snippets.join(" | "),
+        }];
+      }),
+    );
+
+    return {
+      keyword,
+      speaker,
+      total: speeches.length,
+      speeches,
+      official_url: recordUrl,
+      notice: "同時指定 speaker 與 keyword 時，僅回傳兩者在同一議事錄頁面均有文字層命中的結果；speaker 為查詢關鍵字，不代表官方已結構化標註發言者欄位。",
+    };
+  }
+
+  const searchTerm = speaker || keyword;
+  const content = await searchMeetingRecordsContent({ keyword: searchTerm, limit_records: 5 }, env);
   const speeches = content.records.flatMap((record) => record.matches.flatMap((match) =>
     match.snippets.map((snippet) => ({
       speaker: speaker || null,
@@ -115,7 +158,7 @@ export async function searchSpeeches(args: { keyword?: string; speaker?: string 
     speaker,
     total: speeches.length,
     speeches,
-    official_url: `${KCC_PORTAL_URL}/System/meetingrecord/default.aspx`,
+    official_url: recordUrl,
     notice: speaker
       ? "依議事錄 PDF 文字層命中結果回傳；speaker 只作為查詢關鍵字，不代表官方已標註發言者欄位。"
       : "依議事錄 PDF 文字層命中結果回傳。",
