@@ -5,6 +5,8 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "dev": "wrangler dev",
+    "verify:toolchain": "node scripts/assert-wrangler-version.mjs",
+    "predeploy": "npm run verify:toolchain",
     "deploy": "wrangler deploy"
   },
   "keywords": [],
