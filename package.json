@@ -6,6 +6,8 @@
     "typecheck": "tsc --noEmit",
     "test": "npm run typecheck",
     "dev": "wrangler dev",
+    "verify:toolchain": "node scripts/assert-wrangler-version.mjs",
+    "predeploy": "npm run verify:toolchain",
     "deploy": "wrangler deploy"
   },
   "keywords": [],
