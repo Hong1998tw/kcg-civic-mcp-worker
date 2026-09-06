@@ -1,6 +1,7 @@
 import { ToolDefinition } from "../models/types";
-import { fetchBudgetRawData, parseCsvLine } from "../adapters/budget.adapter";
+import { fetchBudgetRawData } from "../adapters/budget.adapter";
 import { buildEnvelope } from "../utils/envelope";
+import { parseBudgetSummaryRaw } from "./budget.parser";
 
 const SUMMARY_CACHE = new Map<number, { result: any; expiresAt: number }>();
 const SUMMARY_CACHE_TTL_MS = 1000 * 60 * 60;
@@ -55,6 +56,7 @@ export const BUDGET_TOOLS: ToolDefinition[] = [
     handler: async (args, env) => {
       const year = args.year === undefined ? 115 : Number(args.year);
       if (!Number.isInteger(year) || year < 1 || year > 999) throw new Error("year 必須是有效的民國年度");
+
       const cached = SUMMARY_CACHE.get(year);
       if (cached && cached.expiresAt > Date.now()) {
         return cached.result;
@@ -67,39 +69,23 @@ export const BUDGET_TOOLS: ToolDefinition[] = [
         env
       );
 
-      const lines = rawContent.split(/\r?\n/).filter((l) => l.trim().length > 0);
-      let agencySum = 0;
-      let agencyCount = 0;
-      let officialTotal: number | null = null;
-      let highest = { record_type: "agency", account_name: "", budget_thousand_twd: 0 };
-      let lowest = { record_type: "agency", account_name: "", budget_thousand_twd: Number.MAX_SAFE_INTEGER };
-
-      for (let i = 1; i < lines.length; i++) {
-        const cols = parseCsvLine(lines[i]);
-        const name = cols[0]?.replace(/^\uFEFF/, "");
-        const val = parseInt(cols[1]?.replace(/[^\d]/g, ""), 10);
-        if (val && name && (name.includes("合計") || name.includes("總額") || name.includes("總計"))) {
-          officialTotal = val;
-        }
-        if (!isNaN(val) && name && !name.includes("合計") && !name.includes("總額")) {
-          agencyCount++;
-          agencySum += val;
-          if (val > highest.budget_thousand_twd) highest = { record_type: "agency", account_name: name, budget_thousand_twd: val };
-          if (val < lowest.budget_thousand_twd) lowest = { record_type: "agency", account_name: name, budget_thousand_twd: val };
-        }
-      }
-
+      const parsed = parseBudgetSummaryRaw(rawContent);
       const result = buildEnvelope(
         {
           year,
-          agency_count: agencyCount,
-          agency_sum_budget_thousand_twd: agencySum,
-        official_total_budget_thousand_twd: officialTotal,
-          highest,
-          lowest,
+          agency_count: parsed.agency_count,
+          agency_sum_budget_thousand_twd: parsed.agency_sum_budget_thousand_twd,
+          official_total_budget_thousand_twd: parsed.official_total_budget_thousand_twd,
+          highest: parsed.highest,
+          lowest: parsed.lowest,
         },
         provenance,
-        { dataset_id: 101174, year, unit: "新臺幣千元" }
+        {
+          dataset_id: 101174,
+          year,
+          unit: "新臺幣千元",
+          parser: "schema-aware-v2",
+        }
       );
 
       SUMMARY_CACHE.set(year, { result, expiresAt: Date.now() + SUMMARY_CACHE_TTL_MS });
