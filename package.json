@@ -4,7 +4,7 @@
   "main": "index.js",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test:budget-parser": "rm -rf .tmp-budget-parser && tsc --ignoreConfig src/tools/budget.parser.ts --target ES2022 --module commonjs --moduleResolution node --outDir .tmp-budget-parser --skipLibCheck && node scripts/test-budget-parser.cjs && rm -rf .tmp-budget-parser",
+    "test:budget-parser": "rm -rf .tmp-budget-parser && tsc --ignoreConfig src/tools/budget.parser.ts --target ES2022 --module nodenext --moduleResolution nodenext --outDir .tmp-budget-parser --skipLibCheck && node scripts/test-budget-parser.cjs && rm -rf .tmp-budget-parser",
     "test": "npm run typecheck && npm run test:budget-parser",
     "dev": "wrangler dev",
     "verify:toolchain": "node scripts/assert-wrangler-version.mjs",
