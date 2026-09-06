@@ -32,6 +32,23 @@ export interface MeetingRecordContentResult {
   page_content?: string;
 }
 
+export interface MeetingRecordSearchMatch {
+  record_id: string;
+  meeting: string;
+  date: string;
+  pdf_url: string;
+  from_cache: boolean;
+  matched_pages_count: number;
+  matches: PageMatch[];
+}
+
+export interface CrossMeetingSearchResult {
+  keyword: string;
+  scanned_records_count: number;
+  matched_records_count: number;
+  records: MeetingRecordSearchMatch[];
+}
+
 interface CachedMeetingRecord {
   record_id: string;
   pdf_url: string;
@@ -236,7 +253,7 @@ export async function getMeetingRecordContent(
 export async function searchMeetingRecordsContent(
   args: CrossMeetingSearchArgs,
   env?: any,
-) {
+): Promise<CrossMeetingSearchResult> {
   const keyword = args.keyword?.trim();
   if (!keyword) {
     throw new Error("請提供欲檢索之關鍵字 (keyword)");
@@ -251,7 +268,7 @@ export async function searchMeetingRecordsContent(
   });
 
   const recordsToScan = searchRes.records.slice(0, limit);
-  const matchedRecords: any[] = [];
+  const matchedRecords: MeetingRecordSearchMatch[] = [];
 
   // Limit concurrent PDF work so one request cannot exhaust Worker memory/CPU.
   for (let index = 0; index < recordsToScan.length; index += 3) {

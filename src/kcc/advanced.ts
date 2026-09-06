@@ -50,7 +50,7 @@ export async function getCouncilorProposals(
   const name = String(councilor || "").trim();
   if (!name) throw new Error("councilor 不可為空");
   const result = await searchKccProposals({ councilor: name, period, session, meeting });
-  return { councilor: name, period, session, ...result };
+  return { ...result, period, session };
 }
 
 export async function getProposalResult(proposalSn: string, detailUrl?: string) {
