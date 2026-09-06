@@ -1,7 +1,9 @@
 import { ToolDefinition } from "../models/types";
-import { fetchCouncilData } from "../adapters/council.adapter";
-import { buildEnvelope } from "../utils/envelope";
-import { boundedLimit } from "../utils/envelope";
+import { searchKccMeetingRecords } from "../kcc/meeting";
+import { searchSpeeches, KCC_PORTAL_URL } from "../kcc/advanced";
+import { buildKccEnvelope, boundedLimit } from "../utils/envelope";
+
+const KCC_RECORD_URL = `${KCC_PORTAL_URL}/System/meetingrecord/default.aspx`;
 
 const PROVENANCE_SCHEMA = {
   type: "object",
@@ -16,15 +18,25 @@ const PROVENANCE_SCHEMA = {
   required: ["source_id", "source_url", "source_type", "agency", "retrieved_at", "content_hash"],
 };
 
+function termToKccPeriod(term: number): string {
+  if (term === 4) return "07";
+  throw new Error("目前僅完成高雄市議會第 4 屆與 KCC 官方屆次代碼的正式映射");
+}
+
+function sessionPeriodToKccSession(period: string, sessionPeriod?: number): string | undefined {
+  if (sessionPeriod === undefined) return undefined;
+  return `${period}${String(sessionPeriod).padStart(2, "0")}`;
+}
+
 export const COUNCIL_TOOLS: ToolDefinition[] = [
   {
     name: "get_kcg_council_meetings",
-    description: "查詢高雄市議會歷屆定期大會與臨時會議事日程與審議議程",
+    description: "透過高雄市議會官方 KCC 議事錄查詢系統，查詢第 4 屆會議紀錄與官方 PDF。",
     inputSchema: {
       type: "object",
       properties: {
-        term: { type: "number", description: "屆期（例如：4 代表第 4 屆）", default: 4 },
-        session_period: { type: "number", description: "會期（例如：3 代表第 3 次定期大會）" },
+        term: { type: "number", description: "屆期；目前正式支援第 4 屆", default: 4 },
+        session_period: { type: "number", description: "選填，會期序號；例如 4 會映射為官方會期代碼 0704" },
         limit: { type: "number", description: "回傳紀錄上限", default: 10 },
       },
     },
@@ -43,45 +55,57 @@ export const COUNCIL_TOOLS: ToolDefinition[] = [
             properties: {
               meeting_id: { type: "string" },
               term: { type: "number" },
-              session_period: { type: "number" },
+              session_period: { type: ["number", "null"] },
               meeting_name: { type: "string" },
               meeting_date: { type: "string" },
-              agenda: { type: "string" },
+              record_type: { type: "string" },
+              pdf_url: { type: "string" },
             },
-            required: ["meeting_id", "term", "session_period", "meeting_name", "meeting_date"],
+            required: ["meeting_id", "term", "meeting_name", "meeting_date", "record_type", "pdf_url"],
           },
         },
       },
       required: ["status", "provider", "updated_at", "provenance", "data"],
     },
-    handler: async (args, env) => {
+    handler: async (args) => {
       const term = args.term === undefined ? 4 : Number(args.term);
       if (!Number.isInteger(term) || term < 1) throw new Error("term 必須是正整數");
       const sessionPeriod = args.session_period === undefined ? undefined : Number(args.session_period);
-      if (sessionPeriod !== undefined && (!Number.isInteger(sessionPeriod) || sessionPeriod < 1)) throw new Error("session_period 必須是正整數");
+      if (sessionPeriod !== undefined && (!Number.isInteger(sessionPeriod) || sessionPeriod < 1)) {
+        throw new Error("session_period 必須是正整數");
+      }
       const limit = boundedLimit(args.limit, 10, 100);
+      const period = termToKccPeriod(term);
+      const session = sessionPeriodToKccSession(period, sessionPeriod);
 
-      const { data, provenance } = await fetchCouncilData(env);
-
-      const matched = data.meetings
-        .filter((m) => m.term === term && (sessionPeriod === undefined || m.session_period === sessionPeriod))
-        .slice(0, limit);
-
-      return buildEnvelope(matched, provenance, {
+      const result = await searchKccMeetingRecords({ period, session });
+      const data = result.records.slice(0, limit).map((record) => ({
+        meeting_id: record.record_id,
         term,
-        session_period: sessionPeriod ?? "all",
-        total: matched.length,
+        session_period: sessionPeriod ?? null,
+        meeting_name: record.meeting,
+        meeting_date: record.date,
+        record_type: record.record_type,
+        pdf_url: record.pdf_url,
+      }));
+
+      return buildKccEnvelope(data, KCC_RECORD_URL, {
+        term,
+        kcc_period: period,
+        kcc_session: session || "all",
+        total: data.length,
+        official_total: result.total,
       });
     },
   },
   {
     name: "search_kcg_council_interpellations",
-    description: "依市政關鍵字或議員姓名檢索高雄市議會質詢問政紀錄與主題摘要",
+    description: "直接檢索高雄市議會官方議事錄 PDF 文字層；可依議題關鍵字與議員姓名交叉比對同頁命中。",
     inputSchema: {
       type: "object",
       properties: {
         keyword: { type: "string", description: "質詢主題或發言關鍵字" },
-        legislator_name: { type: "string", description: "選填，指定質詢議員姓名" },
+        legislator_name: { type: "string", description: "選填，指定議員姓名；與 keyword 同時提供時採同一議事錄頁面交叉命中" },
         limit: { type: "number", description: "回傳筆數上限", default: 10 },
       },
       required: ["keyword"],
@@ -101,13 +125,14 @@ export const COUNCIL_TOOLS: ToolDefinition[] = [
             properties: {
               record_id: { type: "string" },
               term: { type: "number" },
-              session_period: { type: "number" },
               legislator_name: { type: "string" },
               topic: { type: "string" },
               content_summary: { type: "string" },
               date: { type: "string" },
+              meeting_name: { type: "string" },
+              page: { type: "number" },
             },
-            required: ["record_id", "term", "legislator_name", "topic", "content_summary", "date"],
+            required: ["record_id", "term", "legislator_name", "topic", "content_summary", "date", "meeting_name", "page"],
           },
         },
       },
@@ -115,26 +140,29 @@ export const COUNCIL_TOOLS: ToolDefinition[] = [
     },
     handler: async (args, env) => {
       const keyword = String(args.keyword || "").trim();
-      const legislator = args.legislator_name ? String(args.legislator_name).trim() : undefined;
+      const legislator = args.legislator_name ? String(args.legislator_name).trim() : "";
       if (!keyword || keyword.length > 200) throw new Error("keyword 不可為空且不得超過 200 字元");
-      if (legislator && legislator.length > 100) throw new Error("legislator_name 長度不可超過 100 字元");
-      const limit = boundedLimit(args.limit, 10, 100);
+      if (legislator.length > 100) throw new Error("legislator_name 長度不可超過 100 字元");
+      const limit = boundedLimit(args.limit, 10, 50);
 
-      const { data, provenance } = await fetchCouncilData(env);
+      const result = await searchSpeeches({ keyword, speaker: legislator || undefined }, env);
+      const data = result.speeches.slice(0, limit).map((speech) => ({
+        record_id: speech.record_id,
+        term: 4,
+        legislator_name: legislator || "未結構化標註",
+        topic: keyword,
+        content_summary: speech.content_summary,
+        date: speech.date,
+        meeting_name: speech.meeting,
+        page: speech.page,
+      }));
 
-      const matched = data.interpellations
-        .filter((i) => {
-          const matchLegislator = !legislator || i.legislator_name.includes(legislator);
-          const matchTopic = i.topic.includes(keyword);
-          const matchContent = i.content_summary.includes(keyword);
-          return matchLegislator && (matchTopic || matchContent);
-        })
-        .slice(0, limit);
-
-      return buildEnvelope(matched, provenance, {
+      return buildKccEnvelope(data, KCC_RECORD_URL, {
         query_keyword: keyword,
         query_legislator: legislator || "all",
-        total: matched.length,
+        total: data.length,
+        official_match_total: result.total,
+        note: result.notice,
       });
     },
   },
