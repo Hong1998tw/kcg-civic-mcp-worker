@@ -1,6 +1,10 @@
 export interface Env {
   MCP_ACCESS_KEY?: string;
   AUTH_TOKEN?: string;
+  /** Optional dedicated owner login key; existing MCP_ACCESS_KEY remains the fallback. */
+  OAUTH_LOGIN_KEY?: string;
+  PUBLIC_ORIGIN: string;
+  OAUTH_STATE: DurableObjectNamespace;
   /** Set to true only for an explicitly configured local/demo deployment. */
   MCP_ALLOW_ANONYMOUS?: string | boolean;
   CORS_ALLOWED_ORIGINS?: string;

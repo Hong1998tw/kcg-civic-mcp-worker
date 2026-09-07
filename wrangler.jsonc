@@ -3,7 +3,10 @@
 	"name": "kcg-civic-mcp-worker",
 	"main": "src/index.ts",
 	"compatibility_date": "2026-09-01",
-	"compatibility_flags": ["nodejs_compat"],
+	"compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+	"vars": {"PUBLIC_ORIGIN": "https://kcg-civic-mcp-worker.lihong.workers.dev"},
+	"durable_objects": {"bindings": [{"name": "OAUTH_STATE", "class_name": "OAuthState"}]},
+	"migrations": [{"tag": "oauth-v1", "new_sqlite_classes": ["OAuthState"]}],
 	"secrets": {"required": ["MCP_ACCESS_KEY"]},
 	"r2_buckets": [{"bucket_name": "kcg-civic-data", "binding": "kcg_civic_data", "remote": true}]
 }

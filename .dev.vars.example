@@ -1,4 +1,6 @@
 # Local development only. Never commit a real token.
 MCP_ACCESS_KEY=replace_with_a_local_random_token
-# Set true only when intentionally running without authentication on localhost.
-MCP_ALLOW_ANONYMOUS=false
+# Match the local Wrangler URL exactly.
+PUBLIC_ORIGIN=http://localhost:8787
+# Optional separate owner consent credential. Never commit a real credential.
+# OAUTH_LOGIN_KEY=replace_with_a_different_local_random_token
