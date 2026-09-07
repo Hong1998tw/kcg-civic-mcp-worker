@@ -145,9 +145,9 @@ export function parseProposalRows(html: string): KccProposalSearchResult[] {
       detail_url: detailUrl,
       number: rawCells[1] || "",
       category: rawCells[2] || "",
-      councilor: kind === "1" ? proposer : undefined,
+      councilor: undefined,
       proposer,
-      proposer_type: kind === "1" ? "councilor" : "unknown",
+      proposer_type: "unknown",
       subject: rawCells[4] || "",
       status: rawCells[5] || "",
     });

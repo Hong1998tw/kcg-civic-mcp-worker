@@ -100,5 +100,13 @@ async function rejectsCode(objects, code) {
   assert.equal(mutationRows[0].proposer_type, "unknown");
   assert.equal(mutationRows[0].councilor, undefined);
 
+  const kindOneGovernment = parseProposalRows(`<table><tr>
+    <td><input name="hidProposalSN" value="145224"><input name="hidProposalKind" value="1"></td><td>案號</td><td>民政</td>
+    <td>高雄市政府客家事務委員會</td><td>決算案</td><td>上程</td>
+  </tr></table>`);
+  assert.equal(kindOneGovernment[0].proposal_kind, "1");
+  assert.equal(kindOneGovernment[0].proposer_type, "unknown");
+  assert.equal(kindOneGovernment[0].councilor, undefined);
+
   console.log("Integrity regression tests passed");
 })().catch((error) => { console.error(error); process.exitCode = 1; });
