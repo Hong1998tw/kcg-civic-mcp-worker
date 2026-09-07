@@ -40,6 +40,18 @@ function stripHtml(value: string): string {
     .trim();
 }
 
+function controlValue(html: string, suffix: string): string {
+  const escaped = suffix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const select = html.match(new RegExp(`<select\\b[^>]*(?:name|id)=["'][^"']*${escaped}[^"']*["'][^>]*>([\\s\\S]*?)<\\/select>`, "i"))?.[1];
+  if (select) {
+    const selected = (select.match(/<option\b[^>]*>/gi) || []).find((option) => /\bselected\b/i.test(option)) || "";
+    return decodeHtml(selected.match(/\bvalue\s*=\s*(["'])(.*?)\1/i)?.[2] || "").trim();
+  }
+  const input = (html.match(/<input\b[^>]*>/gi) || []).find((element) =>
+    new RegExp(`(?:name|id)=["'][^"']*${escaped}[^"']*["']`, "i").test(element)) || "";
+  return decodeHtml(input.match(/\bvalue\s*=\s*(["'])(.*?)\1/i)?.[2] || "").trim();
+}
+
 export async function searchKccMeetingRecords(
   args: MeetingRecordSearchArgs = {},
 ): Promise<{
@@ -100,8 +112,21 @@ export async function searchKccMeetingRecords(
   if (!resp.ok) {
     throw new Error(`會議紀錄查詢 POST 失敗: HTTP ${resp.status}`);
   }
+  const finalUrl = new URL(resp.url);
+  if (finalUrl.hostname !== "cissearch.kcc.gov.tw" || finalUrl.pathname.toLowerCase() !== "/system/meetingrecord/default.aspx") {
+    throw new Error("PARSER_CONTRACT_CHANGED: 會議紀錄查詢被重新導向非預期頁面");
+  }
 
   const html = await resp.text();
+  const requested: Array<[string, string, string]> = [
+    ["period", "ddlPeriod", period], ["session", "ddlSession", session],
+    ["meeting", "ddlMeeting", meeting], ["keyword", "txtKeyword", keyword],
+  ];
+  for (const [field, control, expected] of requested) {
+    if (expected && controlValue(html, control) !== expected) {
+      throw new Error(`FILTER_NOT_CONFIRMED: ${field}=${expected} 未被官方回應確認`);
+    }
+  }
   const records: KccMeetingRecord[] = [];
 
   const rowRegex = /<tr[\s\S]*?<\/tr>/gi;
@@ -132,6 +157,7 @@ export async function searchKccMeetingRecords(
     // 從 /Upload/Attachment/MeetingRecord/{record_id}/... 擷取 record_id
     const idMatch = rawPath.match(/MeetingRecord\/(\d+)\//i);
     const recordId = idMatch ? idMatch[1] : "";
+    if (!recordId) continue;
 
     records.push({
       record_id: recordId,

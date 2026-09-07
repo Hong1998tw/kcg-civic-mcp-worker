@@ -1,5 +1,6 @@
 import { extractText } from "unpdf";
 import { searchKccMeetingRecords } from "./meeting";
+import { recordIdFromPdfUrl } from "./identity";
 
 export interface MeetingRecordContentArgs {
   record_id: string;
@@ -44,8 +45,13 @@ export interface MeetingRecordSearchMatch {
 
 export interface CrossMeetingSearchResult {
   keyword: string;
+  scan_status: "success" | "partial";
+  attempted_records_count: number;
+  succeeded_records_count: number;
+  failed_records_count: number;
   scanned_records_count: number;
   matched_records_count: number;
+  failures: Array<{ record_id: string; reason: string }>;
   records: MeetingRecordSearchMatch[];
 }
 
@@ -61,7 +67,8 @@ function isCachedMeetingRecord(value: unknown): value is CachedMeetingRecord {
   const item = value as Partial<CachedMeetingRecord> | null;
   return !!item && typeof item.record_id === "string" && typeof item.pdf_url === "string" &&
     typeof item.total_pages === "number" && Array.isArray(item.pages) &&
-    item.pages.every((page) => page && typeof page.page === "number" && typeof page.text === "string");
+    item.total_pages === item.pages.length && item.pages.every((page, index) =>
+      page && page.page === index + 1 && typeof page.text === "string");
 }
 
 const USER_AGENT =
@@ -130,18 +137,18 @@ export async function getMeetingRecordContent(
       const cachedObject = await env.kcg_civic_data.get(cacheKey);
       if (cachedObject) {
         const cached = await cachedObject.json();
-        if (isCachedMeetingRecord(cached) && (() => {
-          try {
-            const cachedUrl = new URL(cached.pdf_url);
-            return cachedUrl.protocol === "https:" && cachedUrl.hostname === "cissearch.kcc.gov.tw";
-          } catch { return false; }
-        })()) {
+        if (!isCachedMeetingRecord(cached)) throw new Error("SNAPSHOT_UNVERIFIED: 議事錄快取結構或頁數不一致");
+        if (cached.record_id !== recordId || recordIdFromPdfUrl(cached.pdf_url) !== recordId) {
+          throw new Error(`SOURCE_ID_MISMATCH: 議事錄快取與 record_id=${recordId} 不一致`);
+        }
+        {
           recordData = cached;
           fromCache = true;
         }
       }
-    } catch {
-      // 容錯降級處理
+    } catch (error) {
+      if (error instanceof Error && /^(?:SNAPSHOT_UNVERIFIED|SOURCE_ID_MISMATCH):/.test(error.message)) throw error;
+      throw new Error("SNAPSHOT_UNVERIFIED: 無法驗證議事錄快取");
     }
   }
 
@@ -165,6 +172,9 @@ export async function getMeetingRecordContent(
     if (parsedPdfUrl.protocol !== "https:" || parsedPdfUrl.hostname !== "cissearch.kcc.gov.tw") {
       throw new Error("pdf_url 僅允許高雄市議會官方網域");
     }
+    if (recordIdFromPdfUrl(parsedPdfUrl.toString()) !== recordId) {
+      throw new Error(`SOURCE_ID_MISMATCH: pdf_url 與 record_id=${recordId} 不一致`);
+    }
     const resp = await fetch(parsedPdfUrl.toString(), {
       headers: { "User-Agent": USER_AGENT },
       signal: AbortSignal.timeout(15000),
@@ -172,6 +182,9 @@ export async function getMeetingRecordContent(
 
     if (!resp.ok) {
       throw new Error(`下載議事錄 PDF 失敗: HTTP ${resp.status}`);
+    }
+    if (recordIdFromPdfUrl(resp.url) !== recordId) {
+      throw new Error(`SOURCE_ID_MISMATCH: PDF 最終下載網址與 record_id=${recordId} 不一致`);
     }
 
     const declaredLength = Number(resp.headers.get("content-length") || "0");
@@ -197,20 +210,8 @@ export async function getMeetingRecordContent(
       cached_at: new Date().toISOString(),
     };
 
-    // 3. 寫入 R2 快取儲存桶
-    if (env?.kcg_civic_data) {
-      try {
-        await env.kcg_civic_data.put(
-          cacheKey,
-          JSON.stringify(recordData),
-          {
-            httpMetadata: { contentType: "application/json" },
-          },
-        );
-      } catch {
-        // 快取寫入失敗不阻斷主查詢
-      }
-    }
+    // Query handlers are read-only. Persisting extracted text belongs to a
+    // separately authorized ingestion job with source/hash validation.
   }
 
   // 4. 關鍵字命中檢索（套用區間合併去重）
@@ -231,7 +232,8 @@ export async function getMeetingRecordContent(
   }
 
   let pageContent: string | undefined;
-  if (args.page && args.page >= 1 && args.page <= recordData.total_pages) {
+  if (args.page) {
+    if (args.page > recordData.total_pages) throw new Error(`page 超出範圍：共有 ${recordData.total_pages} 頁`);
     pageContent = recordData.pages[args.page - 1].text;
   }
 
@@ -269,6 +271,8 @@ export async function searchMeetingRecordsContent(
 
   const recordsToScan = searchRes.records.slice(0, limit);
   const matchedRecords: MeetingRecordSearchMatch[] = [];
+  const failures: Array<{ record_id: string; reason: string }> = [];
+  let succeeded = 0;
 
   // Limit concurrent PDF work so one request cannot exhaust Worker memory/CPU.
   for (let index = 0; index < recordsToScan.length; index += 3) {
@@ -276,17 +280,42 @@ export async function searchMeetingRecordsContent(
     const results = await Promise.all(batch.map(async (rec) => {
       try {
         const detail = await getMeetingRecordContent({ record_id: rec.record_id, pdf_url: rec.pdf_url, keyword }, env);
-        if (detail.matched_pages_count === 0) return null;
-        return { record_id: rec.record_id, meeting: rec.meeting, date: rec.date, pdf_url: rec.pdf_url, from_cache: detail.from_cache, matched_pages_count: detail.matched_pages_count, matches: detail.matches };
-      } catch { return null; }
+        return { ok: true as const, detail, rec };
+      } catch (error) {
+        return { ok: false as const, rec, reason: error instanceof Error ? error.message : "未知 PDF 擷取錯誤" };
+      }
     }));
-    matchedRecords.push(...results.filter((item): item is NonNullable<typeof item> => item !== null));
+    for (const result of results) {
+      if (!result.ok) {
+        failures.push({ record_id: result.rec.record_id, reason: result.reason });
+        continue;
+      }
+      succeeded += 1;
+      if (result.detail.matched_pages_count > 0) matchedRecords.push({
+        record_id: result.rec.record_id,
+        meeting: result.rec.meeting,
+        date: result.rec.date,
+        pdf_url: result.rec.pdf_url,
+        from_cache: result.detail.from_cache,
+        matched_pages_count: result.detail.matched_pages_count,
+        matches: result.detail.matches,
+      });
+    }
+  }
+
+  if (recordsToScan.length > 0 && succeeded === 0) {
+    throw new Error(`PDF_EXTRACTION_FAILED: ${failures.length} 份議事錄全部擷取失敗`);
   }
 
   return {
     keyword,
-    scanned_records_count: recordsToScan.length,
+    scan_status: failures.length ? "partial" : "success",
+    attempted_records_count: recordsToScan.length,
+    succeeded_records_count: succeeded,
+    failed_records_count: failures.length,
+    scanned_records_count: succeeded,
     matched_records_count: matchedRecords.length,
+    failures,
     records: matchedRecords,
   };
 }

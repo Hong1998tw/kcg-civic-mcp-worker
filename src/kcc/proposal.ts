@@ -13,6 +13,7 @@ export interface KccProposal {
   explanation: string;
   method: string;
   remarks: string;
+  official_status: string;
   review: {
     first_reading: string;
     first_reading_date: string;
@@ -109,6 +110,7 @@ function parseMainTable(html: string): Record<string, string> {
             "備註",
             "提案類型",
             "會議",
+            "狀態",
           ].includes(label)
         ) {
           result[label] = cells[i + 1] || "";
@@ -119,7 +121,20 @@ function parseMainTable(html: string): Record<string, string> {
   return result;
 }
 
-function parseReviewTable(html: string): Record<string, string> {
+function fieldFromRow(row: string, label: RegExp, stopLabels: RegExp[] = []): string {
+  const match = label.exec(row);
+  if (!match) return "";
+  let value = row.slice((match.index || 0) + match[0].length);
+  let stop = value.length;
+  for (const stopLabel of stopLabels) {
+    const index = value.search(stopLabel);
+    if (index >= 0) stop = Math.min(stop, index);
+  }
+  value = value.slice(0, stop).replace(/^[\s：:/]+|[\s：:/]+$/g, "").trim();
+  return /^(?:決議|日期|審查意見|大會屆次)?$/.test(value) ? "" : value;
+}
+
+export function parseReviewTable(html: string): Record<string, string> {
   const tables = getTables(html);
   const result: Record<string, string> = {};
   for (const table of tables) {
@@ -127,20 +142,31 @@ function parseReviewTable(html: string): Record<string, string> {
     for (const cells of rows) {
       const row = cells.join(" ").trim();
       if (row.includes("一讀(交付)")) {
-        result.first_reading = row;
+        result.first_reading = fieldFromRow(row, /一讀\(交付\)\s*(?:決議)?\s*[：:]?/, [/\/?交付日期\s*[：:]?/, /一讀日期\s*[：:]?/]);
+        result.first_reading_date = fieldFromRow(row, /(?:交付日期|一讀日期)\s*[：:]?/);
       }
       if (row.includes("委員會審查意見")) {
-        result.committee_opinion = row;
+        result.committee_opinion = fieldFromRow(row, /委員會審查意見\s*[：:]?/, [/審查日期\s*[：:]?/]);
+        result.committee_date = fieldFromRow(row, /審查日期\s*[：:]?/);
       }
       if (row.includes("二讀決議")) {
-        result.second_reading_resolution = row;
+        result.second_reading_resolution = fieldFromRow(row, /二讀決議\s*[：:]?/, [/決議日期\s*[：:]?/]);
+        result.second_reading_date = fieldFromRow(row, /決議日期\s*[：:]?/);
       }
       if (row.includes("三讀決議")) {
-        result.third_reading_session = row;
+        result.third_reading_session = fieldFromRow(row, /三讀決議\s*(?:決議大會屆次)?\s*[：:]?/, [/決議日期\s*[：:]?/]);
+        result.third_reading_date = fieldFromRow(row, /決議日期\s*[：:]?/);
       }
     }
   }
   return result;
+}
+
+export function extractProposalSn(html: string): string {
+  const input = html.match(/<input\b[^>]*(?:name|id)=["'][^"']*(?:hidProposalSN|ProposalSN)[^"']*["'][^>]*>/i)?.[0] || "";
+  const value = input.match(/\bvalue\s*=\s*(["'])(\d+)\1/i)?.[2];
+  if (value) return value;
+  return cleanText(html).match(/(?:議案流水號|提案流水號)\s*[：:]?\s*(\d+)/)?.[1] || "";
 }
 
 export async function getKccProposal(
@@ -182,8 +208,16 @@ export async function getKccProposal(
       `無法取得高雄市議會議案詳細資料: HTTP ${resp.status}`,
     );
   }
+  const finalUrl = new URL(resp.url);
+  if (finalUrl.hostname !== "cissearch.kcc.gov.tw" || finalUrl.pathname !== "/System/Proposal/Detail.aspx") {
+    throw new Error("PARSER_CONTRACT_CHANGED: 議案詳情被重新導向非預期頁面");
+  }
 
   const html = await resp.text();
+  const sourceProposalSn = extractProposalSn(html);
+  if (!sourceProposalSn || sourceProposalSn !== proposalSn) {
+    throw new Error(`SOURCE_ID_MISMATCH: 請求 proposal_sn=${proposalSn}，來源頁面為 ${sourceProposalSn || "unknown"}`);
+  }
   const main = parseMainTable(html);
   const review = parseReviewTable(html);
 
@@ -208,6 +242,7 @@ export async function getKccProposal(
     explanation: main["說明"] || "",
     method: main["辦法"] || "",
     remarks: main["備註"] || "",
+    official_status: main["狀態"] || "",
     review: {
       first_reading: review.first_reading || "",
       first_reading_date: review.first_reading_date || "",

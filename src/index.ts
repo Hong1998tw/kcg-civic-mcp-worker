@@ -34,15 +34,10 @@ function checkAuthorized(request: Request, env: Env): boolean {
     return isLocalHost(host) && isTruthy(env.MCP_ALLOW_ANONYMOUS);
   }
 
-  const url = new URL(request.url);
-  const pathParts = url.pathname.split("/").filter(Boolean);
-  const pathSecret = pathParts.length === 2 && pathParts[0] === "mcp" ? pathParts[1] : null;
-  const querySecret = url.searchParams.get("key") || url.searchParams.get("token");
   const authHeader = request.headers.get("Authorization") || "";
   const headerSecret = /^Bearer\s+/i.test(authHeader) ? authHeader.replace(/^Bearer\s+/i, "").trim() : null;
 
-  return validSecrets.some((s) => [pathSecret, querySecret, headerSecret]
-    .some((candidate) => !!candidate && constantTimeEqual(s as string, candidate)));
+  return validSecrets.some((s) => !!headerSecret && constantTimeEqual(s as string, headerSecret));
 }
 
 function rpcError(id: unknown, code: number, message: string, data?: Record<string, unknown>) {
@@ -99,10 +94,24 @@ async function processRpc(body: any, env: Env) {
       return {
         jsonrpc: "2.0",
         id,
-        result: { content: [{ type: "text", text: JSON.stringify(output) }] },
+        result: {
+          content: [{ type: "text", text: JSON.stringify(output) }],
+          structuredContent: output,
+        },
       };
     } catch (err: any) {
-      return rpcError(id, -32603, err.message || "工具執行失敗");
+      const message = err?.message || "工具執行失敗";
+      const reasonCode = /^([A-Z_]+):/.exec(message)?.[1] || "TOOL_EXECUTION_FAILED";
+      const errorOutput = { status: "error", reason_code: reasonCode, message };
+      return {
+        jsonrpc: "2.0",
+        id,
+        result: {
+          isError: true,
+          content: [{ type: "text", text: JSON.stringify(errorOutput) }],
+          structuredContent: errorOutput,
+        },
+      };
     }
   }
 

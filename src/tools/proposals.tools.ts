@@ -1,5 +1,5 @@
 import { ToolDefinition } from "../models/types";
-import { buildKccEnvelope } from "../utils/envelope";
+import { buildKccEnvelope, buildOfficialProvenance, buildPartialEnvelope } from "../utils/envelope";
 import { searchKccProposals } from "../kcc/search";
 import { getKccProposal } from "../kcc/proposal";
 import { getProposalAttachments } from "../kcc/attachment";
@@ -129,7 +129,7 @@ export const PROPOSAL_TOOLS: ToolDefinition[] = [
   },
   {
     name: "kcc_get_schedule",
-    description: "查詢高雄市議會定期大會與臨時會之議事日程、會期行事曆與各審查會排程。",
+    description: "暫停：尚未接通官方日程來源；呼叫會明確回傳 FEATURE_UNAVAILABLE。",
     inputSchema: {
       type: "object",
       properties: {
@@ -149,7 +149,7 @@ export const PROPOSAL_TOOLS: ToolDefinition[] = [
   },
   {
     name: "kcc_get_councilor",
-    description: "查詢高雄市議會特定議員之基本資料、選區、所屬政黨與隸屬委員會。",
+    description: "暫停：尚未接通可驗證的官方議員名錄；呼叫會明確回傳 FEATURE_UNAVAILABLE。",
     inputSchema: {
       type: "object",
       properties: {
@@ -221,7 +221,7 @@ export const PROPOSAL_TOOLS: ToolDefinition[] = [
   },
   {
     name: "kcc_search_temporary_proposals",
-    description: "專門檢索高雄市議會議員臨時提案紀錄。",
+    description: "暫停：尚未完成臨時提案專用種類／分頁驗證；呼叫會明確回傳 FEATURE_UNAVAILABLE。",
     inputSchema: {
       type: "object",
       properties: {
@@ -245,7 +245,7 @@ export const PROPOSAL_TOOLS: ToolDefinition[] = [
   },
   {
     name: "kcc_search_committees",
-    description: "查詢高雄市議會各委員會名稱、權責範疇與審查業務。",
+    description: "暫停：尚未接通可驗證的官方委員會名錄；呼叫會明確回傳 FEATURE_UNAVAILABLE。",
     inputSchema: {
       type: "object",
       properties: {
@@ -263,7 +263,7 @@ export const PROPOSAL_TOOLS: ToolDefinition[] = [
   },
   {
     name: "kcc_search_speeches",
-    description: "檢索議員在大會或各委員會之發言公報與質詢對話摘要。",
+    description: "暫停：一般議事錄同頁文字共現不能證明發言歸屬；呼叫會明確回傳 FEATURE_UNAVAILABLE。",
     inputSchema: {
       type: "object",
       properties: {
@@ -282,7 +282,7 @@ export const PROPOSAL_TOOLS: ToolDefinition[] = [
   },
   {
     name: "kcc_get_proposal_relations",
-    description: "針對特定議案進行同類別、相同連署人與關聯提案之交叉分析推介。",
+    description: "暫停：尚未建立可驗證的議案關聯契約；呼叫會明確回傳 FEATURE_UNAVAILABLE。",
     inputSchema: {
       type: "object",
       properties: {
@@ -303,7 +303,7 @@ export const PROPOSAL_TOOLS: ToolDefinition[] = [
   {
     name: "kcc_get_meeting_record",
     description:
-      "取得並檢索特定議事錄／會議紀錄 PDF 之完整文字內容（整合 R2 文字層快取）。支援依 record_id 與關鍵字檢索特定議員發言、質詢主題或決議事項。",
+      "取得並檢索特定議事錄 PDF 文字層。結果只代表頁面文字命中，不代表發言者歸屬；查詢不會寫入 R2。",
     inputSchema: {
       type: "object",
       properties: {
@@ -366,8 +366,12 @@ export const PROPOSAL_TOOLS: ToolDefinition[] = [
         },
       },
     },
-    handler: async (args: any, env: any) =>
-      kccEnvelope(await searchMeetingRecordsContent(args || {}, env), KCC_RECORD_URL),
+    handler: async (args: any, env: any) => {
+      const result = await searchMeetingRecordsContent(args || {}, env);
+      return result.scan_status === "partial"
+        ? buildPartialEnvelope(result, buildOfficialProvenance(KCC_RECORD_URL), { reason_code: "PARTIAL_SCAN" })
+        : kccEnvelope(result, KCC_RECORD_URL);
+    },
   },
 ];
 

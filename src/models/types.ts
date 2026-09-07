@@ -3,7 +3,6 @@ export interface Env {
   AUTH_TOKEN?: string;
   /** Set to true only for an explicitly configured local/demo deployment. */
   MCP_ALLOW_ANONYMOUS?: string | boolean;
-  MCP_ALLOW_DEMO_DATA?: string | boolean;
   CORS_ALLOWED_ORIGINS?: string;
   kcg_civic_data?: R2Bucket;
   [key: string]: any;
@@ -17,6 +16,9 @@ export interface Provenance {
   retrieved_at: string;
   published_at?: string;
   content_hash: string;
+  validation_status?: "passed" | "pending" | "failed";
+  snapshot_id?: string;
+  coverage?: { scope: string; complete: boolean };
 }
 
 export interface StandardEnvelope<T> {

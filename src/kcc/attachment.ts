@@ -14,6 +14,7 @@ export async function getProposalAttachments(proposalSn: string) {
   if (!/^\d+$/.test(String(proposalSn || "").trim())) {
     throw new Error("proposal_sn 必須是數字流水號");
   }
+  proposalSn = String(proposalSn).trim();
   const tokens = await fetchWebFormsTokens();
 
   const url =
@@ -34,6 +35,10 @@ export async function getProposalAttachments(proposalSn: string) {
 
   if (!resp.ok) {
     throw new Error(`取得附件清單失敗: HTTP ${resp.status}`);
+  }
+  const finalUrl = new URL(resp.url);
+  if (finalUrl.protocol !== "https:" || finalUrl.hostname !== "cissearch.kcc.gov.tw" || finalUrl.pathname !== "/Common/GetAttachmentList.ashx" || finalUrl.searchParams.get("s") !== proposalSn) {
+    throw new Error(`SOURCE_ID_MISMATCH: 附件回應與 proposal_sn=${proposalSn} 不一致`);
   }
 
   const html = await resp.text();
@@ -102,14 +107,19 @@ export async function getProposalAttachments(proposalSn: string) {
 
       if (links.length > 0) {
         const href = links[0];
-
-        attachment.download_url = href.startsWith("http")
-          ? href
-          : new URL(href, KCC_BASE_URL).toString();
+        const download = new URL(href, KCC_BASE_URL);
+        if (download.protocol !== "https:" || download.hostname !== "cissearch.kcc.gov.tw") {
+          throw new Error("PARSER_CONTRACT_CHANGED: 附件下載連結不是高雄市議會官方網址");
+        }
+        attachment.download_url = download.toString();
       }
 
       attachments.push(attachment);
     }
+  }
+
+  if (attachments.length === 0) {
+    throw new Error("PARSER_CONTRACT_CHANGED: 附件頁既無官方空集合標記，也沒有可解析附件");
   }
 
   return {

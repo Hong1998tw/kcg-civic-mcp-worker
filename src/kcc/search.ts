@@ -13,10 +13,12 @@ export interface ProposalSearchArgs {
 export interface KccProposalSearchResult {
   category?: string;
   proposal_sn: string;
-  proposal_kind: string;
+  proposal_kind: string | null;
   detail_url: string;
   number?: string;
   councilor?: string;
+  proposer?: string;
+  proposer_type: "councilor" | "government_agency" | "unknown";
   subject?: string;
   status?: string;
 }
@@ -32,6 +34,8 @@ export interface KccProposalSearchResponse {
   keyword: string;
   councilor: string;
   proposals: KccProposalSearchResult[];
+  applied_filters: Record<string, string>;
+  tab_counts: number[];
 }
 
 export interface OfficialMeetingOption {
@@ -67,10 +71,7 @@ function normalizePeriod(value?: string): string {
 }
 
 function normalizeSession(value?: string): string {
-  const input = (value || "0704").trim();
-  if (/^\d{4}$/.test(input)) return input;
-  if (/^\d{1,2}$/.test(input)) return `07${input.padStart(2, "0")}`;
-  return input;
+  return (value || "").trim();
 }
 
 function validateCode(value: string, field: string, pattern: RegExp): string {
@@ -129,7 +130,7 @@ export function parseProposalRows(html: string): KccProposalSearchResult[] {
     const sn = attr(snInput, "value");
     if (!/^\d+$/.test(sn)) continue;
     const kindInput = row.match(/<input\b[^>]*name=["'][^"']*hidProposalKind[^"']*["'][^>]*>/i)?.[0] || "";
-    const kind = attr(kindInput, "value") || "1";
+    const kind = attr(kindInput, "value") || null;
     const detailMatch = row.match(/Detail\.aspx\?([^"'\s<>]+)/i);
     const detailUrl = detailMatch ? decodeHtml(`Detail.aspx?${detailMatch[1]}`) : `Detail.aspx?s=${encodeURIComponent(sn)}`;
     const rawCells: string[] = [];
@@ -137,13 +138,16 @@ export function parseProposalRows(html: string): KccProposalSearchResult[] {
     let cell: RegExpExecArray | null;
     while ((cell = cellRegex.exec(row)) !== null) rawCells.push(cleanText(cell[1]));
     if (rawCells.length < 6) continue;
+    const proposer = (rawCells[3] || "").replace(/[,，\s]+$/, "");
     results.push({
       proposal_sn: sn,
       proposal_kind: kind,
       detail_url: detailUrl,
       number: rawCells[1] || "",
       category: rawCells[2] || "",
-      councilor: (rawCells[3] || "").replace(/[,，\s]+$/, ""),
+      councilor: kind === "1" ? proposer : undefined,
+      proposer,
+      proposer_type: kind === "1" ? "councilor" : "unknown",
       subject: rawCells[4] || "",
       status: rawCells[5] || "",
     });
@@ -151,21 +155,34 @@ export function parseProposalRows(html: string): KccProposalSearchResult[] {
   return [...new Map(results.map((item) => [item.proposal_sn, item])).values()];
 }
 
-function parsePager(html: string): { total: number | null; page: number | null; pages: number | null } {
-  const totalMatch = html.match(/共\s*([\d,]+)\s*筆/i);
+export function parsePager(html: string): { total: number | null; page: number | null; pages: number | null; tabCounts: number[] } {
+  const tabCounts = [...html.matchAll(/共\s*([\d,]+)\s*筆/gi)].map((match) => Number(match[1].replace(/,/g, "")));
   const pagesMatch = html.match(/(\d+)\s*\/\s*(\d+)\s*頁/i);
   return {
-    total: totalMatch ? Number(totalMatch[1].replace(/,/g, "")) : null,
+    total: tabCounts.length === 1 ? tabCounts[0] : null,
     page: pagesMatch ? Number(pagesMatch[1]) : null,
     pages: pagesMatch ? Number(pagesMatch[2]) : null,
+    tabCounts,
   };
+}
+
+export function selectedControlValue(html: string, suffix: string): string {
+  const select = html.match(new RegExp(`<select\\b[^>]*(?:name|id)=["'][^"']*${suffix}[^"']*["'][^>]*>([\\s\\S]*?)<\\/select>`, "i"))?.[1];
+  if (select) {
+    const selected = (select.match(/<option\b[^>]*>/gi) || []).find((option) => /\bselected\b/i.test(option)) || "";
+    return attr(selected, "value").trim();
+  }
+  const input = (html.match(/<input\b[^>]*>/gi) || []).find((element) =>
+    new RegExp(`(?:name|id)=["'][^"']*${suffix}[^"']*["']`, "i").test(element)) || "";
+  return attr(input, "value").trim();
 }
 
 export async function searchKccProposals(args: ProposalSearchArgs = {}): Promise<KccProposalSearchResponse> {
   const tokens = await fetchWebFormsTokens(KCC_SEARCH_URL);
   if (!tokens.viewState || !tokens.eventValidation) throw new Error("議會查詢頁缺少 WebForms 驗證欄位");
   const period = validateCode(normalizePeriod(args.period), "period", /^\d{2,4}$/);
-  const session = validateCode(normalizeSession(args.session), "session", /^\d{4}$/);
+  const session = normalizeSession(args.session);
+  if (session) validateCode(session, "session", /^\d{4}$/);
   let meeting = (args.meeting || "").trim();
   if (meeting) validateCode(meeting, "meeting", /^\d{8}$/);
   if (!meeting && args.meeting_number !== undefined) {
@@ -204,7 +221,22 @@ export async function searchKccProposals(args: ProposalSearchArgs = {}): Promise
     signal: AbortSignal.timeout(12000),
   });
   if (!resp.ok) throw new Error(`議案查詢 POST 請求失敗: HTTP ${resp.status}`);
+  const finalUrl = new URL(resp.url);
+  if (finalUrl.hostname !== "cissearch.kcc.gov.tw" || finalUrl.pathname !== "/System/Proposal/Default.aspx") {
+    throw new Error("PARSER_CONTRACT_CHANGED: 議案查詢被重新導向非預期頁面");
+  }
   const html = await resp.text();
+  const requestedFilters: Array<[string, string, string]> = [
+    ["period", "ddlPeriod", period], ["session", "ddlSession", session], ["meeting", "ddlMeeting", meeting],
+    ["councilor", "ddlCouncilor", councilor], ["category", "ddlCategory", category], ["keyword", "txtKeyword", keyword],
+  ];
+  const appliedFilters: Record<string, string> = {};
+  for (const [field, control, expected] of requestedFilters) {
+    if (!expected) continue;
+    const actual = selectedControlValue(html, control);
+    if (actual !== expected) throw new Error(`FILTER_NOT_CONFIRMED: ${field}=${expected} 未被官方回應確認`);
+    appliedFilters[field] = actual;
+  }
   const proposals = parseProposalRows(html);
   const pager = parsePager(html);
   const isComplete = pager.total === null ? null : proposals.length >= pager.total;
@@ -215,11 +247,15 @@ export async function searchKccProposals(args: ProposalSearchArgs = {}): Promise
     current_page: pager.page,
     page_count: pager.pages,
     official_url: KCC_SEARCH_URL,
-    notice: isComplete === false
-      ? `官方查詢系統採分頁，本次僅回傳目前頁 ${proposals.length} 筆；符合條件總數為 ${pager.total} 筆。請至 official_url 查閱其餘頁次。`
-      : null,
+    notice: pager.tabCounts.length > 1
+      ? `官方回應包含 ${pager.tabCounts.length} 個 tab（各自總數 ${pager.tabCounts.join("/")}）；本次混合頁面不能使用單一 total_count，完整性未知。`
+      : isComplete === false
+        ? `官方查詢系統採分頁，本次僅回傳目前頁 ${proposals.length} 筆；符合條件總數為 ${pager.total} 筆。請至 official_url 查閱其餘頁次。`
+        : null,
     keyword,
     councilor,
     proposals,
+    applied_filters: appliedFilters,
+    tab_counts: pager.tabCounts,
   };
 }

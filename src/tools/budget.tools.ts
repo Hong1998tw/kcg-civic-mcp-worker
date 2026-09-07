@@ -5,6 +5,9 @@ import { parseBudgetSummaryRaw } from "./budget.parser";
 
 const SUMMARY_CACHE = new Map<number, { result: any; expiresAt: number }>();
 const SUMMARY_CACHE_TTL_MS = 1000 * 60 * 60;
+const BUDGET_RESOURCES: Record<number, { datasetId: number; resourceUuid: string; version: "original"; legalStatus: "adopted" }> = {
+  115: { datasetId: 101174, resourceUuid: "6712fdb8-c0ff-4f0c-901f-03023c17e15d", version: "original", legalStatus: "adopted" },
+};
 
 const PROVENANCE_SCHEMA = {
   type: "object",
@@ -56,6 +59,8 @@ export const BUDGET_TOOLS: ToolDefinition[] = [
     handler: async (args, env) => {
       const year = args.year === undefined ? 115 : Number(args.year);
       if (!Number.isInteger(year) || year < 1 || year > 999) throw new Error("year 必須是有效的民國年度");
+      const resource = BUDGET_RESOURCES[year];
+      if (!resource) throw new Error(`FEATURE_UNAVAILABLE: 尚未建立民國 ${year} 年預算資源與版本映射`);
 
       const cached = SUMMARY_CACHE.get(year);
       if (cached && cached.expiresAt > Date.now()) {
@@ -64,8 +69,8 @@ export const BUDGET_TOOLS: ToolDefinition[] = [
 
       const { rawContent, provenance } = await fetchBudgetRawData(
         year,
-        101174,
-        "6712fdb8-c0ff-4f0c-901f-03023c17e15d",
+        resource.datasetId,
+        resource.resourceUuid,
         env
       );
 
@@ -73,6 +78,8 @@ export const BUDGET_TOOLS: ToolDefinition[] = [
       const result = buildEnvelope(
         {
           year,
+          budget_version: resource.version,
+          legal_status: resource.legalStatus,
           agency_count: parsed.agency_count,
           agency_sum_budget_thousand_twd: parsed.agency_sum_budget_thousand_twd,
           official_total_budget_thousand_twd: parsed.official_total_budget_thousand_twd,
@@ -81,8 +88,11 @@ export const BUDGET_TOOLS: ToolDefinition[] = [
         },
         provenance,
         {
-          dataset_id: 101174,
+          dataset_id: resource.datasetId,
+          resource_uuid: resource.resourceUuid,
           year,
+          budget_version: resource.version,
+          legal_status: resource.legalStatus,
           unit: "新臺幣千元",
           parser: "schema-aware-v2",
         }

@@ -146,7 +146,7 @@ export const COUNCIL_TOOLS: ToolDefinition[] = [
       const limit = boundedLimit(args.limit, 10, 50);
 
       const result = await searchSpeeches({ keyword, speaker: legislator || undefined }, env);
-      const data = result.speeches.slice(0, limit).map((speech) => ({
+      const data = result.speeches.slice(0, limit).map((speech: any) => ({
         record_id: speech.record_id,
         term: 4,
         legislator_name: legislator || "未結構化標註",
