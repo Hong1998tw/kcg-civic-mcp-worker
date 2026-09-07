@@ -101,7 +101,9 @@ async function processRpc(body: any, env: Env) {
       };
     } catch (err: any) {
       const message = err?.message || "工具執行失敗";
-      const reasonCode = /^([A-Z_]+):/.exec(message)?.[1] || "TOOL_EXECUTION_FAILED";
+      const reasonCode = typeof err?.reasonCode === "string"
+        ? err.reasonCode
+        : /^([A-Z_]+):/.exec(message)?.[1] || "TOOL_EXECUTION_FAILED";
       const errorOutput = { status: "error", reason_code: reasonCode, message };
       return {
         jsonrpc: "2.0",
