@@ -68,7 +68,9 @@ ${message ? `<p role="alert" class="error">${escape(message)}</p>` : ""}
 <label for="owner-key">服務存取金鑰</label><input id="owner-key" type="password" name="access_key" autocomplete="current-password" required maxlength="4096">
 <button name="decision" value="allow" type="submit">同意並連接</button><button name="decision" value="deny" type="submit" class="secondary" formnovalidate>取消</button></form>
 <p class="muted">使用本服務既有的存取金鑰；金鑰只在本服務驗證，ChatGPT 取得的是獨立且可撤銷的授權 token。</p></main></body></html>`, {
-    status, headers: { ...securityHeaders(redirect), "Content-Type": "text/html; charset=utf-8", "Set-Cookie": cookie(origin, nonce) },
+    // no-referrer makes navigation-mode form POSTs send Origin: null. Preserve
+    // the same-origin proof required below without sending referrers off-site.
+    status, headers: { ...securityHeaders(redirect), "Referrer-Policy": "same-origin", "Content-Type": "text/html; charset=utf-8", "Set-Cookie": cookie(origin, nonce) },
   });
 }
 
@@ -82,16 +84,16 @@ export async function handleConsent(request: Request, env: AuthEnv): Promise<Res
 
   let nonce = "", consentKey = "", query = url.searchParams.toString(), values: URLSearchParams | undefined;
   if (request.method === "POST") {
-    if (request.headers.get("Origin") !== origin) return authError("invalid_request", 403);
+    if (request.headers.get("Origin") !== origin) return json({ error: "invalid_request", diagnostic: "CONSENT_ORIGIN_REJECTED" }, 403);
     values = new URLSearchParams(await request.text());
     if ([...values.keys()].some((key) => values!.getAll(key).length !== 1)) return authError("invalid_request");
     nonce = values.get("csrf") || "";
     const browserNonce = (request.headers.get("Cookie") || "").split(";").map((s) => s.trim())
       .find((s) => s.startsWith(`${cookieName(origin)}=`))?.slice(cookieName(origin).length + 1) || "";
-    if (!/^[a-f0-9]{64}$/.test(nonce) || !constantTimeEqual(nonce, browserNonce)) return authError("invalid_request", 403);
+    if (!/^[a-f0-9]{64}$/.test(nonce) || !constantTimeEqual(nonce, browserNonce)) return json({ error: "invalid_request", diagnostic: "CONSENT_COOKIE_MISMATCH" }, 403);
     consentKey = `consent:${await digest(nonce)}`;
     const saved = await env.AUTH_STORAGE.get<ConsentState>(consentKey, "json");
-    if (!saved) return authError("invalid_request", 403);
+    if (!saved) return json({ error: "invalid_request", diagnostic: "CONSENT_EXPIRED_OR_USED" }, 403);
     query = saved.query;
   }
 

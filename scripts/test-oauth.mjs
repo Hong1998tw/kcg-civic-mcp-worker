@@ -76,6 +76,7 @@ try {
     const csrf = html.match(/name="csrf" value="([a-f0-9]+)"/)?.[1];
     const cookie = response.headers.get("set-cookie")?.split(";")[0];
     check(csrf && cookie, "CSRF binding missing");
+    check(response.headers.get("referrer-policy") === "same-origin", "browser form POST would lose its Origin proof");
     check(!html.includes(secret), "owner credential exposed");
     check(response.headers.get("content-security-policy")?.includes(redirect), "callback CSP missing");
     check(!response.headers.get("content-security-policy")?.includes("*"), "wildcard CSP");
@@ -107,6 +108,8 @@ try {
   check((await authorize({ resource: "https://example.com/mcp" })).status === 400, "foreign resource accepted");
   check((await authorize({ scope: "mcp:write" })).status === 400, "unknown scope accepted");
   const state = await consent();
+  const nullOrigin = await formPost("/oauth/authorize", { csrf: state.csrf, access_key: secret, decision: "allow" }, { Origin: "null", Cookie: state.cookie });
+  check(nullOrigin.status === 403 && (await nullOrigin.json()).diagnostic === "CONSENT_ORIGIN_REJECTED", "opaque Origin must remain rejected even with valid cookie");
   check((await formPost("/oauth/authorize", { csrf: state.csrf, access_key: secret, decision: "allow" }, { Origin: origin })).status === 403, "missing cookie accepted");
   check((await approve(state, "invalid-test-key")).status === 401, "wrong owner key accepted");
   const denied = await approve(state, "", { decision: "deny" });

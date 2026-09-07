@@ -9,7 +9,7 @@ function withHeaders(response: Response, origin: string | null): Response {
   const headers = new Headers(response.headers);
   headers.set("Cache-Control", "no-store");
   headers.set("X-Content-Type-Options", "nosniff");
-  headers.set("Referrer-Policy", "no-referrer");
+  if (!headers.has("Referrer-Policy")) headers.set("Referrer-Policy", "no-referrer");
   if (origin) { headers.set("Access-Control-Allow-Origin", origin); headers.append("Vary", "Origin"); }
   headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization, MCP-Protocol-Version, MCP-Session-Id");
