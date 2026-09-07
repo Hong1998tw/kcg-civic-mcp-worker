@@ -6,7 +6,7 @@ import type { Env } from "../models/types";
 
 export async function handleMcp(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") return new Response(null, { status: 405, headers: { Allow: "POST, OPTIONS" } });
-  const server = new Server({ name: "高雄市公民資料 MCP", version: "1.1.0" }, { capabilities: { tools: { listChanged: false } } });
+  const server = new Server({ name: "高雄市公民資料 MCP", version: "1.1.1" }, { capabilities: { tools: { listChanged: false } } });
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOL_REGISTRY.map((tool) => ({
     name: tool.name, description: tool.description,
     inputSchema: { ...tool.inputSchema, type: "object" as const },

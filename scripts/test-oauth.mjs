@@ -99,6 +99,9 @@ try {
   const revoke = (token) => formPost("/oauth/token", { token, token_type_hint: "refresh_token", client_id: client.client_id });
 
   current = "consent protections";
+  const crossSiteConsent = await invoke("/oauth/authorize?" + new URLSearchParams(authParams), { headers: { Origin: "null" } });
+  check(crossSiteConsent.status === 200, "cross-site authorization navigation blocked");
+  check(!crossSiteConsent.headers.has("access-control-allow-origin"), "untrusted authorization origin received CORS access");
   check((await authorize({ redirect_uri: "https://example.com/unregistered" })).status === 400, "unregistered redirect accepted");
   check((await authorize({ code_challenge_method: "plain" })).status === 400, "plain PKCE accepted");
   check((await authorize({ resource: "https://example.com/mcp" })).status === 400, "foreign resource accepted");

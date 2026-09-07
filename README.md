@@ -3,7 +3,7 @@
 正式 HTTPS 網址：<https://kcg-civic-mcp-worker.lihong.workers.dev>  
 專案名稱：`kcg-civic-mcp-worker`  
 MCP Endpoint：<https://kcg-civic-mcp-worker.lihong.workers.dev/mcp>  
-版本：`1.1.0`  
+版本：`1.1.1`  
 平台：Cloudflare Workers + R2 + SQLite Durable Object
 
 ## 連線
