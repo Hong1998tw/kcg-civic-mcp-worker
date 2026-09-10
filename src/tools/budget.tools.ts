@@ -1,15 +1,20 @@
 import { ToolDefinition } from "../models/types";
 import { fetchBudgetRawData } from "../adapters/budget.adapter";
 import { buildEnvelope } from "../utils/envelope";
+import { parseBudgetSummaryRaw } from "./budget.parser";
 
-const SUMMARY_CACHE = new Map<number, any>();
+const SUMMARY_CACHE = new Map<number, { result: any; expiresAt: number }>();
+const SUMMARY_CACHE_TTL_MS = 1000 * 60 * 60;
+const BUDGET_RESOURCES: Record<number, { datasetId: number; resourceUuid: string; version: "original"; legalStatus: "adopted" }> = {
+  115: { datasetId: 101174, resourceUuid: "6712fdb8-c0ff-4f0c-901f-03023c17e15d", version: "original", legalStatus: "adopted" },
+};
 
 const PROVENANCE_SCHEMA = {
   type: "object",
   properties: {
     source_id: { type: ["string", "number"] },
     source_url: { type: "string" },
-    source_type: { type: "string", enum: ["openapi", "csv_direct", "r2", "cache"] },
+    source_type: { type: "string", enum: ["openapi", "csv_direct", "official_web", "r2", "cache", "fallback"] },
     agency: { type: "string" },
     retrieved_at: { type: "string" },
     content_hash: { type: "string" },
@@ -42,7 +47,7 @@ export const BUDGET_TOOLS: ToolDefinition[] = [
             year: { type: "number" },
             agency_count: { type: "number" },
             agency_sum_budget_thousand_twd: { type: "number" },
-            official_total_budget_thousand_twd: { type: "number" },
+            official_total_budget_thousand_twd: { type: ["number", "null"], description: "原始資料明載之總額；未明載時為 null" },
             highest: { type: "object" },
             lowest: { type: "object" },
           },
@@ -52,50 +57,48 @@ export const BUDGET_TOOLS: ToolDefinition[] = [
       required: ["status", "provider", "updated_at", "provenance", "data"],
     },
     handler: async (args, env) => {
-      const year = args.year || 115;
-      if (SUMMARY_CACHE.has(year)) {
-        return SUMMARY_CACHE.get(year);
+      const year = args.year === undefined ? 115 : Number(args.year);
+      if (!Number.isInteger(year) || year < 1 || year > 999) throw new Error("year 必須是有效的民國年度");
+      const resource = BUDGET_RESOURCES[year];
+      if (!resource) throw new Error(`FEATURE_UNAVAILABLE: 尚未建立民國 ${year} 年預算資源與版本映射`);
+
+      const cached = SUMMARY_CACHE.get(year);
+      if (cached && cached.expiresAt > Date.now()) {
+        return cached.result;
       }
 
       const { rawContent, provenance } = await fetchBudgetRawData(
         year,
-        101174,
-        "6712fdb8-c0ff-4f0c-901f-03023c17e15d",
+        resource.datasetId,
+        resource.resourceUuid,
         env
       );
 
-      const lines = rawContent.split("\n").filter((l) => l.trim().length > 0);
-      let agencySum = 0;
-      let agencyCount = 0;
-      let highest = { record_type: "agency", account_name: "", budget_thousand_twd: 0 };
-      let lowest = { record_type: "agency", account_name: "", budget_thousand_twd: Number.MAX_SAFE_INTEGER };
-
-      for (let i = 1; i < lines.length; i++) {
-        const cols = lines[i].split(",").map((c) => c.trim().replace(/^"|"$/g, ""));
-        const name = cols[0];
-        const val = parseInt(cols[1]?.replace(/[^\d]/g, ""), 10);
-        if (!isNaN(val) && name && !name.includes("合計") && !name.includes("總額")) {
-          agencyCount++;
-          agencySum += val;
-          if (val > highest.budget_thousand_twd) highest = { record_type: "agency", account_name: name, budget_thousand_twd: val };
-          if (val < lowest.budget_thousand_twd) lowest = { record_type: "agency", account_name: name, budget_thousand_twd: val };
-        }
-      }
-
+      const parsed = parseBudgetSummaryRaw(rawContent);
       const result = buildEnvelope(
         {
           year,
-          agency_count: agencyCount,
-          agency_sum_budget_thousand_twd: agencySum,
-          official_total_budget_thousand_twd: 197823502,
-          highest,
-          lowest,
+          budget_version: resource.version,
+          legal_status: resource.legalStatus,
+          agency_count: parsed.agency_count,
+          agency_sum_budget_thousand_twd: parsed.agency_sum_budget_thousand_twd,
+          official_total_budget_thousand_twd: parsed.official_total_budget_thousand_twd,
+          highest: parsed.highest,
+          lowest: parsed.lowest,
         },
         provenance,
-        { dataset_id: 101174, year, unit: "新臺幣千元" }
+        {
+          dataset_id: resource.datasetId,
+          resource_uuid: resource.resourceUuid,
+          year,
+          budget_version: resource.version,
+          legal_status: resource.legalStatus,
+          unit: "新臺幣千元",
+          parser: "schema-aware-v2",
+        }
       );
 
-      SUMMARY_CACHE.set(year, result);
+      SUMMARY_CACHE.set(year, { result, expiresAt: Date.now() + SUMMARY_CACHE_TTL_MS });
       return result;
     },
   },

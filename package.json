@@ -1,12 +1,17 @@
 {
   "name": "kcg-civic-mcp-worker",
-  "version": "1.0.0",
+  "version": "1.1.1",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "typecheck": "tsc --noEmit",
+    "test:budget-parser": "rm -rf .tmp-budget-parser && tsc --ignoreConfig src/tools/budget.parser.ts --target ES2022 --module nodenext --moduleResolution nodenext --outDir .tmp-budget-parser --skipLibCheck && node scripts/test-budget-parser.cjs && rm -rf .tmp-budget-parser",
+    "test:integrity": "rm -rf .tmp-integrity && tsc --ignoreConfig src/utils/crypto.ts src/utils/integrity.ts src/models/types.ts src/kcc/client.ts src/kcc/search.ts src/kcc/proposal.ts src/kcc/identity.ts --target ES2022 --module node16 --moduleResolution node16 --outDir .tmp-integrity --skipLibCheck --types @cloudflare/workers-types && node scripts/test-integrity.cjs && rm -rf .tmp-integrity",
+    "test:oauth": "node scripts/test-oauth.mjs",
+    "test": "npm run typecheck && npm run test:budget-parser && npm run test:integrity && npm run test:oauth",
     "dev": "wrangler dev",
     "verify:toolchain": "node scripts/assert-wrangler-version.mjs",
-    "predeploy": "npm run verify:toolchain",
+    "verify:production-safety": "node scripts/assert-production-safe.mjs",
+    "predeploy": "npm test && npm run verify:production-safety && npm run verify:toolchain",
     "deploy": "wrangler deploy"
   },
   "keywords": [],
@@ -14,8 +19,15 @@
   "license": "ISC",
   "description": "",
   "devDependencies": {
-    "@cloudflare/workers-types": "^5.20260905.1",
+    "@types/node": "^26.4.1",
+    "esbuild": "0.28.1",
+    "miniflare": "5.20260903.0-alpha",
     "typescript": "^7.0.2",
     "wrangler": "^4.129.0"
+  },
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "0.10.3",
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "unpdf": "^1.8.1"
   }
 }

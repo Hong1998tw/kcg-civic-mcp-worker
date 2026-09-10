@@ -1,141 +1,78 @@
-import { Env } from "./models/types";
-import { BUDGET_TOOLS } from "./tools/budget.tools";
-import { LAW_TOOLS } from "./tools/laws.tools";
-import { COUNCIL_TOOLS } from "./tools/council.tools";
-import { NEWS_TOOLS } from "./tools/news.tools";
+import type { Env } from "./models/types";
+import { handleMcp } from "./mcp/transport";
+export { OAuthState } from "./auth/state";
 
-const ALL_TOOLS = [...BUDGET_TOOLS, ...LAW_TOOLS, ...COUNCIL_TOOLS, ...NEWS_TOOLS];
+const OAUTH_PATHS = new Set(["/oauth/authorize", "/oauth/token", "/oauth/register",
+  "/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp", "/.well-known/oauth-authorization-server"]);
 
-const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, mcp-session-id",
-};
-
-function checkAuthorized(request: Request, env: Env): boolean {
-  if (!env.AUTH_TOKEN) return true;
-  const url = new URL(request.url);
-  if (url.searchParams.get("token") === env.AUTH_TOKEN) return true;
-  const authHeader = request.headers.get("Authorization") || "";
-  const [scheme, token] = authHeader.split(" ");
-  return scheme === "Bearer" && token === env.AUTH_TOKEN;
+function withHeaders(response: Response, origin: string | null): Response {
+  const headers = new Headers(response.headers);
+  headers.set("Cache-Control", "no-store");
+  headers.set("X-Content-Type-Options", "nosniff");
+  if (!headers.has("Referrer-Policy")) headers.set("Referrer-Policy", "no-referrer");
+  if (origin) { headers.set("Access-Control-Allow-Origin", origin); headers.append("Vary", "Origin"); }
+  headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization, MCP-Protocol-Version, MCP-Session-Id");
+  headers.set("Access-Control-Expose-Headers", "WWW-Authenticate, MCP-Session-Id");
+  return new Response(response.body, { status: response.status, headers });
 }
 
-async function processRpc(body: any, env: Env) {
-  const { id, method, params } = body;
-
-  if (method === "initialize") {
-    return {
-      jsonrpc: "2.0",
-      id,
-      result: {
-        protocolVersion: "2024-11-05",
-        capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: "kcg-civic-mcp-worker", version: "0.5.0" },
-      },
-    };
+async function boundedBody(request: Request, maxBytes: number): Promise<ArrayBuffer | null> {
+  if (Number(request.headers.get("content-length") || 0) > maxBytes) return null;
+  const reader = request.body?.getReader();
+  if (!reader) return new ArrayBuffer(0);
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > maxBytes) { await reader.cancel(); return null; }
+    chunks.push(value);
   }
-
-  if (method === "notifications/initialized") return null;
-  if (method === "ping") return { jsonrpc: "2.0", id, result: {} };
-
-  if (method === "tools/list") {
-    return {
-      jsonrpc: "2.0",
-      id,
-      result: {
-        tools: ALL_TOOLS.map((t) => ({
-          name: t.name,
-          description: t.description,
-          inputSchema: t.inputSchema,
-          outputSchema: t.outputSchema,
-        })),
-      },
-    };
-  }
-
-  if (method === "tools/call") {
-    const tool = ALL_TOOLS.find((t) => t.name === params.name);
-    if (!tool) {
-      return { jsonrpc: "2.0", id, error: { code: -32601, message: `未知的工具: ${params.name}` } };
-    }
-    try {
-      const output = await tool.handler(params.arguments || {}, env);
-      return {
-        jsonrpc: "2.0",
-        id,
-        result: { content: [{ type: "text", text: JSON.stringify(output) }] },
-      };
-    } catch (err: any) {
-      return { jsonrpc: "2.0", id, error: { code: -32603, message: err.message || "工具執行失敗" } };
-    }
-  }
-
-  return { jsonrpc: "2.0", id, error: { code: -32601, message: `不支援的方法: ${method}` } };
+  const result = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) { result.set(chunk, offset); offset += chunk.length; }
+  return result.buffer;
 }
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    if (request.method === "OPTIONS") return new Response(null, { headers: CORS_HEADERS });
-
-    if (!checkAuthorized(request, env)) {
-      return new Response(
-        JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32000, message: "未經授權的連線請求" } }),
-        { status: 401, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } }
-      );
+    const url = new URL(request.url), browserOrigin = request.headers.get("Origin");
+    const allowed = new Set([env.PUBLIC_ORIGIN, "https://chatgpt.com", "https://chat.openai.com",
+      "http://localhost:6274", "http://127.0.0.1:6274", ...(env.CORS_ALLOWED_ORIGINS || "").split(",").filter(Boolean)]);
+    if (url.origin !== env.PUBLIC_ORIGIN) return new Response("Forbidden", { status: 403 });
+    const corsOrigin = browserOrigin && allowed.has(browserOrigin) ? browserOrigin : null;
+    // OAuth authorization is intentionally entered by a cross-site top-level
+    // navigation. Do not apply the MCP fetch CORS gate to that navigation;
+    // the authorization request, registered redirect, PKCE and consent POST
+    // origin are independently validated by OAuthState.
+    if ((request.method === "OPTIONS" || url.pathname === "/mcp") && browserOrigin && !corsOrigin) {
+      return new Response("Forbidden", { status: 403 });
     }
-
-    const url = new URL(request.url);
-
-    // 1. Web Standards SSE Transport
-    if (request.method === "GET") {
-      if (url.pathname === "/mcp" || url.pathname === "/sse" || url.pathname === "/") {
-        const { readable, writable } = new TransformStream();
-        const writer = writable.getWriter();
-        const encoder = new TextEncoder();
-        const tokenQuery = env.AUTH_TOKEN ? `?token=${encodeURIComponent(env.AUTH_TOKEN)}` : "";
-        const endpointEvent = `event: endpoint\ndata: ${url.origin}/mcp${tokenQuery}\n\n`;
-        writer.write(encoder.encode(endpointEvent));
-
-        return new Response(readable, {
-          headers: {
-            ...CORS_HEADERS,
-            "Content-Type": "text/event-stream; charset=utf-8",
-            "Cache-Control": "no-cache, no-transform",
-            Connection: "keep-alive",
-          },
-        });
-      }
-      return new Response("Not Found", { status: 404, headers: CORS_HEADERS });
-    }
-
-    // 2. HTTP POST JSON-RPC 2.0
+    const respond = (response: Response) => withHeaders(response, corsOrigin);
+    if (request.method === "OPTIONS") return respond(new Response(null, { status: 204 }));
+    if (url.pathname === "/health" && request.method === "GET") return respond(Response.json({
+      status: "ok", version: "1.1.1", authentication: "oauth2.1", oauth_configured: !!(env.OAUTH_LOGIN_KEY || env.MCP_ACCESS_KEY),
+      transport: "streamable-http", data_status: "degraded",
+    }));
+    if (url.pathname.startsWith("/mcp/")) return respond(new Response(null, { status: 401, headers: {
+      "WWW-Authenticate": `Bearer resource_metadata="${env.PUBLIC_ORIGIN}/.well-known/oauth-protected-resource/mcp"`,
+    } }));
+    if (url.pathname !== "/mcp" && !OAUTH_PATHS.has(url.pathname)) return respond(new Response("Not Found", { status: 404 }));
+    if (url.search.length > 8192 || (request.headers.get("Authorization") || "").length > 8192) return respond(new Response(null, { status: 413 }));
     if (request.method === "POST") {
-      try {
-        const body = await request.json();
-        if (Array.isArray(body)) {
-          const results = [];
-          for (const item of body) {
-            const res = await processRpc(item, env);
-            if (res) results.push(res);
-          }
-          return new Response(JSON.stringify(results), {
-            headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-          });
-        }
-        const res = await processRpc(body, env);
-        if (!res) return new Response("", { status: 204, headers: CORS_HEADERS });
-        return new Response(JSON.stringify(res), {
-          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-        });
-      } catch (err: any) {
-        return new Response(
-          JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32700, message: err.message } }),
-          { status: 400, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } }
-        );
-      }
+      const body = await boundedBody(request, url.pathname === "/mcp" ? 1024 * 1024 : 16 * 1024);
+      if (!body) return respond(new Response(null, { status: 413 }));
+      request = new Request(request, { body });
     }
-
-    return new Response("Method Not Allowed", { status: 405, headers: CORS_HEADERS });
+    const auth = env.OAUTH_STATE.get(env.OAUTH_STATE.idFromName("oauth-v1"));
+    if (url.pathname !== "/mcp") return respond(await auth.fetch(request));
+    // Send only the authentication header to the auth object, never tool inputs.
+    const probe = await auth.fetch(new Request(`${env.PUBLIC_ORIGIN}/mcp`, {
+      headers: { Authorization: request.headers.get("Authorization") || "" },
+    }));
+    if (!probe.ok) return respond(probe);
+    return respond(await handleMcp(request, env));
   },
 };

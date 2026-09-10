@@ -1,13 +1,14 @@
 import { ToolDefinition } from "../models/types";
 import { fetchLawsData } from "../adapters/laws.adapter";
 import { buildEnvelope } from "../utils/envelope";
+import { boundedLimit } from "../utils/envelope";
 
 const PROVENANCE_SCHEMA = {
   type: "object",
   properties: {
     source_id: { type: ["string", "number"] },
     source_url: { type: "string" },
-    source_type: { type: "string", enum: ["openapi", "csv_direct", "r2", "cache"] },
+    source_type: { type: "string", enum: ["openapi", "csv_direct", "official_web", "r2", "cache", "fallback"] },
     agency: { type: "string" },
     retrieved_at: { type: "string" },
     content_hash: { type: "string" },
@@ -55,9 +56,10 @@ export const LAW_TOOLS: ToolDefinition[] = [
       required: ["status", "provider", "updated_at", "provenance", "data"],
     },
     handler: async (args, env) => {
-      const keyword = (args.keyword || "").trim();
-      const category = args.category?.trim();
-      const limit = typeof args.limit === "number" ? args.limit : 10;
+      const keyword = String(args.keyword || "").trim();
+      if (!keyword || keyword.length > 200) throw new Error("keyword 不可為空且不得超過 200 字元");
+      const category = args.category ? String(args.category).trim() : undefined;
+      const limit = boundedLimit(args.limit, 10, 100);
 
       const { laws, provenance } = await fetchLawsData(env);
 
@@ -134,10 +136,12 @@ export const LAW_TOOLS: ToolDefinition[] = [
       required: ["status", "provider", "updated_at", "provenance", "data"],
     },
     handler: async (args, env) => {
-      const { law_id, law_name } = args;
+      const law_id = args.law_id ? String(args.law_id).trim() : "";
+      const law_name = args.law_name ? String(args.law_name).trim() : "";
       if (!law_id && !law_name) {
         throw new Error("必須提供 law_id 或 law_name 其中一項查詢參數");
       }
+      if (law_id.length > 100 || law_name.length > 200) throw new Error("法規查詢條件過長");
 
       const { laws, provenance } = await fetchLawsData(env);
       const target = laws.find(
