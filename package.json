@@ -14,10 +14,29 @@
     "predeploy": "npm test && npm run verify:production-safety && npm run verify:toolchain",
     "deploy": "wrangler deploy"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "description": "",
+  "description": "Open-source MCP infrastructure providing structured, source-verifiable access to Kaohsiung municipal laws, budgets, council records, news, and public datasets.",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "civic-tech",
+    "open-data",
+    "taiwan",
+    "kaohsiung",
+    "government-data",
+    "cloudflare-workers",
+    "typescript",
+    "oauth"
+  ],
+  "author": "Hong1998tw",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Hong1998tw/kcg-civic-mcp-worker.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Hong1998tw/kcg-civic-mcp-worker/issues"
+  },
+  "homepage": "https://github.com/Hong1998tw/kcg-civic-mcp-worker#readme",
   "devDependencies": {
     "@types/node": "^26.4.1",
     "esbuild": "0.28.1",
