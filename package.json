@@ -38,6 +38,7 @@
   },
   "homepage": "https://github.com/Hong1998tw/kcg-civic-mcp-worker#readme",
   "devDependencies": {
+    "@cloudflare/workers-types": "5.20260916.1",
     "@types/node": "^26.4.1",
     "esbuild": "0.28.1",
     "miniflare": "5.20260903.0-alpha",
