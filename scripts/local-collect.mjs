@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 import { pathToFileURL } from "node:url";
-import { CollectorError, PROFILE_MANIFEST, parseCollectorArgs, runCollection } from "../src/ingestion/collector.mjs";
+import { CollectorError } from "../src/ingestion/collector.mjs";
+import { COLLECTION_PROFILES, parseDispatchArgs, runDispatchedCollection } from "../src/ingestion/dispatch.mjs";
 
 function assertLocalRuntime() {
   const major = Number(process.versions.node.split(".")[0]);
@@ -12,9 +13,9 @@ function assertLocalRuntime() {
 
 export async function main(argv = process.argv.slice(2)) {
   assertLocalRuntime();
-  const options = parseCollectorArgs(argv);
+  const options = parseDispatchArgs(argv);
   const { LocalStore } = await import("../src/local/store.mjs");
-  const result = await runCollection(options, { storeFactory: (root) => new LocalStore(root, { readOnly: false }) });
+  const result = await runDispatchedCollection(options, { storeFactory: (root) => new LocalStore(root, { readOnly: false }) });
   process.stdout.write(`${JSON.stringify(result)}\n`);
   if (result.status === "blocked") process.exitCode = 2;
   return result;
@@ -28,4 +29,4 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   });
 }
 
-export { PROFILE_MANIFEST };
+export { COLLECTION_PROFILES as PROFILE_MANIFEST };

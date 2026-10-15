@@ -131,8 +131,10 @@ export function parseProposalRows(html: string): KccProposalSearchResult[] {
     if (!/^\d+$/.test(sn)) continue;
     const kindInput = row.match(/<input\b[^>]*name=["'][^"']*hidProposalKind[^"']*["'][^>]*>/i)?.[0] || "";
     const kind = attr(kindInput, "value") || null;
-    const detailMatch = row.match(/Detail\.aspx\?([^"'\s<>]+)/i);
-    const detailUrl = detailMatch ? decodeHtml(`Detail.aspx?${detailMatch[1]}`) : `Detail.aspx?s=${encodeURIComponent(sn)}`;
+    // onclick uses HTML-encoded apostrophes. Decode first so the closing
+    // &#39; cannot become part of the encrypted query parameter.
+    const detailMatch = decodeHtml(row).match(/Detail\.aspx\?([^"'\s<>]+)/i);
+    const detailUrl = detailMatch ? `Detail.aspx?${detailMatch[1]}` : `Detail.aspx?s=${encodeURIComponent(sn)}`;
     const rawCells: string[] = [];
     const cellRegex = /<td\b[^>]*>([\s\S]*?)<\/td>/gi;
     let cell: RegExpExecArray | null;

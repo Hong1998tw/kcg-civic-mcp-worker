@@ -163,8 +163,8 @@ function boundedLimit(value, fallback = 10, max = 100) {
   return Math.min(limit, max);
 }
 
-async function search(store, dataset, { keyword = "", limit = MAX_SCAN_ROWS, offset = 0, predicate = () => true } = {}) {
-  return await store.queryRecords(dataset, { keyword, limit: Math.min(limit, MAX_SCAN_ROWS), offset, predicate });
+async function search(store, dataset, { keyword = "", limit = MAX_SCAN_ROWS, offset = 0, predicate = () => true, orderBy } = {}) {
+  return await store.queryRecords(dataset, { keyword, limit: Math.min(limit, MAX_SCAN_ROWS), offset, predicate, orderBy });
 }
 
 function addFieldFilter(filters, name, expected, paths, mode = "exact") {
@@ -269,11 +269,11 @@ function storedProposalDetailUrl(record) {
     localError("SOURCE_ID_MISMATCH", `proposal ${proposalId(record)} detail_url 不是官方議案詳情頁`);
   }
   const urlId = url.searchParams.get("s") ?? url.searchParams.get("proposal_sn");
-  if (urlId && urlId !== proposalId(record)) localError("SOURCE_ID_MISMATCH", `proposal ${proposalId(record)} detail_url 識別碼不一致`);
+  if (urlId && urlId !== proposalId(record) && !/^[a-f0-9]{16}$/i.test(urlId)) localError("SOURCE_ID_MISMATCH", `proposal ${proposalId(record)} detail_url 識別碼不一致`);
   return url.toString();
 }
 
-function assertProposalDetailRecord(record) {
+async function assertProposalDetailRecord(record, store) {
   const id = proposalId(record);
   let source;
   try { source = new URL(record.source_url); } catch { localError("SNAPSHOT_UNVERIFIED", `proposal ${id} source_url 無效`); }
@@ -282,7 +282,26 @@ function assertProposalDetailRecord(record) {
     localError("LOCAL_DATA_UNAVAILABLE", `proposal ${id} 只有索引來源；本機沒有已驗證的 Detail.aspx 原始內容`);
   }
   const sourceId = source.searchParams.get("s") ?? source.searchParams.get("proposal_sn");
-  if (sourceId && sourceId !== id) localError("SOURCE_ID_MISMATCH", `proposal ${id} Detail.aspx 識別碼不一致`);
+  if (!sourceId || (sourceId !== id && !/^[a-f0-9]{16}$/i.test(sourceId))) localError("SOURCE_ID_MISMATCH", `proposal ${id} Detail.aspx 識別碼無效`);
+  if (typeof store.readRawObject !== "function") localError("SOURCE_ID_MISMATCH", "詳情需要原件身分讀回");
+  const html = (await store.readRawObject(record.raw_sha256, 4 * 1024 * 1024)).toString("utf8");
+  const inputs = html.match(/<input\b[^>]*>/gi) || [];
+  const attribute = (tag, name) => tag.match(new RegExp(`(?:^|\\s)${name}=["']([^"']*)["']`, "i"))?.[1];
+  const exactHidden = (name, controlId) => {
+    const found = inputs.filter((tag) => attribute(tag, "name") === name || attribute(tag, "id") === controlId);
+    if (found.length > 1) localError("SOURCE_ID_MISMATCH", "詳情原件身分控制項不唯一");
+    if (!found.length) return null;
+    if ((attribute(found[0], "name") && attribute(found[0], "name") !== name) ||
+        (attribute(found[0], "id") && attribute(found[0], "id") !== controlId)) localError("SOURCE_ID_MISMATCH", "詳情身分控制項衝突");
+    return attribute(found[0], "value")?.trim() || "";
+  };
+  const attachmentId = exactHidden("ctl00$ContentPlaceHolder1$uscAttachment$hidDataSN", "ContentPlaceHolder1_uscAttachment_hidDataSN");
+  const attachmentType = exactHidden("ctl00$ContentPlaceHolder1$uscAttachment$hidDataType", "ContentPlaceHolder1_uscAttachment_hidDataType");
+  const proposalIdFromRaw = exactHidden("ctl00$ContentPlaceHolder1$hidProposalSN", "ContentPlaceHolder1_hidProposalSN");
+  if (attachmentId !== null) {
+    if (attachmentId !== id || attachmentType !== "1") localError("SOURCE_ID_MISMATCH", "詳情原件hidDataSN/type與議案不一致");
+  } else if (proposalIdFromRaw !== id) localError("SOURCE_ID_MISMATCH", "詳情原件沒有可證明的議案身分");
+  if (proposalIdFromRaw !== null && proposalIdFromRaw !== id) localError("SOURCE_ID_MISMATCH", "詳情原件身分互相矛盾");
   const declaredDetail = storedProposalDetailUrl(record);
   if (declaredDetail && declaredDetail !== source.toString()) localError("SOURCE_ID_MISMATCH", `proposal ${id} detail_url 與原始來源不一致`);
   return source.toString();
@@ -356,7 +375,10 @@ function assertNewsRecord(record) {
   const sourceLink = item.source_link ?? record.source_url;
   let url;
   try { url = new URL(sourceLink); } catch { localError("SNAPSHOT_UNVERIFIED", `新聞 record ${record.id} source_link 無效`); }
-  if (url.protocol !== "https:" || url.hostname !== "www.kcg.gov.tw" || url.pathname !== "/News_Content.aspx" || !url.searchParams.get("s")) {
+  const kind = url.pathname === "/News_Content.aspx" ? "messages" : url.pathname === "/CityNews_Detail1.aspx" ? "city" : null;
+  const nativeId = kind === "messages" ? url.searchParams.get("s") : kind === "city" ? url.searchParams.get("ss") : null;
+  if (url.protocol !== "https:" || url.hostname !== "www.kcg.gov.tw" || url.username || url.password || url.port || !nativeId ||
+      (item.news_id !== nativeId && item.news_id !== `${kind}:${nativeId}`)) {
     localError("SOURCE_ID_MISMATCH", `新聞 record ${record.id} source_link 身分不一致`);
   }
   return item;
@@ -523,9 +545,9 @@ const handlers = {
     addFieldFilter(filters, "agency", asString(args.agency), ["agency"], "contains");
     addFieldFilter(filters, "category", asString(args.category), ["category"], "contains");
     const predicate = makePredicate(filters);
-    const result = await search(store, "kcg-news", { limit: MAX_SCAN_ROWS, predicate });
+    const result = await search(store, "kcg-news", { limit: MAX_SCAN_ROWS, predicate, orderBy: { field: "published_at", descending: true } });
     assertFiltersSupported(predicate);
-    if (result.local_match_count > result.records.length) {
+    if (result.local_match_count > result.records.length && result.order_by?.scope !== "entire_verified_snapshot") {
       localError("PARTIAL_SCAN", "新聞索引超過 1000 筆上限，無法確認全域最新排序");
     }
     const selected = [...result.records].sort((a, b) =>
@@ -580,7 +602,7 @@ const handlers = {
     if (!id) localError("INVALID_ARGUMENT", "proposal_sn 不可為空");
     const result = await findProposalDetail(store, id);
     const record = result.records[0];
-    const detailUrl = assertProposalDetailRecord(record);
+    const detailUrl = await assertProposalDetailRecord(record, store);
     verifyDetailUrl(args.detail_url, detailUrl, record.source_url);
     return envelope(result, { ...proposalWithEvidence(record, result.release), detail_url: detailUrl }, { query_proposal_sn: id });
   },
@@ -653,7 +675,7 @@ const handlers = {
     if (!id) localError("INVALID_ARGUMENT", "proposal_sn 不可為空");
     const result = await findProposalDetail(store, id);
     const record = result.records[0];
-    const detailUrl = assertProposalDetailRecord(record);
+    const detailUrl = await assertProposalDetailRecord(record, store);
     verifyDetailUrl(args.detail_url, detailUrl, record.source_url);
     const data = {
       proposal_sn: id,
@@ -707,6 +729,7 @@ const handlers = {
     const selectedPage = args.page ? pages.find((page) => page.page === args.page) : null;
     if (args.page && !selectedPage) localError("LOCAL_DATA_UNAVAILABLE", `record_id=${id} 的本機文字層沒有第 ${args.page} 頁`);
     const matches = keyword ? pages.filter((page) => page.text.includes(keyword)).map((page) => ({ page: page.page, match_count: page.text.split(keyword).length - 1, snippets: [snippet(page.text, keyword)] })) : [];
+    const unsearchablePages = pages.filter((page) => !page.text.trim()).length;
     const data = {
       record_id: id,
       pdf_url: pdfUrl,
@@ -718,7 +741,8 @@ const handlers = {
       page_content: selectedPage?.text,
       local_provenance: recordWithEvidence(result.records[0], result.release).local_provenance,
     };
-    return envelope(result, data, { local_match_count: matches.length });
+    return envelope(result, data, { local_match_count: matches.length, ocr_pending_pages: unsearchablePages,
+      note: unsearchablePages ? "至少一頁缺少文字層；未命中不代表完整全文無相關內容。" : undefined }, unsearchablePages ? "partial" : undefined);
   },
 
   kcc_search_meeting_record_content: async (store, args) => {
@@ -750,6 +774,7 @@ const handlers = {
       return dateB.localeCompare(dateA);
     });
     const selectedGroups = orderedGroups.slice(0, limitRecords);
+    const unsearchablePages = selectedGroups.reduce((count, [, group]) => count + group.pages.filter((page) => !page.text.trim()).length, 0);
     for (const [, group] of selectedGroups) {
       for (const page of group.pages) {
         if (page.text.includes(keyword)) group.matches.push({ page: page.page, match_count: page.text.split(keyword).length - 1, snippets: [snippet(page.text, keyword)] });
@@ -766,7 +791,7 @@ const handlers = {
       local_provenance: recordWithEvidence(group.record, result.release).local_provenance,
     }));
     const truncated = orderedGroups.length > selectedGroups.length;
-    const status = result.release.coverage.complete && !truncated ? undefined : "partial";
+    const status = result.release.coverage.complete && !truncated && !unsearchablePages ? undefined : "partial";
     return envelope({ ...result, local_match_count: dataRecords.length }, {
       keyword,
       scan_status: status === "partial" ? "partial" : "success",
@@ -780,6 +805,7 @@ const handlers = {
     }, {
       limit_records: limitRecords,
       omitted_local_records: Math.max(0, orderedGroups.length - selectedGroups.length),
+      ocr_pending_pages: unsearchablePages,
       note: result.release.coverage.complete ? undefined : "搜尋只涵蓋目前不完整的本機 snapshot。",
     }, status);
   },

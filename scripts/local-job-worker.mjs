@@ -4,9 +4,10 @@ import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
+import { COLLECTION_DATASETS } from '../src/ingestion/dispatch.mjs';
 
 const ID = /^[a-f0-9]{64}$/;
-const PROFILES = new Set(['health', 'budget-115', 'proposals-pilot']);
+const PROFILES = new Set(['health', ...Object.keys(COLLECTION_DATASETS)]);
 const sha = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex');
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -30,6 +31,25 @@ function assertDirectory(directory) {
   if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('JOB_QUEUE_PATH_INVALID');
 }
 
+export async function dependencyReady(queueRoot, dependency, dataRoot) {
+  const { LocalStore } = await import('../src/local/store.mjs');
+  let store;
+  try {
+    store = new LocalStore(dataRoot, { readOnly: true });
+    const active = (await store.queryRecords(COLLECTION_DATASETS[dependency], { limit: 0 })).release;
+    if (active.coverage.complete !== true) return false;
+    return fs.readdirSync(path.join(queueRoot, 'receipts')).filter((file) => /^[a-f0-9]{64}\.json$/.test(file)).some((file) => {
+      const prior = JSON.parse(regular(path.join(queueRoot, 'receipts', file), 131072));
+      const receipt = prior.store_readback || prior.collector?.receipt;
+      return prior.profile === dependency && prior.status === 'succeeded' && receipt?.coverage?.complete === true &&
+        receipt.snapshot_id === active.snapshot_id && receipt.manifest_sha256 === active.manifest_sha256 && receipt.record_count === active.record_count;
+    });
+  } catch (error) {
+    if (error.reasonCode === 'LOCAL_DATA_UNAVAILABLE') return false;
+    throw error;
+  } finally { store?.close(); }
+}
+
 export function validateRequest(value, filename) {
   if (!value || Object.keys(value).some((k) => !['schema_version', 'job_id', 'profile', 'idempotency_key', 'requested_at'].includes(k)) ||
       value.schema_version !== 1 || !PROFILES.has(value.profile) || !ID.test(value.job_id) ||
@@ -40,14 +60,14 @@ export function validateRequest(value, filename) {
 }
 
 export function verifyCollectorReceipt(result, profile, exitCode) {
-  if (exitCode !== 0 || !result || result.profile !== profile || !['complete', 'partial'].includes(result.status) ||
+  if (exitCode !== 0 || !result || result.profile !== profile || !['complete', 'partial', 'paused'].includes(result.status) ||
       result.dry_run !== false || result.commit_state !== 'committed' || result.basic_validation !== 'passed' ||
       !result.receipt || !['imported', 'unchanged'].includes(result.receipt.status) || typeof result.receipt.snapshot_id !== 'string' ||
       !Number.isSafeInteger(result.record_count) || result.record_count < 1 ||
       result.receipt.record_count !== result.record_count || result.receipt.dataset !== result.dataset ||
       !ID.test(result.receipt.manifest_sha256 || '') || result.receipt.raw_objects_verified < 1 ||
-      result.dataset !== ({ 'budget-115': 'kcg-budget-115', 'proposals-pilot': 'kcc-proposals-pilot' })[profile] ||
-      result.failed !== 0 || result.succeeded < 1) return false;
+      result.dataset !== COLLECTION_DATASETS[profile] ||
+      result.failed !== 0) return false;
   return true;
 }
 
@@ -57,7 +77,7 @@ export function runCollector(profile, root) {
       stdio: ['ignore', 'pipe', 'pipe'], env: { PATH: process.env.PATH, HOME: process.env.HOME, TZ: 'Asia/Taipei' },
     });
     let stdout = ''; let stderr = ''; let exceeded = false;
-    const timer = setTimeout(() => { exceeded = true; child.kill('SIGKILL'); }, 120000);
+    const timer = setTimeout(() => { exceeded = true; child.kill('SIGKILL'); }, 180000);
     child.stdout.on('data', (b) => { stdout += b; if (stdout.length > 131072) { exceeded = true; child.kill('SIGKILL'); } });
     child.stderr.on('data', (b) => { if (stderr.length < 4096) stderr += b; });
     child.on('error', (e) => { clearTimeout(timer); reject(e); });
@@ -67,8 +87,15 @@ export function runCollector(profile, root) {
       const lines = stdout.trim().split('\n');
       try {
         const result = JSON.parse(lines.at(-1));
+        const continuing = code === 0 && result.profile === profile && result.status === 'paused' && result.dry_run === false && result.continuation_required === true && !result.error_code;
+        if (continuing) {
+          const checkpoint = path.resolve(result.checkpoint_path || '');
+          if (!checkpoint.startsWith(path.resolve(root) + path.sep)) throw new Error('CHECKPOINT_PATH_INVALID');
+          regular(checkpoint, 256 * 1024 * 1024);
+          if (!result.receipt && result.commit_state === 'not-committed') return resolve({ status: 'running', collector: result });
+        }
         if (!verifyCollectorReceipt(result, profile, code)) {
-          const uncertain = ['unknown', 'committed'].includes(result.commit_state);
+          const uncertain = ['unknown', 'partial', 'committed'].includes(result.commit_state) || result.needs_reconciliation === true;
           return resolve({ status: uncertain ? 'outcome_unknown' : 'failed', reason_code: uncertain ? 'COLLECTOR_RECONCILIATION_REQUIRED' : result.error_code || 'COLLECTOR_RECEIPT_INVALID', collector: result });
         }
         const { LocalStore } = await import('../src/local/store.mjs');
@@ -77,7 +104,7 @@ export function runCollector(profile, root) {
           const stored = await readback.queryRecords(result.dataset, { limit: 1 });
           if (stored.release.snapshot_id !== result.receipt.snapshot_id || stored.release.record_count !== result.record_count ||
               stored.release.manifest_sha256 !== result.receipt.manifest_sha256) throw new Error('COMMIT_READBACK_MISMATCH');
-          resolve({ status: 'succeeded', collector: result, store_readback: stored.release });
+          resolve({ status: continuing ? 'running' : 'succeeded', collector: result, store_readback: stored.release });
         } finally { readback.close(); }
       } catch { resolve({ status: 'outcome_unknown', reason_code: 'COLLECTOR_RECONCILIATION_REQUIRED' }); }
     });
@@ -85,17 +112,19 @@ export function runCollector(profile, root) {
 }
 
 async function processClaimed(queueRoot, dataRoot) {
-  for (const name of ['', 'requests', 'processing', 'receipts']) {
+  for (const name of ['', 'requests', 'processing', 'receipts', 'progress']) {
     const directory = path.join(queueRoot, name);
     fs.mkdirSync(directory, { recursive: true, mode: 0o770 });
     assertDirectory(directory);
   }
-  const names = [...new Set([...fs.readdirSync(path.join(queueRoot, 'processing')), ...fs.readdirSync(path.join(queueRoot, 'requests'))])].sort();
+  const lastWork = (name) => { try { return fs.statSync(path.join(queueRoot, 'progress', name)).mtimeMs; } catch { return 0; } };
+  const names = [...new Set([...fs.readdirSync(path.join(queueRoot, 'processing')), ...fs.readdirSync(path.join(queueRoot, 'requests'))])].sort((a, b) => lastWork(a) - lastWork(b) || a.localeCompare(b));
   for (const name of names) {
     if (!/^[a-f0-9]{64}\.json$/.test(name)) continue;
     const requestFile = path.join(queueRoot, 'requests', name);
     const activeFile = path.join(queueRoot, 'processing', name);
     const receiptFile = path.join(queueRoot, 'receipts', name);
+    const progressFile = path.join(queueRoot, 'progress', name);
     if (fs.existsSync(receiptFile)) continue;
     if (!fs.existsSync(activeFile)) {
       try { fs.renameSync(requestFile, activeFile); } catch (e) { if (e.code === 'ENOENT') continue; throw e; }
@@ -104,6 +133,11 @@ async function processClaimed(queueRoot, dataRoot) {
     let request;
     try {
       request = validateRequest(JSON.parse(regular(activeFile)), name);
+      const prerequisite = ({ 'kcc-proposal-details': 'kcc-proposals-full', 'kcc-meeting-records': 'kcc-meetings-full' })[request.profile];
+      if (prerequisite) {
+        const complete = await dependencyReady(queueRoot, prerequisite, dataRoot);
+        if (!complete) { atomicJson(progressFile, { schema_version: 1, job_id: request.job_id, profile: request.profile, status: 'waiting_dependency', dependency: prerequisite }); continue; }
+      }
       let result;
       if (request.profile === 'health') {
         const bytes = Buffer.from('kcg-civic-local-storage-v1\n');
@@ -116,6 +150,17 @@ async function processClaimed(queueRoot, dataRoot) {
         result = { status: 'succeeded', health: { status: 'PASS', bytes: bytes.length, sha256: sha(bytes), root: dataRoot } };
       } else result = await runCollector(request.profile, dataRoot);
       const receipt = { schema_version: 1, job_id: request.job_id, profile: request.profile, started_at: started, finished_at: new Date().toISOString(), ...result };
+      if (result.status === 'running') {
+        let previous = null;
+        try { previous = JSON.parse(regular(progressFile, 131072)); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+        const stalled = (result.collector?.attempted ?? 0) === 0 && previous?.collector?.record_count === result.collector?.record_count;
+        const stallCount = stalled ? (previous.stall_count || 0) + 1 : 0;
+        if (stallCount >= 3) {
+          receipt.status = 'outcome_unknown'; receipt.reason_code = 'COLLECTION_STALLED_RECONCILE_CHECKPOINT';
+          atomicJson(receiptFile, receipt);
+        } else atomicJson(progressFile, { ...receipt, stall_count: stallCount });
+        return receipt;
+      }
       atomicJson(receiptFile, receipt);
       return receipt;
     } catch (error) {

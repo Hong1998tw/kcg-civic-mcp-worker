@@ -284,6 +284,7 @@ export class LocalStore {
     if (typeof root !== "string" || !root.trim()) throw new TypeError("LocalStore root is required");
     this.root = path.resolve(root);
     this.readOnly = options.readOnly !== false;
+    this.rawVerificationCache = new Map();
     this.dbPath = path.join(this.root, DB_NAME);
     if (!this.readOnly) {
       // The ingestion process is the only writer. DELETE journaling keeps the
@@ -291,6 +292,7 @@ export class LocalStore {
       mkdirSync(this.root);
       if (pathEntryIsSymlink(this.dbPath)) fail("SNAPSHOT_UNVERIFIED", "index.sqlite 不可為 symlink");
       this.db = new DatabaseSync(this.dbPath);
+      this.db.exec("PRAGMA busy_timeout=3000");
       this.db.exec(SCHEMA);
     } else {
       try {
@@ -333,6 +335,18 @@ export class LocalStore {
       fail("SNAPSHOT_UNVERIFIED", `raw object ${expectedHash} 的 SHA-256 不一致`);
     }
     return await this.#writeRawBytes(expectedHash.toLowerCase(), bytes);
+  }
+
+  async readRawObject(hash, maxBytes = 32 * 1024 * 1024) {
+    if (!SHA256_RE.test(hash) || !Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 32 * 1024 * 1024) {
+      fail("SNAPSHOT_UNVERIFIED", "原始檔讀取參數無效");
+    }
+    await this.#verifyRawObject(hash);
+    const rawPath = this.#rawPath(hash);
+    if (lstatSync(rawPath).size > maxBytes) fail("PARTIAL_SCAN", "原始檔超過讀取上限");
+    const bytes = await readFile(rawPath);
+    if (sha256(bytes) !== hash.toLowerCase()) fail("SNAPSHOT_UNVERIFIED", "原始檔讀回雜湊不一致");
+    return bytes;
   }
 
   async #writeRawBytes(hash, bytes) {
@@ -391,15 +405,24 @@ export class LocalStore {
   async #verifyRawObject(hash) {
     let bytes;
     const rawPath = this.#rawPath(hash);
+    const signature = (info) => [info.dev, info.ino, info.size, info.mtimeNs, info.ctimeNs].join(":");
+    let before;
     try {
-      const info = lstatSync(rawPath);
+      const info = lstatSync(rawPath, { bigint: true });
       if (info.isSymbolicLink() || !info.isFile()) fail("SNAPSHOT_UNVERIFIED", `raw object ${hash} 不是一般檔案`);
+      before = signature(info);
+      if (this.rawVerificationCache.get(hash) === before) return true;
       bytes = await readFile(rawPath);
     } catch (error) {
       if (error?.code === "ENOENT") fail("SNAPSHOT_UNVERIFIED", `缺少 content-addressed raw object ${hash}`);
       throw error;
     }
     if (sha256(bytes) !== hash.toLowerCase()) fail("SNAPSHOT_UNVERIFIED", `raw object ${hash} 內容遭竄改`);
+    const after = lstatSync(rawPath, { bigint: true });
+    if (!after.isFile() || after.isSymbolicLink() || signature(after) !== before) fail("SNAPSHOT_UNVERIFIED", `raw object ${hash} 在驗證期間改變`);
+    this.rawVerificationCache.delete(hash);
+    this.rawVerificationCache.set(hash, before);
+    if (this.rawVerificationCache.size > 2048) this.rawVerificationCache.delete(this.rawVerificationCache.keys().next().value);
     return true;
   }
 
@@ -574,10 +597,22 @@ export class LocalStore {
 
   async queryRecords(dataset, options = {}) {
     if (!this.db) fail("LOCAL_DATA_UNAVAILABLE", "本機資料庫未開啟");
+    const reader = new DatabaseSync(this.dbPath, { readOnly: true });
+    try {
+      reader.exec("PRAGMA busy_timeout=3000; BEGIN DEFERRED");
+      return await this.#queryRecordsSnapshot(dataset, options, reader);
+    } finally {
+      try { reader.exec("ROLLBACK"); } catch {}
+      reader.close();
+    }
+  }
+
+  async #queryRecordsSnapshot(dataset, options, reader) {
+    if (!this.db) fail("LOCAL_DATA_UNAVAILABLE", "本機資料庫未開啟");
     if (!ALLOWED_DATASETS.has(dataset) && !/^kcg-budget-\d{1,3}$/.test(dataset)) {
       fail("FEATURE_UNAVAILABLE", `未設定 dataset=${dataset} 的本機查詢`);
     }
-    const releaseRow = this.db.prepare("SELECT * FROM releases WHERE dataset = ?").get(dataset);
+    const releaseRow = reader.prepare("SELECT * FROM releases WHERE dataset = ?").get(dataset);
     if (!releaseRow) fail("LOCAL_DATA_UNAVAILABLE", `dataset=${dataset} 尚無本機 snapshot`);
     let coverage;
     try { coverage = normalizeCoverage(JSON.parse(releaseRow.coverage_json), releaseRow.record_count); }
@@ -591,6 +626,17 @@ export class LocalStore {
       fail("FILTER_NOT_CONFIRMED", "limit 或 offset 超出本機查詢範圍");
     }
     const predicate = typeof options.predicate === "function" ? options.predicate : () => true;
+    const order = options.orderBy;
+    if (order !== undefined && (!order || !["published_at", "date", "meeting_date"].includes(order.field) ||
+        typeof order.descending !== "boolean" || offset + limit > 1000)) {
+      fail("FILTER_NOT_CONFIRMED", "本機排序欄位或頁面範圍無效");
+    }
+    const compare = (left, right) => {
+      const a = String(left.data[order.field] ?? "");
+      const b = String(right.data[order.field] ?? "");
+      const difference = a < b ? -1 : a > b ? 1 : 0;
+      return (order.descending ? -difference : difference) || (left.id < right.id ? -1 : left.id > right.id ? 1 : 0);
+    };
     const keyword = typeof options.keyword === "string" ? options.keyword.trim() : "";
     if (keyword.length > 200) fail("FILTER_NOT_CONFIRMED", "keyword 不可超過 200 字元");
     const hash = createHash("sha256");
@@ -611,7 +657,7 @@ export class LocalStore {
     let totalBytes = 0;
     const normalizedHash = createHash("sha256");
     normalizedHash.update("[");
-    const rows = this.db.prepare(`SELECT id,title,text,json,source_url,retrieved_at,raw_sha256
+    const rows = reader.prepare(`SELECT id,title,text,json,source_url,retrieved_at,raw_sha256
       FROM collections WHERE dataset=? ORDER BY id COLLATE BINARY`).iterate(dataset);
     for (const row of rows) {
       let data;
@@ -649,7 +695,13 @@ export class LocalStore {
       const matchesKeyword = !keyword || record.title.includes(keyword) || record.text.includes(keyword) || record.json.includes(keyword);
       const matchesPredicate = predicate(record);
       if (!matchesKeyword || !matchesPredicate) continue;
-      if (localMatchCount >= offset && selected.length < limit) selected.push(record);
+      if (order && offset + limit > 0) {
+        let low = 0;
+        let high = selected.length;
+        while (low < high) { const middle = (low + high) >>> 1; if (compare(selected[middle], record) <= 0) low = middle + 1; else high = middle; }
+        selected.splice(low, 0, record);
+        if (selected.length > offset + limit) selected.pop();
+      } else if (!order && localMatchCount >= offset && selected.length < limit) selected.push(record);
       localMatchCount += 1;
     }
     normalizedHash.update("]");
@@ -659,8 +711,9 @@ export class LocalStore {
       fail("SNAPSHOT_UNVERIFIED", `dataset=${dataset} 資料列與 manifest 不一致`);
     }
     if (recordCount === 0) fail("LOCAL_DATA_UNAVAILABLE", `dataset=${dataset} snapshot 沒有可查資料`);
+    const outputRecords = order ? selected.slice(offset, offset + limit) : selected;
     const verifiedRaw = new Set();
-    for (const record of selected) {
+    for (const record of outputRecords) {
       if (verifiedRaw.has(record.raw_sha256)) continue;
       await this.#verifyRawObject(record.raw_sha256);
       verifiedRaw.add(record.raw_sha256);
@@ -677,8 +730,9 @@ export class LocalStore {
         source_url: sourceUrl,
         retrieved_at: latestRetrievedAt,
       },
-      records: selected,
+      records: outputRecords,
       local_match_count: localMatchCount,
+      order_by: order ? { field: order.field, descending: order.descending, scope: "entire_verified_snapshot" } : null,
     };
   }
 

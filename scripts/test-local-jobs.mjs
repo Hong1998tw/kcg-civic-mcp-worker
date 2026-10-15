@@ -4,7 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
-import { processOne, validateRequest, verifyCollectorReceipt } from './local-job-worker.mjs';
+import { processOne, validateRequest, verifyCollectorReceipt, dependencyReady } from './local-job-worker.mjs';
+import { LocalStore } from '../src/local/store.mjs';
 
 const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'TEST-kcg-jobs-'));
 try {
@@ -43,5 +44,18 @@ try {
   fs.mkdirSync(symlinkQueue);
   fs.symlinkSync(path.join(queue, 'receipts'), path.join(symlinkQueue, 'receipts'));
   await assert.rejects(() => processOne(symlinkQueue, data), /SYMLINK|INVALID/);
+  const store = new LocalStore(data, { readOnly: false });
+  const bytes = Buffer.from('TEST dependency raw');
+  const rawHash = crypto.createHash('sha256').update(bytes).digest('hex');
+  const input = { dataset: 'kcc-proposals', snapshot_id: 'TEST-dependency-v1', coverage: { scope: 'TEST complete', complete: true, source_total: 1 }, records: [{ id: '100', title: 'TEST', text: 'TEST', data: { proposal_sn: '100', test_fixture: true }, source_url: 'https://cissearch.kcc.gov.tw/System/Proposal/Default.aspx', retrieved_at: '2026-10-15T00:00:00Z', raw_sha256: rawHash }], raw_objects: [{ sha256: rawHash, bytes_base64: bytes.toString('base64') }], parser_version: 'TEST', validator_version: 'TEST', validation_status: 'passed' };
+  const dependencyReceipt = await store.importSnapshot(input);
+  const receiptFile = path.join(queue, 'receipts', 'b'.repeat(64) + '.json');
+  fs.writeFileSync(receiptFile, JSON.stringify({ profile: 'kcc-proposals-full', status: 'succeeded', store_readback: dependencyReceipt }));
+  assert.equal(await dependencyReady(queue, 'kcc-proposals-full', data), true);
+  await store.importSnapshot({ ...input, snapshot_id: 'TEST-dependency-v2', coverage: { scope: 'TEST next run partial', complete: false, source_total: 2 } });
+  assert.equal(await dependencyReady(queue, 'kcc-proposals-full', data), false);
+  await store.importSnapshot({ ...input, snapshot_id: 'TEST-dependency-v3' });
+  assert.equal(await dependencyReady(queue, 'kcc-proposals-full', data), false);
+  store.close();
   console.log('PASS local jobs: decoded n8n code integration, concurrent claim exclusion, dry-run rejection, fixed profiles, request identity, idempotency, persistent read-back, symlink rejection');
 } finally { fs.rmSync(root, { recursive: true, force: true }); }

@@ -4,6 +4,7 @@ import { timingSafeEqual } from "node:crypto";
 import { handleMcp } from "../mcp/transport.ts";
 import { createLocalRegistry, LOCAL_SOURCE_TOOL_SCHEMAS, LOCAL_TOOL_NAMES } from "./registry.mjs";
 import { LocalStore } from "./store.mjs";
+import { createLocalOAuth } from "./oauth-native.mjs";
 
 export { createLocalRegistry, LOCAL_SOURCE_TOOL_SCHEMAS, LOCAL_TOOL_NAMES };
 
@@ -124,16 +125,30 @@ export async function startLocalServer(env = process.env) {
   if (!isLoopback(bindHost) && env.LOCAL_PRIVATE_BIND !== "true") {
     throw new Error("non-loopback BIND_HOST requires LOCAL_PRIVATE_BIND=true");
   }
-  const accessKey = await loadAccessKey(env);
+  const accessKey = env.OAUTH_ISSUER_URL ? null : await loadAccessKey(env);
   const dataRoot = env.KCG_CIVIC_DATA_DIR || "/data/kcg-civic";
   const store = new LocalStore(dataRoot, { readOnly: true });
   const registry = createLocalRegistry(store);
   const hostSet = allowedHosts(port, env);
   const originSet = allowedOrigins(port, env);
-  const mcpEnv = { PUBLIC_ORIGIN: `http://${bindHost}:${port}` };
+  const oauth = env.OAUTH_ISSUER_URL ? await createLocalOAuth({
+    issuerUrl: env.OAUTH_ISSUER_URL,
+    authRoot: env.OAUTH_DATA_ROOT,
+    ownerKeyFile: env.OAUTH_OWNER_LOGIN_KEY_FILE,
+    bearerKeyFile: env.MCP_ACCESS_KEY_FILE,
+    allowedHosts: [...hostSet],
+    allowLoopbackHttp: env.LOCAL_OAUTH_ALLOW_LOOPBACK_HTTP === "true",
+  }) : null;
+  const mcpEnv = { PUBLIC_ORIGIN: env.OAUTH_ISSUER_URL?.replace(/\/$/, "") || `http://${bindHost}:${port}` };
 
   const server = createServer(async (req, res) => {
     try {
+      if (!hostSet.has(String(req.headers.host || "").toLowerCase())) {
+        plainResponse(res, 403, JSON.stringify({ error: "forbidden" }));
+        return;
+      }
+      const pathname = new URL(req.url || "/", `http://${req.headers.host}`).pathname;
+      if (oauth?.handles(pathname)) { oauth.handler(req, res); return; }
       if (!validateHostAndOrigin(req, hostSet, originSet)) {
         plainResponse(res, 403, JSON.stringify({ error: "forbidden" }));
         return;
@@ -143,7 +158,6 @@ export async function startLocalServer(env = process.env) {
         plainResponse(res, 413, JSON.stringify({ error: "payload_too_large" }));
         return;
       }
-      const pathname = new URL(req.url || "/", `http://${req.headers.host}`).pathname;
       if (pathname === "/health") {
         if (req.method !== "GET") {
           plainResponse(res, 405, JSON.stringify({ error: "method_not_allowed" }), { Allow: "GET" });
@@ -164,7 +178,8 @@ export async function startLocalServer(env = process.env) {
         plainResponse(res, 405, JSON.stringify({ error: "method_not_allowed" }), { Allow: "POST" });
         return;
       }
-      if (!bearerAuthorized(req.headers.authorization, accessKey)) {
+      if (oauth ? !(await oauth.authenticateMcp(req, res)) : !bearerAuthorized(req.headers.authorization, accessKey)) {
+        if (oauth) return;
         plainResponse(res, 401, JSON.stringify({ error: "unauthorized" }), { "WWW-Authenticate": "Bearer" });
         return;
       }
@@ -172,7 +187,7 @@ export async function startLocalServer(env = process.env) {
       const response = await handleMcp(request, mcpEnv, {
         registry,
         serverInfo: SERVER_INFO,
-        securitySchemes: API_KEY_SCHEME,
+        securitySchemes: oauth ? [{ type: "oauth2", scopes: ["mcp:read"] }] : API_KEY_SCHEME,
         iconUrl: null,
         openWorldHint: false,
       });
@@ -202,6 +217,7 @@ export async function startLocalServer(env = process.env) {
   const close = async () => {
     await new Promise((resolve) => server.close(resolve));
     store.close();
+    oauth?.close();
   };
   return { server, store, close };
 }
