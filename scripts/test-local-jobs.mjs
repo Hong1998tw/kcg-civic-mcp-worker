@@ -56,6 +56,7 @@ try {
   await store.importSnapshot({ ...input, snapshot_id: 'TEST-dependency-v2', coverage: { scope: 'TEST next run partial', complete: false, source_total: 2 } });
   assert.equal(await dependencyReady(queue, 'kcc-proposals-full', data), false);
   const completeProposalReceipt = await store.importSnapshot({ ...input, snapshot_id: 'TEST-dependency-v3' });
+  assert.equal(await dependencyReady(queue, 'kcc-proposals-full', data), false);
   fs.writeFileSync(receiptFile, JSON.stringify({ profile: 'kcc-proposals-full', status: 'succeeded', store_readback: completeProposalReceipt }));
   assert.equal(await dependencyReady(queue, 'kcc-proposals-full', data), true);
 
