@@ -203,10 +203,17 @@ async function ensurePrepareRoot(root, counts) {
   return { marker, markerPath };
 }
 
-function checkPhasePid(marker, phase) {
-  const prior = marker.phases?.[phase]?.pid;
-  if (prior !== undefined && prior === process.pid) throw new Error(`${phase} 必須在新的作業系統程序執行`);
-  if (phase !== "prepare" && marker.phases?.prepare?.pid === process.pid) {
+export function checkPhasePid(marker, phase, identity = { pid: process.pid, timeOrigin: performance.timeOrigin }) {
+  const sameProcess = (prior) => {
+    if (!prior || prior.pid !== identity.pid) return false;
+    if (Number.isFinite(prior.process_time_origin)) return prior.process_time_origin === identity.timeOrigin;
+    // Older markers recorded only PID. Separate containers can both use PID 14;
+    // an already-ended phase predating this Node process is a fresh process.
+    const ended = Date.parse(prior.finished_at || prior.updated_at || "");
+    return !["complete", "failed"].includes(prior.status) || !Number.isFinite(ended) || ended >= identity.timeOrigin;
+  };
+  if (sameProcess(marker.phases?.[phase])) throw new Error(`${phase} 必須在新的作業系統程序執行`);
+  if (phase !== "prepare" && sameProcess(marker.phases?.prepare)) {
     throw new Error(`${phase} 必須在不同於 prepare 的新作業系統程序執行`);
   }
 }
@@ -217,6 +224,7 @@ async function setPhase(marker, markerPath, phase, status, extra = {}) {
     ...(marker.phases[phase] || {}),
     status,
     pid: process.pid,
+    process_time_origin: performance.timeOrigin,
     updated_at: nowIso(),
     ...extra,
   };
@@ -913,7 +921,7 @@ async function main() {
   }
 }
 
-main().catch((error) => {
+if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) main().catch((error) => {
   process.stderr.write(`${JSON.stringify({ tool: TOOL, status: "failed", error: error?.message || String(error), ...metrics() })}\n`);
   process.exitCode = 1;
 });

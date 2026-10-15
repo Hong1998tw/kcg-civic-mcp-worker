@@ -21,3 +21,5 @@ node source/scripts/verify-enrichment-v2-capacity.mjs --root /tmp/enrichment-v2-
 ```
 
 `prepare` 只接受新空 root 或本工具建立且規模相同的未完成 marker；不會清理 root，也不允許在已完成的 prepare 上重跑。各 phase 時間、receipt、測試結果及 process 資源用量會寫入 marker/progress JSON，不能單憑 script 輸出宣稱外層 cgroup 或真語料 Gate 通過。
+
+不同 Docker 容器可重用同一 PID；階段隔離以 PID 與 Node process time origin 核對。舊 marker 僅有 PID 時，已結束階段必須早於新程序啟動才可接受，不能把 PID 相同當成程序相同。
