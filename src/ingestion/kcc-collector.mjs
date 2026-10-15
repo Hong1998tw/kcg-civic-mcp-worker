@@ -284,6 +284,10 @@ async function collectIndex(ctx, meetings) {
       const next = structuredClone(ctx.state); next.queries[key].complete = true; const totals = indexTotals(next);
       await publishState(ctx, next, Object.keys(next.records[dataset] || {}).length ? [{ dataset, coverage: coverage(next, totals.complete, totals.sourceTotal) }] : []);
     }
+    // Official Search retains the previous term's pager offset in ViewState.
+    // Preserve this term's successful receipt and start the next term only
+    // after a fresh GET in the next segment, never by reusing its last page.
+    if (!indexTotals(ctx.state).complete) throw pause();
     initial = response;
   }
 }

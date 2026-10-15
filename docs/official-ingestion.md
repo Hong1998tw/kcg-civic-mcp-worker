@@ -88,11 +88,13 @@ const result = await runOfficialCollection({
 
 官方明細確實存在「發布機關：」但內容為空時，保留 `agency`／`publisher` 空字串，標示 `publisher_status: not_provided`、`publisher_source: official-detail-empty`，不推猜新聞局或其他機關。有明示值則為 `publisher_status: provided`、`publisher_source: official-detail`。發布機關欄位整個不存在、正文或日期缺失，仍為結構錯誤並停止；索引有機關但明細空白也保留身分不一致阻擋。NAS r3 的 `city:598182DA152F961C` 即為明示空欄、正文與日期齊全的已驗證實例。
 
+最新消息的 `DC.Subject` 若為精確網站通用值「高雄市政府全球資訊網-中文版」或缺值，以明細正式標題區的可見標題與索引精確核對，保留 `title_source: official-detail-visible-title` 與原 `title_meta_subject`。具體文章 meta 標題仍正常核對；具體 meta、可見標題或索引有真正衝突時停止，不用 fallback 掩蓋。`messages:2E98CCB38C0FDA07` 的 r6 NAS CAS 已證明上述通用 meta 情況，官方 ID／URL、可見標題、日期及機關均一致。
+
 這些檢查證明原件來源、身分與本機內容一致；沒有把 schema 合格當成法規法律效力或新聞主張均已查證。
 
 ## 驗證紀錄與限制
 
-執行 `node scripts/test-official-ingestion.mjs`。十五項結構與安全測試涵蓋跨段累積、來源總數、raw 先保存、來源身分、redirect allowlist、byte limit、來源漂移保留前段、分散 HTML 標籤條號、廢停狀態badge與日期、發布機關空欄及缺欄反證、附件中斷續作、WebForms 原生 POST 及 namespace、symlink 與 checkpoint 契約，並在完整 law snapshot 後刪除／竄改沿革與附件 bytes、竄改各 receipt metadata 欄位，核對無重新抓取且不得回報 complete；另測三種 URL 形式及外站／未知格式拒絕。測試使用明確的合成結構 fixture，不能代替 live authority 證據。
+執行 `node scripts/test-official-ingestion.mjs`。十六項結構與安全測試涵蓋跨段累積、來源總數、raw 先保存、來源身分、redirect allowlist、byte limit、來源漂移保留前段、分散 HTML 標籤條號、廢停狀態badge與日期、發布機關空欄及缺欄反證、網站通用meta與真標題衝突反證、附件中斷續作、WebForms 原生 POST 及 namespace、symlink 與 checkpoint 契約，並在完整 law snapshot 後刪除／竄改沿革與附件 bytes、竄改各 receipt metadata 欄位，核對無重新抓取且不得回報 complete；另測三種 URL 形式及外站／未知格式拒絕。測試使用明確的合成結構 fixture，不能代替 live authority 證據。
 
 2026-10-15 實際官方 canary 已核驗：`GL000020` 的41條完整正文（含跨標籤的第二十八條）、沿革及 PDF；`GL000021` 的15條、沿革及 PDF；最新消息兩則與市政新聞兩則全文，以及市政新聞第2頁 POST。當次兩新聞來源宣告總數為 1,726 + 610 = 2,336；此為擷取時點的觀察值，不是固定設定。bounded canary 均維持 partial coverage，沒有宣稱全站已下載。
 

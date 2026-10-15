@@ -111,14 +111,19 @@ export function parseOfficialNews(detail, expected) {
   const tree = asHtml(detail), nativeId = detailIdentity(detail.url, "kcg-news"), kind = newsKind(detail.url), id = `${kind}:${nativeId}`;
   documentIdentity(tree, nativeId, "kcg-news", kind);
   const titleNode = allNodes(tree, (node) => node.tag === "meta" && node.attrs.name === "DC.Subject")[0];
-  const title = kind === "city" ? cleanText(allNodes(byClass(tree, "data_midlle_news_box01")[0], (node) => node.tag === "td")[0]) : titleNode?.attrs.content?.trim();
+  const metaSubject = titleNode?.attrs.content?.trim() || "";
+  const visibleTitle = cleanText(allNodes(byClass(tree, "data_midlle_news_box01")[0], (node) => node.tag === "td")[0]);
+  const genericMeta = normalized(metaSubject) === normalized("高雄市政府全球資訊網-中文版");
+  const useVisibleTitle = kind === "city" || !metaSubject || genericMeta;
+  const title = useVisibleTitle ? visibleTitle : metaSubject;
   if (!title || normalized(title) !== normalized(expected.title)) fail("SOURCE_ID_MISMATCH", "最新消息標題與官方索引不一致");
+  if (kind === "messages" && visibleTitle && normalized(visibleTitle) !== normalized(expected.title)) fail("SOURCE_ID_MISMATCH", "最新消息可見標題與官方索引不一致");
   const listItem = (label) => allNodes(byId(tree, "data_midlle") || tree, (node) => node.tag === "li").map(cleanText).find((text) => text.startsWith(label))?.slice(label.length).trim();
   const agency = listItem("發布機關："), dateRaw = listItem("發布日期：");
   const content = byClass(tree, "data_midlle_news_box02").map(cleanText).filter(Boolean).join("\n\n");
   if (agency === undefined || !dateRaw || !content) fail("SOURCE_STRUCTURE_CHANGED", "最新消息正文、發布機關或日期缺漏");
   if ((expected.agency && normalized(agency) !== normalized(expected.agency)) || dateIso(dateRaw) !== dateIso(expected.published_at)) fail("SOURCE_ID_MISMATCH", "新聞發布資訊與官方索引不一致");
-  return { news_id: id, source_native_id: nativeId, source_kind: kind, title, agency, publisher: agency, publisher_status: agency ? "provided" : "not_provided", publisher_source: agency ? "official-detail" : "official-detail-empty", category: expected.category || "最新消息", published_at: dateIso(dateRaw), published_at_source: dateRaw,
+  return { news_id: id, source_native_id: nativeId, source_kind: kind, title, title_source: useVisibleTitle ? "official-detail-visible-title" : "official-detail-meta-subject", title_meta_subject: metaSubject || null, agency, publisher: agency, publisher_status: agency ? "provided" : "not_provided", publisher_source: agency ? "official-detail" : "official-detail-empty", category: expected.category || "最新消息", published_at: dateIso(dateRaw), published_at_source: dateRaw,
     content, content_summary: content, content_summary_kind: "official-full-text", source_link: detail.url,
     index_source_url: expected.index_url, index_raw_sha256: expected.index_raw_sha256 };
 }

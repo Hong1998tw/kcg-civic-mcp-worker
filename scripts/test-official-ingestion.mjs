@@ -142,6 +142,23 @@ try {
     assert.throws(() => parseOfficialNews(captured(html.replace('<li><span>發布日期：</span>115-10-01</li>', '')), expected), /正文、發布機關或日期缺漏/);
     assert.throws(() => parseOfficialNews(captured(html), { ...expected, agency: '索引有機關但明細為空' }), /發布資訊與官方索引不一致/);
   });
+  await test("網站通用DC.Subject以正式可見標題核對，真正標題衝突仍拒絕", async () => {
+    const url = 'https://www.kcg.gov.tw/News_Content.aspx?n=F29A02A9D36C47F0&sms=19902EF36D6B551D&s=2E98CCB38C0FDA07';
+    const title = '測試正式可見標題', generic = '高雄市政府全球資訊網-中文版';
+    const html = `<meta name="DC.Subject" content="${generic}"><form action="${url}"><div class="data_midlle_news_box01"><table><tr><td>${title}</td></tr></table></div><div id="data_midlle"><li>發布日期：115-08-23</li><li>發布機關：交通局</li><div class="data_midlle_news_box02"><p>測試原件正文。</p></div></div></form>`;
+    const expected = { title, agency: '交通局', published_at: '115-08-23' }, captured = (source) => ({ url, bytes: Buffer.from(source) });
+    const value = parseOfficialNews(captured(html), expected);
+    assert.equal(value.title, title); assert.equal(value.title_source, 'official-detail-visible-title'); assert.equal(value.title_meta_subject, generic);
+    const absent = parseOfficialNews(captured(html.replace(`<meta name="DC.Subject" content="${generic}">`, '')), expected);
+    assert.equal(absent.title, title); assert.equal(absent.title_meta_subject, null);
+    const specific = parseOfficialNews(captured(html.replace(`content="${generic}"`, `content="${title}"`)), expected);
+    assert.equal(specific.title_source, 'official-detail-meta-subject');
+    assert.throws(() => parseOfficialNews(captured(html.replace(`content="${generic}"`, `content="${title}"`).replace(`<td>${title}</td>`, '<td>另一個可見標題</td>')), expected), /可見標題與官方索引不一致/);
+    assert.throws(() => parseOfficialNews(captured(html.replace(`content="${generic}"`, 'content="另一篇文章標題"')), expected), /標題與官方索引不一致/);
+    assert.throws(() => parseOfficialNews(captured(html.replace(`<td>${title}</td>`, '<td>另一篇文章標題</td>')), expected), /標題與官方索引不一致/);
+    assert.throws(() => parseOfficialNews(captured(html.replace(`<td>${title}</td>`, '<td></td>')), expected), /標題與官方索引不一致/);
+    assert.throws(() => parseOfficialNews(captured(html.replaceAll('s=2E98CCB38C0FDA07', 's=AAAAAAAAAAAAAAAA')), expected), /原始 HTML form 身分/);
+  });
   await test("法規附件預設保存原件，request中斷後續作不遺失", async () => {
     const root = path.join(base, "law-attachments"), lawUrl = "https://outlaw.kcg.gov.tw/LawContent.aspx?id=GL999999", historyUrl = "https://outlaw.kcg.gov.tw/LawContentSource.aspx?id=GL999999";
     const category = "https://outlaw.kcg.gov.tw/LawCategoryContentList.aspx?CategoryID=34", attachment = "https://outlaw.kcg.gov.tw/Download.ashx?FileID=1&id=GL999999&type=LAW";

@@ -62,7 +62,7 @@ PDF `coverage.complete` 需母集完整、原件及逐頁擷取通過，且沒�
 
 ## 驗證與已確認界線
 
-執行 `node scripts/test-kcc-ingestion.mjs`。27項測試涵蓋獨立tab完整性、分段接續、HTTP來源失敗、發布失敗不推進cursor、重複頁阻擋、詳情/附件原件跨段保存、多版本PDF續作、HTML entity URL回歸、頁序及空文字層，另重現並阻擋跨ID redirect、矛盾身分欄位、active release替換、母集A1000+B1混讀與雙dataset部分發布。含原生SQLite的別scope保護及「已寫入後拋錯」冪等恢復測試。
+執行 `node scripts/test-kcc-ingestion.mjs`。29項測試涵蓋獨立tab完整性、分段接續、HTTP來源失敗、發布失敗不推進cursor、重複頁阻擋、詳情/附件原件跨段保存、多版本PDF續作、HTML entity URL回歸、頁序及空文字層，另重現並阻擋跨ID redirect、矛盾身分欄位、active release替換、母集A1000+B1混讀與雙dataset部分發布。含原生SQLite的別scope保護及「已寫入後拋錯」冪等恢復測試。
 
 2026-10-15真實有界canary證據位於工作區 `../evidence/kcc-ingestion-canary/`：
 
@@ -143,3 +143,12 @@ NAS原件證明tab1總數1561，第4頁末尾的45052、45050（案號空白）�
 checkpoint版本、scope、已成功records及cursor相容，不重置NAS原400。reconciliation成功後的新paused邊界沿同job續作即可。舊checkpoint／work已有DOC原件但缺格式驗證metadata時，先從原生CAS讀回相同hash、補驗CFBF；通過才發布補充metadata，原件bytes、raw hash及cursor不變。驗證失敗保留既有證據並blocked，不把舊弱驗證當新格式通過。
 
 `regression-review-followup.log` 記錄27項測試通過。`review-followup-native-proof.json` 記錄真DOC1449由舊checkpoint進行CAS補驗：0次HTTP、cursor1、61952 bytes及原hash保持一致；真官方1561筆完整回應亦以新邊界重驗原始rows=unique IDs=正規化rows=total=1561，精確singleton查詢控制通過。本輪仍未修改NAS或啟動job。
+
+
+### 跨屆查詢的ViewState分段界線
+
+真來源對照顯示：fresh GET查0702為390筆，但沿用0701第5頁（pageSize100、offset400）的ViewState查0702會回0筆；再次fresh GET仍為390筆。這是跨屆沿用pager狀態造成的空頁，不能視為390筆正式來源消失。
+
+`collectIndex` 每屆全部tab成功發布後，若還有下一屆立即paused；下一段fresh GET才查下一屆。不改任何原枚舉總數、成功cursor、records或receipt，也不放寬SOURCE_DRIFT。真正總數不同的fixture仍blocked並保留原receipt。
+
+`../evidence/kcc-session-boundary-canary/live-438-to-0702-result.json` 記錄同scope、同baseline manifest的本機NAS等價store驗收：438→828筆，6次真官方HTTP完成0702的390筆後paused；原438筆record及0701完整query證據保持不變，0703/0704維持待續。原NAS、job及failed receipt均未改動。兩個新增跨屆fixture與原27項測試共29項通過。

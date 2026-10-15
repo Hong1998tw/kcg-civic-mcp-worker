@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { loadTypeScriptParser } from '../src/ingestion/collector.mjs';
 import { runKccCollection, validatePdfExtraction } from '../src/ingestion/kcc-collector.mjs';
-import { parseMeetingPage, parseAttachments, parseDetail, assertQuery } from '../src/ingestion/kcc-html.mjs';
+import { parseMeetingPage, parseAttachments, parseDetail, assertQuery, controls } from '../src/ingestion/kcc-html.mjs';
 const P='ctl00$ContentPlaceHolder1$', M=`${P}uscPeriodSessionMeeting$`;
 const e=(s)=>String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;');
 const input=(name,value='')=>`<input name="${e(name)}" value="${e(value)}"/>`;
@@ -45,6 +45,26 @@ function bindSource(h,dataset,records){
  h.store.hasDataset=async(name)=>name===dataset||originalHas(name);
  h.store.queryRecords=async(name,options={})=>name===dataset?{records:records.slice(options.offset||0,(options.offset||0)+(options.limit??1000)),local_match_count:records.length,release}:originalQuery(name,options);
  return release;
+}
+function meetingTermBoundaryHarness(){
+ const h=harness(),sourceTotals={'0701':3,'0702':2};let lastHtml='',unsafeSwitches=0;
+ const render=(session,offset,size)=>{
+  const total=sourceTotals[session],empty=offset>=total,page=Math.floor(offset/size)+1,pages=Math.ceil(total/size);
+  const form=input('__VIEWSTATE',JSON.stringify({session,offset,size}))+input('__EVENTVALIDATION','public-validation')+select(`${M}ddlPeriod`,['07'],'07')+select(`${M}ddlSession`,['0701','0702'],session)+select(`${M}ddlMeeting`,[''],'')+input(`${P}txtKeyword`,'');
+  const rows=empty?'<tr><td>尚無任何資料!</td></tr>':Array.from({length:Math.min(size,total-offset)},(_,i)=>{const id=String((session==='0701'?100:200)+offset+i+1);return `<tr><td>${offset+i+1}</td><td>100/01/01</td><td>${session}會議${id}</td><td><a href="/Upload/Attachment/MeetingRecord/${id}/original.pdf">PDF</a></td><td></td></tr>`;}).join('');
+  const footer=empty?'':`<span id="ContentPlaceHolder1_DataPager1">共 ${total} 筆 | ${page} / ${pages} 頁 | ${page<pages?`<a href="javascript:__doPostBack('ctl00$ContentPlaceHolder1$DataPager1$ctl01$ctl02','')">下一頁</a>`:'<a>下一頁</a>'}${input(`${P}DataPager1$ctl02$txtCurrentPage`)}${input(`${P}DataPager1$ctl02$txtPageSize`,size)}</span>`;
+  return form+`<table id="ContentPlaceHolder1_gvIndex">${rows}</table>`+footer;
+ };
+ const fetchImpl=async(url,options={})=>{
+  let session='0701',offset=0,size=2;
+  if(options.method==='POST'){
+   const f=new URLSearchParams(options.body),previous=JSON.parse(f.get('__VIEWSTATE'));session=f.get(`${M}ddlSession`);size=Number(f.get(`${P}DataPager1$ctl02$txtPageSize`))||previous.size;
+   if(f.get('__EVENTTARGET')===`${P}linkBtnSearch`){offset=previous.offset;if(previous.session!==session&&offset>0)unsafeSwitches++;}
+   else offset=((Number(f.get(`${P}DataPager1$ctl02$txtCurrentPage`))||1)-1)*size;
+  }
+  lastHtml=render(session,offset,size);return new Response(lastHtml,{headers:{'content-type':'text/html'}});
+ };
+ return{...h,sourceTotals,getLastHtml:()=>lastHtml,getUnsafeSwitches:()=>unsafeSwitches,dependencies:{...h.dependencies,fetchImpl}};
 }
 const temp=await mkdtemp(path.join(await realpath(os.tmpdir()),'kcc-ingestion-test-'));
 let passed=0;
@@ -230,6 +250,16 @@ try{
   const options={profile:'kcc-meeting-records',root,maxRequests:1},deps={...h.dependencies,fetchImpl:async()=>new Response(Buffer.from('d0cf11e0a1b11ae1','hex'))};const first=await runKccCollection(options,deps),state=JSON.parse(await readFile(first.checkpoint_path,'utf8')),snapshot=structuredClone(h.snapshots.get('kcc-meeting-records'));
   delete snapshot.records[0].data.original_versions[0].format_validation;snapshot.snapshot_id='legacy-doc-unverified-container';const receipt=await h.store.importSnapshot(snapshot);state.records['kcc-meeting-records'][id]=snapshot.records[0];state.receipts['kcc-meeting-records']=receipt;await import('node:fs/promises').then(fs=>fs.writeFile(first.checkpoint_path,JSON.stringify(state)));
   const result=await runKccCollection(options,deps);assert.equal(result.status,'partial');assert.equal(result.archive_complete,true);assert.equal(result.attempted,0);assert.equal(result.progress.cursor,1);const migrated=h.snapshots.get('kcc-meeting-records').records[0];assert.equal(migrated.raw_sha256,snapshot.records[0].raw_sha256);assert.equal(migrated.data.original_versions[0].format_validation.validation_version,'cfbf-magic-8-v1');
+ });
+ await test('跨屆完成即yield：舊末頁offset使下一屆假零筆，新段fresh GET可完整接續',async()=>{
+  const h=meetingTermBoundaryHarness(),options={profile:'kcc-meetings-full',root:path.join(temp,'term-boundary'),pageSize:2,maxRequests:30};
+  const first=await runKccCollection(options,h.dependencies);assert.equal(first.status,'paused');assert.equal(first.record_count,3);assert.equal(first.progress.queries['07/0701'].complete,true);assert.equal(first.progress.queries['07/0701'].tabs['1'].next_page,3);assert.equal(first.progress.queries['07/0702'].tabs['1'].total,2);assert.equal(h.getUnsafeSwitches(),0);
+  const before=JSON.parse(await readFile(first.checkpoint_path,'utf8')),form=controls(h.getLastHtml());form.set('__EVENTTARGET',`${P}linkBtnSearch`);form.set(`${M}ddlSession`,'0702');const bad=await h.dependencies.fetchImpl('https://cissearch.kcc.gov.tw/System/meetingrecord/default.aspx',{method:'POST',body:form.toString()});assert.equal(parseMeetingPage(await bad.text())[0].total,0);assert.equal(h.getUnsafeSwitches(),1);
+  const last=await runKccCollection(options,h.dependencies);assert.equal(last.status,'complete');assert.equal(last.record_count,5);assert.equal(last.coverage.source_total,5);assert.equal(last.coverage.complete,true);assert.equal(h.getUnsafeSwitches(),1);const after=JSON.parse(await readFile(last.checkpoint_path,'utf8'));for(const [id,record]of Object.entries(before.records['kcc-meetings']))assert.deepEqual(after.records['kcc-meetings'][id],record);assert.deepEqual(after.queries['07/0701'],before.queries['07/0701']);
+ });
+ await test('跨屆fresh GET仍核原枚舉總數：真正來源變動維持SOURCE_DRIFT',async()=>{
+  const h=meetingTermBoundaryHarness(),options={profile:'kcc-meetings-full',root:path.join(temp,'term-real-drift'),pageSize:2,maxRequests:30};const first=await runKccCollection(options,h.dependencies);assert.equal(first.status,'paused');assert.equal(first.record_count,3);h.sourceTotals['0702']=3;
+  const next=await runKccCollection(options,h.dependencies);assert.equal(next.status,'blocked');assert.equal(next.error_code,'SOURCE_DRIFT');assert.equal(next.record_count,3);assert.equal(next.receipt.snapshot_id,first.receipt.snapshot_id);assert.equal(next.receipt.manifest_sha256,first.receipt.manifest_sha256);assert.equal(next.progress.queries['07/0702'].tabs['1'].total,2);assert.equal(h.getUnsafeSwitches(),0);
  });
  console.log(`${passed} meaningful KCC ingestion tests passed`);
 }finally{await rm(temp,{recursive:true,force:true});}
