@@ -22,10 +22,10 @@ function messageDetail(id, title, body = "新聞正文") {
   const url = OLD_URL(id);
   return `<meta name="DC.Subject" content="${title}"><form action="${url}"><div id="data_midlle"><li><span>發布機關：</span>測試機關</li><li><span>發布日期：</span>${PUBLISHED}</li><div class="data_midlle_news_box02"><p>${body}</p></div></div></form>`;
 }
-function messageIndex(items, next = false, total = 3) {
+function messageIndex(items, next = false, total = 3, nextHref = `${NEWS}&page=2`) {
   const rows = items.map(({ id, title = `最新消息${id[0]}`, agency = "測試機關", date = PUBLISHED }) =>
     `<tr><td><a href="${OLD_URL(id)}">${title}</a></td><td>${agency}</td><td>${date}</td></tr>`).join("");
-  return `<table>${rows}</table><p>共${total}筆</p>${next ? `<a href="${NEWS}&page=2">下一頁</a>` : ""}`;
+  return `<table>${rows}</table><p>共${total}筆</p>${next ? `<a href="${nextHref}">下一頁</a>` : ""}`;
 }
 function cityIndex(page) {
   const id = CITY_IDS[page - 1], title = `市政新聞${page}`;
@@ -79,7 +79,7 @@ async function seedDrift(root, { lastError = "SOURCE_DRIFT", profile = "kcg-news
   return { runId, checkpointPath, checkpointDoc, checkpointBytes: await readFile(checkpointPath), detailUrl, detailSha };
 }
 
-function roundDeps({ replaceHome = false, mixScope = false } = {}) {
+function roundDeps({ replaceHome = false, mixScope = false, nextHref = `${NEWS}&page=2` } = {}) {
   const requests = [];
   let newsGets = 0, cityGets = 0, instant = Date.now();
   return { requests, now: () => instant, sleep: async (ms) => { instant += ms; }, fetchImpl: async (input, options) => {
@@ -90,12 +90,13 @@ function roundDeps({ replaceHome = false, mixScope = false } = {}) {
       if (mixScope && newsGets === 1) return new Response(`<table><tr><td><a href="${CITY_DETAIL(CITY_IDS[0])}">跨scope市政稿</a></td><td>測試機關</td><td>${PUBLISHED}</td></tr></table><p>共3筆</p><a href="${NEWS}&page=2">下一頁</a>`);
       if (replaceHome && newsGets === 2) return new Response(messageIndex([
         { id: MESSAGE_IDS[0], title: "最新消息A被同總數置換" }, { id: MESSAGE_IDS[1], title: "最新消息B" },
-      ], true));
+      ], true, 3, nextHref));
       return new Response(messageIndex([
         { id: MESSAGE_IDS[0], title: "最新消息A" }, { id: MESSAGE_IDS[1], title: "最新消息B" },
-      ], true));
+      ], true, 3, nextHref));
     }
-    if (address === `${NEWS}&page=2` || address === `${NEWS}&page=2&PageSize=20`) {
+    if (address === `${NEWS}&page=2` || address === `${NEWS}&page=2&PageSize=20` ||
+        address === "https://www.kcg.gov.tw/news.aspx?n=F29A02A9D36C47F0&sms=19902EF36D6B551D&page=2&PageSize=20") {
       return new Response(messageIndex([{ id: MESSAGE_IDS[2], title: "最新消息C" }], false));
     }
     if (address === CITY) {
@@ -242,6 +243,56 @@ try {
     const deps = roundDeps();
     const result = await runOfficialCollection({ profile: "kcg-news", root, maxRequests: 5, maxPages: 5 }, deps);
     assert.equal(result.error_code, "SOURCE_ID_MISMATCH"); assert.equal(deps.requests.length, 0);
+  });
+
+  await test("舊 collector 僅接受明示小寫 ASP alias 並可跨頁續作", async () => {
+    const lowerHref = "/./news.aspx?n=F29A02A9D36C47F0&sms=19902EF36D6B551D&page=2&PageSize=20";
+    const root = path.join(base, "legacy-lower-alias"), deps = roundDeps({ nextHref: lowerHref });
+    let result;
+    for (let segment = 0; segment < 10; segment++) {
+      result = await runOfficialCollection({ profile: "kcg-news", root, maxRequests: 30, maxPages: 10 }, deps);
+      if (result.status !== "paused") break;
+    }
+    assert.equal(result.status, "complete"); assert.equal(result.record_count, 5);
+    const lowerPage2 = "https://www.kcg.gov.tw/news.aspx?n=F29A02A9D36C47F0&sms=19902EF36D6B551D&page=2&PageSize=20";
+    assert.ok(deps.requests.some((request) => request.address === lowerPage2), "實際續作使用官方回應中的小寫 alias");
+    const store = new LocalStore(root); const records = await store.queryRecords("kcg-news", { limit: 10 }); store.close();
+    const page2Record = records.records.find((record) => record.id === `messages:${MESSAGE_IDS[2]}`);
+    assert.equal(new URL(page2Record.data.index_source_url).pathname, "/news.aspx");
+
+    const badRoot = path.join(base, "legacy-uppercase-negative"), badDeps = roundDeps({ nextHref: "/NEWS.aspx?n=F29A02A9D36C47F0&sms=19902EF36D6B551D&page=2&PageSize=20" });
+    const rejected = await runOfficialCollection({ profile: "kcg-news", root: badRoot, maxRequests: 10 }, badDeps);
+    assert.equal(rejected.status, "blocked"); assert.equal(rejected.error_code, "SOURCE_ID_MISMATCH");
+    assert.deepEqual(badDeps.requests.map((request) => request.address), [NEWS]);
+  });
+
+  await test("index_round 保留小寫 listing alias，verification 另以原首頁 GET 複核", async () => {
+    const lowerHref = "/./news.aspx?n=F29A02A9D36C47F0&sms=19902EF36D6B551D&page=2&PageSize=20";
+    const root = path.join(base, "round-lower-alias"), seeded = await seedDrift(root, { publishedCount: 1 }); const prepared = await prepare(root, seeded);
+    const deps = roundDeps({ nextHref: lowerHref });
+    const result = await runOfficialCollection({ profile: "kcg-news", root, maxRequests: 30, maxPages: 20 }, deps);
+    assert.equal(result.status, "complete"); assert.equal(result.index_round.phase, "complete"); assert.equal(result.record_count, 5);
+    const state = (await currentCheckpoint(seeded.checkpointPath)).state;
+    const page2 = state.index_round_scope_evidence.messages.pages.find((page) => page.page === 2);
+    assert.equal(new URL(page2.requested_url).pathname, "/news.aspx"); assert.equal(new URL(page2.final_url).pathname, "/news.aspx");
+    const third = state.entries[`messages:${MESSAGE_IDS[2]}`];
+    assert.equal(new URL(third.index_url).pathname, "/news.aspx");
+    const verify = state.index_round_verifications.messages;
+    assert.equal(verify.request_method, "GET"); assert.equal(verify.requested_url, NEWS);
+    assert.ok(deps.requests.filter((request) => request.address === NEWS && request.method === "GET").length >= 2,
+      "listing homepage and fresh verification GET are separate requests");
+    assert.equal(state.index_round_id, prepared.index_round_id);
+  });
+
+  await test("index_round 明確拒絕 /NEWS.aspx 與其他未列名路徑", async () => {
+    for (const pathname of ["/NEWS.aspx", "/News.aspxExtra"]) {
+      const root = path.join(base, `round-path-${pathname.replaceAll("/", "")}`), seeded = await seedDrift(root); await prepare(root, seeded);
+      const doc = await currentCheckpoint(seeded.checkpointPath), url = new URL(NEWS);
+      url.pathname = pathname; doc.state.queues[0].url = url.toString(); doc.sha256 = hash(JSON.stringify(doc.state));
+      await writeFile(seeded.checkpointPath, JSON.stringify(doc));
+      const deps = roundDeps(), result = await runOfficialCollection({ profile: "kcg-news", root, maxRequests: 5, maxPages: 5 }, deps);
+      assert.equal(result.status, "blocked"); assert.equal(result.error_code, "SOURCE_ID_MISMATCH"); assert.equal(deps.requests.length, 0);
+    }
   });
 
   await test("完整新母體小於原發布數時停止，保留原 active release", async () => {

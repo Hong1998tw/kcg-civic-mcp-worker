@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 
 export const NEWS_INDEX_ROUND_VERSION = 1;
 export const NEWS_ROUND_SCOPES = Object.freeze({
-  messages: Object.freeze({ path: "/News.aspx", n: "F29A02A9D36C47F0", sms: "19902EF36D6B551D" }),
+  messages: Object.freeze({ path: "/News.aspx", pathAliases: Object.freeze(["/News.aspx", "/news.aspx"]), n: "F29A02A9D36C47F0", sms: "19902EF36D6B551D" }),
   city: Object.freeze({ path: "/CityNews1.aspx", n: "3A379BB94CA5F12D" }),
 });
 
@@ -87,7 +87,8 @@ function validatedNewsRoundTaskUrl(task) {
   const scope = scopeForTask(task), spec = NEWS_ROUND_SCOPES[scope];
   let page, url;
   try { url = new URL(task.url); } catch { fail("SOURCE_ID_MISMATCH", "官方新聞索引網址無效"); }
-  if (url.protocol !== "https:" || url.hostname !== "www.kcg.gov.tw" || url.pathname !== spec.path || url.username || url.password || url.port || url.hash) {
+  const allowedPath = scope === "messages" ? spec.pathAliases.includes(url.pathname) : url.pathname === spec.path;
+  if (url.protocol !== "https:" || url.hostname !== "www.kcg.gov.tw" || !allowedPath || url.username || url.password || url.port || url.hash) {
     fail("SOURCE_ID_MISMATCH", "官方新聞索引來源路徑不符合固定 scope");
   }
   if (scope === "messages") {

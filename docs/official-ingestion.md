@@ -55,7 +55,7 @@ const result = await runOfficialCollection({
 
 新狀態保留 `run_id`、全部 captures／原始 CAS、歷史 snapshot 與目前 active release；另建 `index_round_id`、`index_round_attempt` 和專屬 request-key namespace，重新建立 `messages` 與 `city` 兩個來源的索引佇列。舊 checkpoint 的 `records.length` 留在 `prior_published_count`，所以新的 `record_count: 0` 表示「本索引回合尚未重解析明細」，不表示工作歸零。索引與複核階段不取明細、不發布；未重建的新 records 尚少於原發布數時，發布仍保留原快照。
 
-回合依 `indexing → verifying → frozen → details → complete` 前進。索引每頁先驗證固定路徑、`scope`、`n`／`sms`、頁次連續、列數、全體唯一 ID 和正確 `messages:`／`city:` namespace；每頁另存依序排列的 ID、標題、日期、機關（市政新聞另保留類別）digest，以及兩來源首末頁的 capture 證據。完成兩個來源後，以新的 namespaced GET 分別重抓最新消息首頁與市政新聞首頁，核對來源總數及首頁有序 digest；市政新聞末頁證據沿用本輪 WebForms POST 鏈的真實原件，不把尾頁偽裝成 GET。兩次首頁複核都通過後，完整索引 digest 與 capture window 先寫入 checkpoint，才允許明細階段。
+回合依 `indexing → verifying → frozen → details → complete` 前進。最新消息索引路徑只明確接受 `/News.aspx` 與實測 ASP alias `/news.aspx`；不將路徑全面轉小寫，其他大小寫形式如 `/NEWS.aspx` 仍拒絕。原始 `requested_url`、capture URL 與 entry `index_url` 保留收到的路徑大小寫。索引每頁先驗證固定路徑、`scope`、`n`／`sms`、頁次連續、列數、全體唯一 ID 和正確 `messages:`／`city:` namespace；每頁另存依序排列的 ID、標題、日期、機關（市政新聞另保留類別）digest，以及兩來源首末頁的 capture 證據。完成兩個來源後，以新的 namespaced GET 分別重抓最新消息首頁與市政新聞首頁，核對來源總數及首頁有序 digest；市政新聞末頁證據沿用本輪 WebForms POST 鏈的真實原件，不把尾頁偽裝成 GET。兩次首頁複核都通過後，完整索引 digest 與 capture window 先寫入 checkpoint，才允許明細階段。
 
 `index_round_capture_window` 表示跨分段採集與複核時間範圍，不代表官方同一交易快照。明細階段會先按 receipt 和 CAS hash 讀回已存在的明細 capture，再重新執行 `parseOfficialNews`，不沿用舊 parsed record。若本輪又發生 `SOURCE_DRIFT`，一般 resume 會保留該輪狀態並再次停在錯誤；只有 root 明確以目前 checkpoint SHA 呼叫 API 才開始下一輪。
 
@@ -108,7 +108,7 @@ const result = await runOfficialCollection({
 
 ## 驗證紀錄與限制
 
-執行 `node scripts/test-official-ingestion.mjs` 驗證 17 項既有 parser、原件、法規、新聞及 checkpoint 情境；另執行 `node scripts/test-official-news-round.mjs` 驗證來源漂移遷移 gate、原 checkpoint archive／讀回／冪等重試、同 run identity、分段索引、雙首頁 fresh GET、固定 scope 與 entry namespace、同總數首頁替換拒絕、POST 尾頁證據、frozen resume、舊 detail CAS 重解析、發布保留及最多三輪。測試均使用明確的合成結構 fixture，不能代替 live authority 證據，也不執行 NAS 全量採集。
+執行 `node scripts/test-official-ingestion.mjs` 驗證 17 項既有 parser、原件、法規、新聞及 checkpoint 情境；另執行 `node scripts/test-official-news-round.mjs` 驗證 14 項回合情境，涵蓋來源漂移 gate、checkpoint archive／讀回／冪等重試、同 run identity、分段索引、雙首頁 fresh GET、固定 scope 與 entry namespace、同總數首頁替換拒絕、POST 尾頁證據、舊 detail CAS 重解析、發布保留、最多三輪，以及 `/news.aspx` 跨頁 alias 與 `/NEWS.aspx` 反例。舊 collector 和 index_round 都保留原始 URL 大小寫。測試均使用合成 fixture，不能代替 live authority 證據，也不執行 NAS 全量採集。
 
 2026-10-15 實際官方 canary 已核驗：`GL000020` 的41條完整正文（含跨標籤的第二十八條）、沿革及 PDF；`GL000021` 的15條、沿革及 PDF；最新消息兩則與市政新聞兩則全文，以及市政新聞第2頁 POST。當次兩新聞來源宣告總數為 1,726 + 610 = 2,336；此為擷取時點的觀察值，不是固定設定。bounded canary 均維持 partial coverage，沒有宣稱全站已下載。
 

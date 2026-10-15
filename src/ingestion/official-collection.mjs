@@ -14,6 +14,7 @@ import {
 const LAW_ROOT = "https://outlaw.kcg.gov.tw/LawCategoryMain.aspx?type=M";
 const NEWS_ROOT = "https://www.kcg.gov.tw/News.aspx?n=F29A02A9D36C47F0&sms=19902EF36D6B551D";
 const CITY_ROOT = "https://www.kcg.gov.tw/CityNews1.aspx?n=3A379BB94CA5F12D";
+const NEWS_INDEX_PATH_ALIASES = new Set(["/News.aspx", "/news.aspx"]);
 const VERSION = "official-html-2026-10-15-v5";
 export const OFFICIAL_PROFILES = Object.freeze({
   "kcg-laws": Object.freeze({ dataset: "kcg-laws", entrypoint: LAW_ROOT, scope: "法規體系全部機關分類（不以近六個月最新訊息代替）", hosts: ["outlaw.kcg.gov.tw"] }),
@@ -172,7 +173,10 @@ function parseIndex(capture, profile) {
   if (nextUrl) {
     const current = new URL(capture.url), following = new URL(nextUrl);
     const sameScope = profile === "kcg-laws" ? current.searchParams.get("CategoryID") === following.searchParams.get("CategoryID") : current.searchParams.get("n") === following.searchParams.get("n") && current.searchParams.get("sms") === following.searchParams.get("sms");
-    if (following.pathname !== current.pathname || !sameScope || Number(following.searchParams.get("page")) !== Number(current.searchParams.get("page") || 1) + 1) fail("SOURCE_ID_MISMATCH", "分頁範圍或頁次不連續");
+    const samePath = profile === "kcg-news"
+      ? NEWS_INDEX_PATH_ALIASES.has(current.pathname) && NEWS_INDEX_PATH_ALIASES.has(following.pathname)
+      : following.pathname === current.pathname;
+    if (!samePath || !sameScope || Number(following.searchParams.get("page")) !== Number(current.searchParams.get("page") || 1) + 1) fail("SOURCE_ID_MISMATCH", "分頁範圍或頁次不連續");
   }
   const pageText = isCityIndex ? cleanText(byId(tree, "ContentPlaceHolder1_lblPageCount")) : null;
   const pageMatch = pageText ? /^(\d+)\s*\/\s*(\d+)$/.exec(pageText) : null;
