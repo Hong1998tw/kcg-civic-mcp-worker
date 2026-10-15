@@ -5,6 +5,12 @@ export { OAuthState } from "./auth/state";
 const OAUTH_PATHS = new Set(["/oauth/authorize", "/oauth/token", "/oauth/register",
   "/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp", "/.well-known/oauth-authorization-server"]);
 
+const APP_ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <rect width="64" height="64" rx="14" fill="#0f766e"/>
+  <path d="M16 17h32v6H16zM16 29h32v6H16zM16 41h20v6H16z" fill="#fff"/>
+  <circle cx="45" cy="44" r="6" fill="#fff"/>
+</svg>`;
+
 function withHeaders(response: Response, origin: string | null): Response {
   const headers = new Headers(response.headers);
   headers.set("Cache-Control", "no-store");
@@ -52,6 +58,11 @@ export default {
     }
     const respond = (response: Response) => withHeaders(response, corsOrigin);
     if (request.method === "OPTIONS") return respond(new Response(null, { status: 204 }));
+    if (url.pathname === "/icon.svg" && request.method === "GET") {
+      return respond(new Response(APP_ICON_SVG, {
+        headers: { "Content-Type": "image/svg+xml; charset=utf-8" },
+      }));
+    }
     if (url.pathname === "/health" && request.method === "GET") return respond(Response.json({
       status: "ok", version: "1.1.1", authentication: "oauth2.1", oauth_configured: !!(env.OAUTH_LOGIN_KEY || env.MCP_ACCESS_KEY),
       transport: "streamable-http", data_status: "degraded",

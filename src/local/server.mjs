@@ -173,6 +173,8 @@ export async function startLocalServer(env = process.env) {
         registry,
         serverInfo: SERVER_INFO,
         securitySchemes: API_KEY_SCHEME,
+        iconUrl: null,
+        openWorldHint: false,
       });
       const headers = Object.fromEntries(response.headers.entries());
       headers["Cache-Control"] = "no-store";
