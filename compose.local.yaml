@@ -1,0 +1,39 @@
+services:
+  kcg-civic-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile.local
+    image: kcg-civic-mcp-local:node24
+    init: true
+    read_only: true
+    mem_limit: 384m
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    environment:
+      BIND_HOST: 0.0.0.0
+      PORT: "8787"
+      LOCAL_PRIVATE_BIND: "true"
+      LOCAL_ALLOWED_HOSTS: "kcg-civic-mcp:8787,127.0.0.1:8787"
+      KCG_CIVIC_DATA_DIR: /data/kcg-civic
+      MCP_ACCESS_KEY_FILE: /run/secrets/mcp_access_key
+    secrets:
+      - source: mcp_access_key
+        target: mcp_access_key
+    volumes:
+      - type: bind
+        source: "${KCG_CIVIC_HOST_DIR:?Set KCG_CIVIC_HOST_DIR to a persistent local or NAS data directory}"
+        target: /data/kcg-civic
+        read_only: true
+    expose:
+      - "8787"
+    networks:
+      - local_private
+    restart: unless-stopped
+
+secrets:
+  mcp_access_key:
+    file: "${MCP_ACCESS_KEY_FILE:?Set MCP_ACCESS_KEY_FILE to a protected secret file}"
+
+networks:
+  local_private:
+    internal: true

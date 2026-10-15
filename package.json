@@ -7,12 +7,27 @@
     "test:budget-parser": "rm -rf .tmp-budget-parser && tsc --ignoreConfig src/tools/budget.parser.ts --target ES2022 --module nodenext --moduleResolution nodenext --outDir .tmp-budget-parser --skipLibCheck && node scripts/test-budget-parser.cjs && rm -rf .tmp-budget-parser",
     "test:integrity": "rm -rf .tmp-integrity && tsc --ignoreConfig src/utils/crypto.ts src/utils/integrity.ts src/models/types.ts src/kcc/client.ts src/kcc/search.ts src/kcc/proposal.ts src/kcc/identity.ts --target ES2022 --module node16 --moduleResolution node16 --outDir .tmp-integrity --skipLibCheck --types @cloudflare/workers-types && node scripts/test-integrity.cjs && rm -rf .tmp-integrity",
     "test:oauth": "node scripts/test-oauth.mjs",
-    "test": "npm run typecheck && npm run test:budget-parser && npm run test:integrity && npm run test:oauth",
+    "test": "npm run typecheck && npm run test:budget-parser && npm run test:integrity && npm run test:oauth && npm run test:kcc-filters",
     "dev": "wrangler dev",
     "verify:toolchain": "node scripts/assert-wrangler-version.mjs",
     "verify:production-safety": "node scripts/assert-production-safe.mjs",
     "predeploy": "npm test && npm run verify:production-safety && npm run verify:toolchain",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "build:local": "node scripts/build-local.mjs",
+    "start:local": "node scripts/build-local.mjs && node dist-local/server.mjs",
+    "test:local": "node scripts/test-local.mjs",
+    "test:local-all": "npm run test:local && npm run test:local-readback && node scripts/test-local-collector.mjs && npm run test:kcc-ingestion && npm run test:official-ingestion && npm run test:local-oauth && npm run test:local-oauth-integration && npm run test:local-ingress && node scripts/test-local-jobs.mjs && npm run test:enrichment-v2 && npm run test:official-news-round && npm run test:kcc-readall && npm run test:capacity-identity",
+    "test:kcc-filters": "node scripts/test-kcc-filter-controls.mjs",
+    "test:kcc-ingestion": "node scripts/test-kcc-ingestion.mjs",
+    "test:official-ingestion": "node scripts/test-official-ingestion.mjs",
+    "test:local-oauth": "node scripts/test-local-oauth.mjs",
+    "test:local-readback": "node scripts/test-local-readback.mjs",
+    "test:local-oauth-integration": "node scripts/test-local-oauth-integration.mjs",
+    "test:local-ingress": "node scripts/test-local-ingress.mjs",
+    "test:enrichment-v2": "node scripts/test-local-v2-store.mjs && node scripts/test-kcc-payload-v2.mjs && node scripts/test-local-v2-registry.mjs && node scripts/test-kcc-enrichment-v2.mjs",
+    "test:official-news-round": "node scripts/test-official-news-round.mjs",
+    "test:kcc-readall": "node scripts/test-kcc-readall-fastpath.mjs",
+    "test:capacity-identity": "node scripts/test-capacity-process-identity.mjs"
   },
   "description": "Open-source MCP infrastructure providing structured, source-verifiable access to Kaohsiung municipal laws, budgets, council records, news, and public datasets.",
   "keywords": [
@@ -38,16 +53,18 @@
   },
   "homepage": "https://github.com/Hong1998tw/kcg-civic-mcp-worker#readme",
   "devDependencies": {
-    "@cloudflare/workers-types": "5.20260916.1",
+    "@cloudflare/workers-types": "5.20261006.1",
     "@types/node": "^26.4.1",
     "esbuild": "0.28.1",
-    "miniflare": "5.20260903.0-alpha",
+    "miniflare": "5.20261012.0-beta",
     "typescript": "^7.0.2",
-    "wrangler": "^4.129.0"
+    "undici": "7.29.1",
+    "wrangler": "4.151.0"
   },
   "dependencies": {
     "@cloudflare/workers-oauth-provider": "0.10.3",
-    "@modelcontextprotocol/sdk": "1.30.0",
+    "@modelcontextprotocol/sdk": "1.31.0",
+    "express": "5.2.1",
     "unpdf": "^1.8.1"
   }
 }
