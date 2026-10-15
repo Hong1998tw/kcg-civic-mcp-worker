@@ -35,6 +35,8 @@ SQLite 必須由同一 NAS 主機的程序操作本機磁碟；Mac 不經 SMB／
 
 35 秒尚未取得回執時回 `pending`；它代表工作流已結束等待，不代表採集完成。採集者逾時、被中止或可能已提交但回執不明時回 `outcome_unknown`。正常提交還需以唯讀 store 再核 snapshot、筆數及 manifest hash。
 
+worker 對單次 collector 子程序使用固定 900,000 ms（15 分鐘）框架時限，涵蓋子程序內的擷取、耐久儲存、發布及原生讀回；時限到達、程序被殺或退出結果不明仍須回 `outcome_unknown` 並依原 job reconcile。HTTP 採集維持 collector 自身每段最多 25 requests／75 秒的界線；這個 request 界線不會截斷之後的本機驗證與發布。NAS R9 全規模 32,391 筆一次匯入實測，`kcc-proposal-details` 花 139,737 ms、`kcc-proposal-attachments` 花 145,652 ms；同一詳情批次依序驗證並發布兩個 dataset 至少需要約 285 秒，因此 180 秒 worker 時限不足。
+
 交接目錄是同一受信任 NAS 內的程序介面；同 UID 的可寫目錄不提供對惡意 n8n 的獨立身分驗證或防竄改證明。正式驗收另核容器與 SQLite／原始檔，不只相信 n8n 回執。
 
 n8n 的執行紀錄、binary data 或 Data Tables 不作正文語料庫；執行紀錄會被清理，容器路徑也須有持久 volume。[執行紀錄保存](https://docs.n8n.io/hosting/scaling/execution-data/)、[檔案讀寫](https://docs.n8n.io/integrations/builtin/core-nodes/n8n-nodes-base.readwritefile/)
@@ -58,11 +60,11 @@ n8n 的執行紀錄、binary data 或 Data Tables 不作正文語料庫；執行
 
 ## 可攜式 NAS Compose 模板
 
-`compose.nas.yaml` 是可攜式角色與隔離設定模板，供 NAS 本機環境填入實際路徑與既有 tunnel network 名稱後檢查。它不代表目前 NAS 的即時部署狀態；專案狀態、實際部署與收錄範圍仍以本文件開頭所列 MCP 主檔與 CTX 為準。
+`compose.nas.yaml` 是可攜式角色與隔離設定模板，供 NAS 本機環境填入實際路徑與既有 tunnel network 名稱後檢查。`jobs` 設定 1200 秒停止寬限，讓 worker 收到停止訊號後有時間等待 collector 子程序完成或達到固定時限，並完成必要的本機讀回；此值不改變 collector 的 HTTP 分段預算。`compose.local.yaml` 目前只有唯讀查詢服務，沒有 `jobs` role，因此不設定 worker 停止寬限。模板不代表目前 NAS 的即時部署狀態；專案狀態、實際部署與收錄範圍仍以本文件開頭所列 MCP 主檔與 CTX 為準。
 
 | 角色 | 本機資料與網路權限 | 容器隔離 |
 | --- | --- | --- |
-| `jobs` | `data` 與 `queue` 可寫；加入 `ingestion` 官方來源採集網路 | UID 1000、唯讀根檔案系統、1.5 CPU、1024 MiB、200 秒停止寬限 |
+| `jobs` | `data` 與 `queue` 可寫；加入 `ingestion` 官方來源採集網路 | UID 1000、唯讀根檔案系統、1.5 CPU、1024 MiB、1200 秒停止寬限 |
 | `query` | `data` 唯讀、`auth` 可寫、Bearer 與 owner key 以唯讀檔案 secret 注入；只加入 `local_private` 內部網路 | UID 1000、唯讀根檔案系統、384 MiB；沒有 host port |
 | `ingress` | 沒有資料 volume 或 secret；同時加入 `local_private` 與既有 tunnel network，以 `kcg-civic-ingress` alias 提供固定 Host 入口 | 可選 `tunnel` profile、UID 1000、唯讀根檔案系統、`cap_drop: ALL`；沒有 host port |
 
@@ -98,3 +100,5 @@ docker compose -f compose.nas.yaml --profile tunnel config --quiet
 ```
 
 OAuth 備份需同時保存可一致還原的 `auth` SQLite 狀態與 Proton Pass 中的秘密參照及復原資訊。不要只複製執行中的 `oauth.sqlite` 主檔，也不要將 Bearer 或 owner key 值寫入 `.env`、Compose、repo、日誌或一般備份說明。備份後要在隔離位置驗證 SQLite 還原與兩個秘密參照的安全取回流程；此流程不改變本文件所列唯一專案狀態來源。
+
+子程序退出後，worker 還會獨立讀回目前 release；這一步在 900 秒子程序計時之外。1200 秒容器停止寬限額外配置約 300 秒給父程序讀回與回執落盤，讀回時程以全規模查詢驗收衡量。

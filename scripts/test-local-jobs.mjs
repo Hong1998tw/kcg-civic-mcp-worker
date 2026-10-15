@@ -4,7 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
-import { processOne, runCollector, validateRequest, verifyCollectorReceipt, dependencyReady, readCollectorCommit, collectionAdvanced } from './local-job-worker.mjs';
+import { EventEmitter } from 'node:events';
+import { COLLECTOR_TIMEOUT_MS, processOne, runCollector, validateRequest, verifyCollectorReceipt, dependencyReady, readCollectorCommit, collectionAdvanced } from './local-job-worker.mjs';
 import { LocalStore } from '../src/local/store.mjs';
 import { packKccV2Record } from '../src/local/kcc-payload.mjs';
 
@@ -14,6 +15,28 @@ try {
   const queue = path.join(root, 'queue');
   const data = path.join(root, 'data');
   fs.mkdirSync(path.join(queue, 'requests'), { recursive: true });
+  assert.equal(COLLECTOR_TIMEOUT_MS, 900000, 'collector process deadline is the fixed 900-second worker budget');
+  const timeoutChild = new EventEmitter();
+  timeoutChild.stdout = new EventEmitter(); timeoutChild.stderr = new EventEmitter();
+  let timeoutCallback, observedTimeoutMs, killedWith, timerCleared = false;
+  timeoutChild.kill = (signal) => { killedWith = signal; setImmediate(() => timeoutChild.emit('close', null, signal)); return true; };
+  const timeoutScript = path.join(root, 'timeout-fixture.mjs');
+  const timeoutPromise = runCollector('kcg-news', data, {
+    collectorScript: timeoutScript,
+    spawnImpl: (command, args) => {
+      assert.equal(command, process.execPath);
+      assert.deepEqual(args, [timeoutScript, '--profile', 'kcg-news', '--root', data, '--run']);
+      return timeoutChild;
+    },
+    setTimeoutImpl: (callback, delay) => { timeoutCallback = callback; observedTimeoutMs = delay; return 'TEST-timer'; },
+    clearTimeoutImpl: (timer) => { assert.equal(timer, 'TEST-timer'); timerCleared = true; },
+  });
+  assert.equal(observedTimeoutMs, COLLECTOR_TIMEOUT_MS, 'runCollector arms the fixed real budget');
+  timeoutCallback();
+  const timeoutOutcome = await timeoutPromise;
+  assert.equal(killedWith, 'SIGKILL');
+  assert.equal(timerCleared, true);
+  assert.deepEqual(timeoutOutcome, { status: 'outcome_unknown', reason_code: 'COLLECTOR_RECONCILIATION_REQUIRED' }, 'timeout kill still requires reconciliation');
   const id = crypto.createHash('sha256').update('health:TEST-health-v1').digest('hex');
   const request = { schema_version: 1, job_id: id, profile: 'health', idempotency_key: 'TEST-health-v1', requested_at: new Date().toISOString() };
   assert.equal(validateRequest(request, id + '.json').job_id, id);
@@ -217,7 +240,7 @@ try {
     assert.equal(fs.existsSync(path.join(queue, 'requests', held.job_id + '.json')), false);
     assert.equal(fs.existsSync(terminalPath), false);
   }
-  console.log('PASS local jobs: native complete-parent checks, capacity hold preserves request identity without terminal receipt, health job continues, prior queue/store cases');
+  console.log('PASS local jobs: fixed 900-second collector deadline preserves unknown-on-kill, native complete-parent checks, held news prior readback, capacity holds, health, prior queue/store cases');
 } finally {
   if (previousEnrichmentEnabled === undefined) delete process.env.KCG_ENRICHMENT_ENABLED;
   else process.env.KCG_ENRICHMENT_ENABLED = previousEnrichmentEnabled;

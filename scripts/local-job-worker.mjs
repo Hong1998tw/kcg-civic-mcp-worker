@@ -10,6 +10,7 @@ import { validateNewsIndexRoundState } from '../src/ingestion/official-news-roun
 const ID = /^[a-f0-9]{64}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const OFFICIAL_NEWS_VERSION = 'official-html-2026-10-15-v5';
+export const COLLECTOR_TIMEOUT_MS = 900_000;
 const PROFILES = new Set(['health', ...Object.keys(COLLECTION_DATASETS)]);
 const CAPACITY_HELD_PROFILES = new Set(['kcc-proposal-details', 'kcc-meeting-records']);
 const sha = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex');
@@ -170,18 +171,23 @@ async function readHeldNewsPriorRelease(root, result, profile, exitCode) {
   } finally { readback.close(); }
 }
 
-export function runCollector(profile, root, { collectorScript = path.join(here, 'local-collect.mjs') } = {}) {
+export function runCollector(profile, root, {
+  collectorScript = path.join(here, 'local-collect.mjs'),
+  spawnImpl = spawn,
+  setTimeoutImpl = setTimeout,
+  clearTimeoutImpl = clearTimeout,
+} = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [collectorScript, '--profile', profile, '--root', root, '--run'], {
+    const child = spawnImpl(process.execPath, [collectorScript, '--profile', profile, '--root', root, '--run'], {
       stdio: ['ignore', 'pipe', 'pipe'], env: { PATH: process.env.PATH, HOME: process.env.HOME, TZ: 'Asia/Taipei' },
     });
     let stdout = ''; let stderr = ''; let exceeded = false;
-    const timer = setTimeout(() => { exceeded = true; child.kill('SIGKILL'); }, 180000);
+    const timer = setTimeoutImpl(() => { exceeded = true; child.kill('SIGKILL'); }, COLLECTOR_TIMEOUT_MS);
     child.stdout.on('data', (b) => { stdout += b; if (stdout.length > 131072) { exceeded = true; child.kill('SIGKILL'); } });
     child.stderr.on('data', (b) => { if (stderr.length < 4096) stderr += b; });
-    child.on('error', (e) => { clearTimeout(timer); reject(e); });
+    child.on('error', (e) => { clearTimeoutImpl(timer); reject(e); });
     child.on('close', async (code) => {
-      clearTimeout(timer);
+      clearTimeoutImpl(timer);
       if (exceeded || code === null) return resolve({ status: 'outcome_unknown', reason_code: 'COLLECTOR_RECONCILIATION_REQUIRED' });
       const lines = stdout.trim().split('\n');
       try {
