@@ -61,3 +61,8 @@ npm run deploy
 ```
 
 不要把任何 access key 寫入 Git、文件、測試輸出或對話。
+# NAS 在地化候選
+
+新增 Node.js 24 的唯讀本機 MCP、SQLite／原始檔與歷史快照、固定 profile 採集 CLI。建置及測試：`npm run build:local`、`npm run test:local-all`；官方表單條件回歸已納入 `npm test`。
+
+部署、來源範圍與正式切換 Gate 見 [NAS 設計](docs/nas-localization.md) 與 [在地採集](docs/local-ingestion.md)。`Dockerfile.local`／`compose.local.yaml` 是私網候選；21 個工具名稱不代表全部來源已遷移。正式主檔與接續定位見上述文件。

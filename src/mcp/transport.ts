@@ -4,10 +4,18 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import { TOOL_REGISTRY } from "./tools";
 import type { Env } from "../models/types";
 
-export async function handleMcp(request: Request, env: Env): Promise<Response> {
+export interface McpTransportOptions {
+  registry?: typeof TOOL_REGISTRY;
+  serverInfo?: { name: string; version: string };
+  securitySchemes?: Array<Record<string, unknown>>;
+}
+
+export async function handleMcp(request: Request, env: Env, options: McpTransportOptions = {}): Promise<Response> {
   if (request.method !== "POST") return new Response(null, { status: 405, headers: { Allow: "POST, OPTIONS" } });
-  const server = new Server({ name: "高雄市公民資料 MCP", version: "1.1.1" }, { capabilities: { tools: { listChanged: false } } });
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOL_REGISTRY.map((tool) => ({
+  const registry = options.registry ?? TOOL_REGISTRY;
+  const securitySchemes = options.securitySchemes ?? [{ type: "oauth2", scopes: ["mcp:read"] }];
+  const server = new Server(options.serverInfo ?? { name: "高雄市公民資料 MCP", version: "1.1.1" }, { capabilities: { tools: { listChanged: false } } });
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: registry.map((tool) => ({
     name: tool.name, description: tool.description,
     inputSchema: { ...tool.inputSchema, type: "object" as const },
     outputSchema: { type: "object" as const, anyOf: [tool.outputSchema, {
@@ -15,11 +23,11 @@ export async function handleMcp(request: Request, env: Env): Promise<Response> {
       properties: { status: { const: "error" }, reason_code: { type: "string" }, message: { type: "string" } },
     }] },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-    securitySchemes: [{ type: "oauth2", scopes: ["mcp:read"] }],
-    _meta: { securitySchemes: [{ type: "oauth2", scopes: ["mcp:read"] }] },
+    securitySchemes,
+    _meta: { securitySchemes },
   })) }));
   server.setRequestHandler(CallToolRequestSchema, async ({ params }) => {
-    const tool = TOOL_REGISTRY.find((candidate) => candidate.name === params.name);
+    const tool = registry.find((candidate) => candidate.name === params.name);
     try {
       if (!tool) throw new Error("UNKNOWN_TOOL: 未知工具");
       const output = await tool.handler(params.arguments || {}, env);

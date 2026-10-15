@@ -1,0 +1,47 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { createRequire } from 'node:module';
+import { processOne, validateRequest, verifyCollectorReceipt } from './local-job-worker.mjs';
+
+const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'TEST-kcg-jobs-'));
+try {
+  const queue = path.join(root, 'queue');
+  const data = path.join(root, 'data');
+  fs.mkdirSync(path.join(queue, 'requests'), { recursive: true });
+  const id = crypto.createHash('sha256').update('health:TEST-health-v1').digest('hex');
+  const request = { schema_version: 1, job_id: id, profile: 'health', idempotency_key: 'TEST-health-v1', requested_at: new Date().toISOString() };
+  assert.equal(validateRequest(request, id + '.json').job_id, id);
+  assert.throws(() => validateRequest({ ...request, profile: '../../bad' }, id + '.json'));
+  assert.throws(() => validateRequest({ ...request, url: 'http://localhost/' }, id + '.json'));
+  fs.writeFileSync(path.join(queue, 'requests', id + '.json'), JSON.stringify(request));
+  const first = await processOne(queue, data);
+  assert.equal(first.status, 'succeeded');
+  assert.equal(first.health.status, 'PASS');
+  assert.equal(await processOne(queue, data), null);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(queue, 'receipts', id + '.json'))).job_id, id);
+  assert.equal(verifyCollectorReceipt({ profile: 'budget-115', status: 'pending', dry_run: true }, 'budget-115', 0), false);
+  const sdk = fs.readFileSync(new URL('../../workflow-src/kcg-civic-00-health.ts', import.meta.url), 'utf8');
+  const literal = sdk.match(/jsCode: ("(?:[^"\\]|\\.)*")/)[1];
+  const code = JSON.parse(literal).replace("'/data/storage/kcg-civic-jobs'", JSON.stringify(queue));
+  const executeCode = new (Object.getPrototypeOf(async function () {}).constructor)('require', '$execution', code);
+  const pending = executeCode(createRequire(import.meta.url), { id: 'TEST-workflow' });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const race = await Promise.all([processOne(queue, data), processOne(queue, data)]);
+  assert.equal(race.filter(Boolean).length, 1);
+  const result = await pending;
+  assert.equal(result[0].json.status, 'succeeded');
+  assert.equal(result[0].json.n8n_execution_id, 'TEST-workflow');
+  const badId = 'a'.repeat(64);
+  fs.symlinkSync('/etc/hosts', path.join(queue, 'requests', badId + '.json'));
+  const bad = await processOne(queue, data);
+  assert.equal(bad.status, 'failed');
+  assert.equal(bad.reason_code, 'JOB_FILE_INVALID');
+  const symlinkQueue = path.join(root, 'symlink-queue');
+  fs.mkdirSync(symlinkQueue);
+  fs.symlinkSync(path.join(queue, 'receipts'), path.join(symlinkQueue, 'receipts'));
+  await assert.rejects(() => processOne(symlinkQueue, data), /SYMLINK|INVALID/);
+  console.log('PASS local jobs: decoded n8n code integration, concurrent claim exclusion, dry-run rejection, fixed profiles, request identity, idempotency, persistent read-back, symlink rejection');
+} finally { fs.rmSync(root, { recursive: true, force: true }); }
