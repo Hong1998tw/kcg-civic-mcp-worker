@@ -294,6 +294,45 @@ async function collectIndex(ctx, meetings) {
 }
 async function readAll(store, dataset) {
   if (!await store.hasDataset(dataset)) throw new CollectorError('DEPENDENCY_UNAVAILABLE', `缺少已驗證${dataset}索引`);
+  if (typeof store.readSnapshotVersion === 'function') {
+    const assertActiveRelease = async () => {
+      const result = await store.queryRecords(dataset, { limit: 0 });
+      const active = result?.release;
+      if (!active || active.dataset !== dataset || typeof active.snapshot_id !== 'string' ||
+          !/^[a-f0-9]{64}$/i.test(active.manifest_sha256 || '') || !Number.isSafeInteger(active.record_count) || active.record_count < 1 ||
+          result.local_match_count !== active.record_count || !Array.isArray(result.records) || result.records.length !== 0) {
+        throw new CollectorError('DEPENDENCY_DRIFT', '母集原生 active release 的完整查詢驗證不一致');
+      }
+      return active;
+    };
+    const first = await assertActiveRelease();
+    // The v1 archive reader verifies the immutable archive manifest and each
+    // unique raw CAS object. Keep this separate from limit:0, which validates
+    // every normalized SQLite row and its manifest but returns no raw rows.
+    const archive = await store.readSnapshotVersion(dataset, first.snapshot_id);
+    const releaseMatches = (value) => value && sameRelease(first, value) &&
+      value.dataset === dataset && value.parser_version === first.parser_version &&
+      value.validator_version === first.validator_version && JSON.stringify(value.coverage) === JSON.stringify(first.coverage);
+    if (!releaseMatches(archive) || !Array.isArray(archive.records) || archive.records.length !== first.record_count) {
+      throw new CollectorError('DEPENDENCY_DRIFT', '母集固定 archive 的dataset、snapshot、manifest、總數或metadata與active release不一致');
+    }
+    const rows = [], seen = new Set(); let previousId = '';
+    for (const value of archive.records) {
+      if (!value || typeof value !== 'object' || Array.isArray(value) || typeof value.id !== 'string' ||
+          !/^[A-Za-z0-9._:#/-]{1,512}$/.test(value.id) || seen.has(value.id) || (previousId && previousId >= value.id) ||
+          typeof value.title !== 'string' || typeof value.text !== 'string' || !value.data || typeof value.data !== 'object' || Array.isArray(value.data) ||
+          typeof value.source_url !== 'string' || typeof value.retrieved_at !== 'string' || !/^[a-f0-9]{64}$/i.test(value.raw_sha256 || '')) {
+        throw new CollectorError('DEPENDENCY_DRIFT', '母集固定 archive 含缺漏、重複、錯序或無效record');
+      }
+      seen.add(value.id); previousId = value.id;
+      const { json: _json, ...record } = value;
+      rows.push(record);
+    }
+    if (rows.length !== first.record_count || seen.size !== first.record_count) throw new CollectorError('DEPENDENCY_DRIFT', '母集 archive records 數量與active release不一致');
+    const last = await assertActiveRelease();
+    if (!releaseMatches(last)) throw new CollectorError('DEPENDENCY_DRIFT', '母集固定archive讀取期間active snapshot、manifest或範圍已改變');
+    return { rows, release: first };
+  }
   const rows = []; let release;
   for (let offset = 0; ; offset += 1000) {
     const result = await store.queryRecords(dataset, { limit: 1000, offset });
