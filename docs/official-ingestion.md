@@ -43,9 +43,21 @@ const result = await runOfficialCollection({
 | `status: blocked` | 來源結構、身分、總數、大小、權限或連線有實際阻礙；檢查 `error_code`，不盲目重送 |
 | `dryRun: true` | 僅回傳 profile 定義，不抓取或寫入 |
 
-正常分段會匯入「累積至今所有已驗證明細」，不是只留下最後一段。任何未完成母體均維持 `coverage.complete: false`；來源總數尚未收齊時為 `null`。發生錯誤時不覆蓋先前已發布快照。沒有明細的分段不建立空成功快照。來源總數變動回報 `SOURCE_DRIFT`，需檢查後以新 run 重新採集。
+正常分段會匯入「累積至今所有已驗證明細」，不是只留下最後一段。任何未完成母體均維持 `coverage.complete: false`；來源總數尚未收齊時為 `null`。發生錯誤時不覆蓋先前已發布快照。沒有明細的分段不建立空成功快照。來源總數變動回報 `SOURCE_DRIFT`。法規及一般新聞 run 維持既有 checkpoint 行為；只有官方新聞的 SOURCE_DRIFT 修復使用下方同 run 索引回合，不以舊快取頁重複卡在原漂移位置。
 
-`resume: false` 開始新的 run，保留既有 raw 與歷史快照。每日排程的新 job 應使用 `resume: false`；同一 job 的下一段才使用 `resume: true`。已完成 run 的 checkpoint 不能當成隔日重新抓取的證據。parser 版本或附件策略變更會拒絕舊 checkpoint，避免混用不同驗證契約。
+`resume: false` 開始新的 run，保留既有 raw 與歷史快照。每日排程的新 job 應使用 `resume: false`；同一 job 的下一段才使用 `resume: true`。已完成 run 的 checkpoint 不能當成隔日重新抓取的證據。`kcg-news` 的 SOURCE_DRIFT checkpoint 或已啟動 index_round 會拒絕 `resume: false`，避免在同一工作上重設 run。parser 版本或附件策略變更會拒絕舊 checkpoint，避免混用不同驗證契約。
+
+### 官方新聞來源漂移：同一 run 的索引回合
+
+`prepareNewsIndexRound({ root, expectedCheckpointSha256 })` 是 root-native 的明確遷移 API。它只接受 `profile: kcg-news`、目前 parser v5 checkpoint，且 `state.last_error_code` **精確等於** `SOURCE_DRIFT`。`expectedCheckpointSha256` 必須是 `checkpoint.json` envelope 的 `.sha256` 欄位；API 先驗證此欄位等於 `SHA-256(JSON.stringify(state))`，再比對呼叫端預期值。它不建立新 run、不改 `run_id`、不碰 n8n job key，也不呼叫 `resume: false`。
+
+遷移先把完整舊 checkpoint bytes 以不可覆寫方式保存至 `checkpoint-archives/<archive-bytes-sha256>.json`，同步檔案後原始 bytes 讀回並核 hash；確認後才以原子 rename 寫入新 checkpoint。若呼叫端在結果不明後以同一預期 `.sha256` 重試，API 會核驗 archive 原件並回傳同一回合，不重做遷移。每一輪來源漂移 checkpoint 都可用它當下的 `.sha256` 明確準備下一輪，最多三輪。
+
+新狀態保留 `run_id`、全部 captures／原始 CAS、歷史 snapshot 與目前 active release；另建 `index_round_id`、`index_round_attempt` 和專屬 request-key namespace，重新建立 `messages` 與 `city` 兩個來源的索引佇列。舊 checkpoint 的 `records.length` 留在 `prior_published_count`，所以新的 `record_count: 0` 表示「本索引回合尚未重解析明細」，不表示工作歸零。索引與複核階段不取明細、不發布；未重建的新 records 尚少於原發布數時，發布仍保留原快照。
+
+回合依 `indexing → verifying → frozen → details → complete` 前進。索引每頁先驗證固定路徑、`scope`、`n`／`sms`、頁次連續、列數、全體唯一 ID 和正確 `messages:`／`city:` namespace；每頁另存依序排列的 ID、標題、日期、機關（市政新聞另保留類別）digest，以及兩來源首末頁的 capture 證據。完成兩個來源後，以新的 namespaced GET 分別重抓最新消息首頁與市政新聞首頁，核對來源總數及首頁有序 digest；市政新聞末頁證據沿用本輪 WebForms POST 鏈的真實原件，不把尾頁偽裝成 GET。兩次首頁複核都通過後，完整索引 digest 與 capture window 先寫入 checkpoint，才允許明細階段。
+
+`index_round_capture_window` 表示跨分段採集與複核時間範圍，不代表官方同一交易快照。明細階段會先按 receipt 和 CAS hash 讀回已存在的明細 capture，再重新執行 `parseOfficialNews`，不沿用舊 parsed record。若本輪又發生 `SOURCE_DRIFT`，一般 resume 會保留該輪狀態並再次停在錯誤；只有 root 明確以目前 checkpoint SHA 呼叫 API 才開始下一輪。
 
 ## 原件、身分與驗證
 
@@ -75,6 +87,8 @@ const result = await runOfficialCollection({
 
 法規的 **collection coverage 只表示目前官方各分類、索引及內容頁已捕獲**，不代表已取得停止適用法規的歷史條文全文。回傳的 `law_text_count` 與 `repeal_notice_count` 分開呈現兩種原件，驗收時需同時看這些數量與 `fulltext_complete`。2026-10-15 NAS r3 的 `GL001565` 原件只有43字停止適用公告，已由該次CAS正文與沿革重新驗證；其歷史條文不可由公告推造。
 
+若官方目前「法規內容」只包含修正公告而非完整整編正文，且官方兩個修正欄位均以「修正＋精確法規名稱＋條號／點次範圍」結尾，歸類為 `law_record_type: amendment_notice`、`articles_unavailable: true`、`fulltext_complete: false`、`articles: []`。必須同時有官方附件，保留公告原文與附件連結；一般未編號正文、名稱後接其他敘述或只含一個修正欄位都不符合例外，仍停止並回報來源結構錯誤。明示空白的沿革容器可保留為 `history_status: not_provided`，但沿革容器本身缺漏仍拒絕。`law_text_count`、`repeal_notice_count`、`amendment_notice_count` 分開呈現三種官方紀錄。
+
 新聞 ID 與來源身分如下，避免兩來源相同 native ID 碰撞：
 
 | 欄位 | 最新消息 | 市政新聞 |
@@ -94,7 +108,7 @@ const result = await runOfficialCollection({
 
 ## 驗證紀錄與限制
 
-執行 `node scripts/test-official-ingestion.mjs`。十六項結構與安全測試涵蓋跨段累積、來源總數、raw 先保存、來源身分、redirect allowlist、byte limit、來源漂移保留前段、分散 HTML 標籤條號、廢停狀態badge與日期、發布機關空欄及缺欄反證、網站通用meta與真標題衝突反證、附件中斷續作、WebForms 原生 POST 及 namespace、symlink 與 checkpoint 契約，並在完整 law snapshot 後刪除／竄改沿革與附件 bytes、竄改各 receipt metadata 欄位，核對無重新抓取且不得回報 complete；另測三種 URL 形式及外站／未知格式拒絕。測試使用明確的合成結構 fixture，不能代替 live authority 證據。
+執行 `node scripts/test-official-ingestion.mjs` 驗證 17 項既有 parser、原件、法規、新聞及 checkpoint 情境；另執行 `node scripts/test-official-news-round.mjs` 驗證來源漂移遷移 gate、原 checkpoint archive／讀回／冪等重試、同 run identity、分段索引、雙首頁 fresh GET、固定 scope 與 entry namespace、同總數首頁替換拒絕、POST 尾頁證據、frozen resume、舊 detail CAS 重解析、發布保留及最多三輪。測試均使用明確的合成結構 fixture，不能代替 live authority 證據，也不執行 NAS 全量採集。
 
 2026-10-15 實際官方 canary 已核驗：`GL000020` 的41條完整正文（含跨標籤的第二十八條）、沿革及 PDF；`GL000021` 的15條、沿革及 PDF；最新消息兩則與市政新聞兩則全文，以及市政新聞第2頁 POST。當次兩新聞來源宣告總數為 1,726 + 610 = 2,336；此為擷取時點的觀察值，不是固定設定。bounded canary 均維持 partial coverage，沒有宣稱全站已下載。
 

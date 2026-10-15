@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
-import { processOne, validateRequest, verifyCollectorReceipt, dependencyReady, readCollectorCommit, collectionAdvanced } from './local-job-worker.mjs';
+import { processOne, runCollector, validateRequest, verifyCollectorReceipt, dependencyReady, readCollectorCommit, collectionAdvanced } from './local-job-worker.mjs';
 import { LocalStore } from '../src/local/store.mjs';
 import { packKccV2Record } from '../src/local/kcc-payload.mjs';
 
@@ -106,6 +106,78 @@ try {
   assert.equal(collectionAdvanced(priorSegment, { collector: { ...priorSegment.collector, prepared_count: 5 } }), true, 'unpublished preparation is forward progress');
   assert.equal(collectionAdvanced(priorSegment, structuredClone(priorSegment)), false);
   assert.equal(collectionAdvanced(priorSegment, { collector: { ...priorSegment.collector, attempted: 1 } }), true);
+  const newsProgress = { collector: { attempted: 0, record_count: 0, prepared_count: 0, index_round: { phase: 'indexing', page_count: 0, verification_scopes: [] } } };
+  assert.equal(collectionAdvanced(newsProgress, { collector: { ...newsProgress.collector, index_round: { ...newsProgress.collector.index_round, page_count: 1 } } }), true, 'news index page is forward progress');
+  assert.equal(collectionAdvanced(newsProgress, { collector: { ...newsProgress.collector, index_round: { ...newsProgress.collector.index_round, phase: 'verifying' } } }), true, 'news round phase is forward progress');
+  assert.equal(collectionAdvanced(newsProgress, { collector: { ...newsProgress.collector, index_round: { ...newsProgress.collector.index_round, verification_scopes: ['messages'] } } }), true, 'news home verification is forward progress');
+  assert.equal(collectionAdvanced(newsProgress, structuredClone(newsProgress)), false, 'unchanged news round is stalled');
+  assert.equal(collectionAdvanced(newsProgress, { collector: { ...newsProgress.collector } }), false, 'missing news progress metadata is not advancement');
+
+  const priorNewsBytes = Buffer.from('TEST worker prior news raw object');
+  const priorNewsSha = crypto.createHash('sha256').update(priorNewsBytes).digest('hex');
+  const priorNewsRecords = Array.from({ length: 180 }, (_, index) => {
+    const nativeId = `messages:${index.toString(16).padStart(16, '0')}`;
+    return { id: nativeId, title: `TEST prior news ${index}`, text: `TEST prior news body ${index}`,
+      data: { news_id: nativeId, source_kind: 'messages', content: `TEST prior news body ${index}` },
+      source_url: `https://www.kcg.gov.tw/News_Content.aspx?s=${index.toString(16).padStart(16, '0')}`, retrieved_at: '2026-10-15T00:00:00.000Z', raw_sha256: priorNewsSha };
+  });
+  const priorNewsReceipt = await store.importSnapshot({ dataset: 'kcg-news', snapshot_id: 'TEST-worker-prior-news-v1',
+    coverage: { scope: 'TEST prior partial news release', complete: false, source_total: 2336 }, records: priorNewsRecords,
+    raw_objects: [{ sha256: priorNewsSha, bytes_base64: priorNewsBytes.toString('base64') }],
+    parser_version: 'official-html-2026-10-15-v5', validator_version: 'official-identity-count-v1', validation_status: 'passed' });
+  assert.equal(priorNewsReceipt.record_count, 180);
+  const newsQueue = path.join(root, 'news-queue'), newsRequests = path.join(newsQueue, 'requests'), newsReceipts = path.join(newsQueue, 'receipts');
+  fs.mkdirSync(newsRequests, { recursive: true }); fs.mkdirSync(newsReceipts, { recursive: true });
+  const newsJobId = crypto.createHash('sha256').update('kcg-news:TEST-held-index-round-v1').digest('hex');
+  const newsJob = { schema_version: 1, job_id: newsJobId, profile: 'kcg-news', idempotency_key: 'TEST-held-index-round-v1', requested_at: new Date().toISOString() };
+  fs.writeFileSync(path.join(newsRequests, newsJobId + '.json'), JSON.stringify(newsJob));
+  const roundId = crypto.randomUUID(), runId = crypto.randomUUID();
+  const checkpointDirectory = path.join(data, 'staging', 'official', 'kcg-news');
+  const checkpointPath = path.join(checkpointDirectory, 'checkpoint.json');
+  fs.mkdirSync(checkpointDirectory, { recursive: true });
+  const roundState = { version: 'official-html-2026-10-15-v5', profile: 'kcg-news', run_id: runId, download_attachments: true,
+    index_round_version: 1, index_round_id: roundId, index_round_attempt: 1, index_round_phase: 'indexing',
+    index_round_pages: [], index_round_verifications: {}, index_round_frozen_at: null, index_round_digest: null,
+    prior_published_count: 180, records: [], queues: [{ type: 'index', scope: 'messages' }], captures: {}, entries: {}, finished_scopes: [] };
+  const checkpointEnvelope = { sha256: crypto.createHash('sha256').update(JSON.stringify(roundState)).digest('hex'), state: roundState };
+  fs.writeFileSync(checkpointPath, JSON.stringify(checkpointEnvelope));
+  const heldCollectorResult = { profile: 'kcg-news', dataset: 'kcg-news', status: 'paused', continuation_required: true, dry_run: false,
+    basic_validation: 'passed', failed: 0, error_code: null, commit_state: 'held-for-prior-release', publication_deferred: true,
+    receipt: null, run_id: runId, record_count: 0, checkpoint_path: checkpointPath,
+    index_round: { version: 1, id: roundId, attempt: 1, phase: 'indexing', digest: null, page_count: 0, verification_scopes: [], prior_published_count: 180 } };
+  const collectorScript = path.join(root, 'collector-fixture.mjs');
+  const writeCollectorScript = (value) => fs.writeFileSync(collectorScript, `console.log(${JSON.stringify(JSON.stringify(value))});\n`);
+  writeCollectorScript(heldCollectorResult);
+  const held = await processOne(newsQueue, data, { collectorScript });
+  assert.equal(held.status, 'running', 'held first news round segment stays in progress');
+  assert.equal(held.collector.record_count, 0, 'collector record_count remains this prepared round count');
+  assert.equal(held.store_readback.snapshot_id, priorNewsReceipt.snapshot_id);
+  assert.equal(held.store_readback.record_count, 180);
+  assert.equal(held.store_readback.coverage.complete, false, 'partial prior release still remains the active held baseline');
+  assert.equal(fs.existsSync(path.join(newsReceipts, newsJobId + '.json')), false, 'held round does not create a terminal receipt');
+  const heldProgress = JSON.parse(fs.readFileSync(path.join(newsQueue, 'progress', newsJobId + '.json'), 'utf8'));
+  assert.equal(heldProgress.status, 'running'); assert.equal(heldProgress.collector.record_count, 0);
+  assert.equal(heldProgress.store_readback.record_count, 180);
+
+  const rejectedHeldVariants = [
+    ['bad checkpoint path', { ...heldCollectorResult, checkpoint_path: path.join(checkpointDirectory, 'other-checkpoint.json') }, 'kcg-news'],
+    ['round id mismatch', { ...heldCollectorResult, index_round: { ...heldCollectorResult.index_round, id: crypto.randomUUID() } }, 'kcg-news'],
+    ['prior count mismatch', { ...heldCollectorResult, index_round: { ...heldCollectorResult.index_round, prior_published_count: 181 } }, 'kcg-news'],
+    ['wrong profile', { ...heldCollectorResult, profile: 'kcg-laws', dataset: 'kcg-laws' }, 'kcg-laws'],
+  ];
+  fs.writeFileSync(path.join(checkpointDirectory, 'other-checkpoint.json'), fs.readFileSync(checkpointPath));
+  for (const [label, result, profile] of rejectedHeldVariants) {
+    writeCollectorScript(result);
+    const rejected = await runCollector(profile, data, { collectorScript });
+    assert.notEqual(rejected.status, 'running', `${label} must not be accepted as a held news round`);
+  }
+  const validCheckpointBytes = fs.readFileSync(checkpointPath);
+  fs.writeFileSync(checkpointPath, JSON.stringify({ ...checkpointEnvelope, sha256: '0'.repeat(64) }));
+  writeCollectorScript(heldCollectorResult);
+  const badCheckpointHash = await runCollector('kcg-news', data, { collectorScript });
+  assert.notEqual(badCheckpointHash.status, 'running', 'invalid checkpoint envelope hash must be rejected');
+  fs.writeFileSync(checkpointPath, validCheckpointBytes);
+  assert.equal(fs.existsSync(path.join(newsReceipts, newsJobId + '.json')), false, 'rejected held results do not add a terminal to the valid in-progress job');
   store.close();
 
   process.env.KCG_ENRICHMENT_ENABLED = 'false';

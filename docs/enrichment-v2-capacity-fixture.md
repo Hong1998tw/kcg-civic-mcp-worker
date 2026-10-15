@@ -10,7 +10,7 @@ node source/scripts/verify-enrichment-v2-capacity.mjs --root /absolute/path/to/c
 node source/scripts/verify-enrichment-v2-capacity.mjs --root /absolute/path/to/capacity-root --phase restore
 ```
 
-`query` 優先載入 `dist-local/registry.mjs` production bundle；只有 bundle 不存在時才動態載入開發用 esbuild fallback。它透過實際 registry handler 驗證完整 metadata、零命中零 hydration、單案完整 detail、最新 15 筆、跨 64 KiB 中文詞、多頁指定頁、snippet 上限及單頁全文。`prepare` 對 details、attachments、meetings 各累積完整 descriptor 後只呼叫一次 `importV2`；每 1,000 筆將 JSON progress 附加到 root 的 `progress-prepare.jsonl`，並輸出 process RSS、`process.memoryUsage()` 與 `process.resourceUsage()`。`restore` 先切換至一筆 probe snapshot，再還原原始 full snapshot 並重新驗證 active release；保留原始 raw、derived CAS 與 archive。
+`query` 優先載入 `dist-local/registry.mjs` production bundle；只有 bundle 不存在時才動態載入開發用 esbuild fallback。它透過實際 registry handler 驗證完整 metadata、零命中零 hydration、單案完整 detail、最新 15 筆、跨 64 KiB 中文詞、多頁指定頁、snippet 上限及單頁全文。`prepare` 對 details、attachments、meetings 使用 8 個有界 fixture write lanes 建立不同 record 的 raw/CAS 物件，descriptor 依原始 index 收集，全部完成後每個 dataset 仍只呼叫一次 `importV2`；每 1,000 筆依 completed 數量將 JSON progress 附加到 root 的 `progress-prepare.jsonl`，並輸出 process RSS、`process.memoryUsage()` 與 `process.resourceUsage()`。這項 concurrency 僅供合成 fixture 寫入，正式 collector 維持單一寫入者。`restore` 先切換至一筆 probe snapshot，再還原原始 full snapshot 並重新驗證 active release；保留原始 raw、derived CAS 與 archive。
 
 小型三階段 smoke 可用：
 

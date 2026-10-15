@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// Synthetic fixture preparation uses eight bounded lanes; production collectors remain single-writer.
 
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
@@ -19,6 +20,7 @@ const MARKER_NAME = ".verify-enrichment-v2-capacity.json";
 const MARKER_SCHEMA = "synthetic-kcc-enrichment-v2-capacity-run-v1";
 const DATASETS = ["kcc-proposal-details", "kcc-proposal-attachments", "kcc-meeting-records"];
 const DEFAULTS = { detailsCount: 32_391, meetingsCount: 2_198 };
+const PREPARE_CONCURRENCY = 8;
 const MEETING_SEARCH_KEYWORD = "TEST議事容量命中";
 const CROSS_BOUNDARY_KEYWORD = "跨界中文詞";
 const MEETING_BASE = 87_000_000_000_000_000_000n;
@@ -184,6 +186,7 @@ async function ensurePrepareRoot(root, counts) {
       synthetic_fixture: true,
       source_label: "SYNTHETIC TEST; not an official corpus",
       counts: { ...counts, attachmentCount: counts.detailsCount },
+      fixture_prepare_concurrency: PREPARE_CONCURRENCY,
       phases: {},
       snapshots: {},
     };
@@ -263,29 +266,59 @@ function assertReceipt(receipt, dataset, count, expectedStatus) {
 }
 
 async function importFullDataset(store, marker, dataset, count, makeRecord, root, phaseStarted) {
-  const descriptors = [];
+  const descriptors = new Array(count);
+  const laneCount = Math.min(PREPARE_CONCURRENCY, count);
+  let nextIndex = 0;
+  let completed = 0;
   let totalRawBytes = 0;
-  for (let index = 0; index < count; index += 1) {
-    const { record, rawBytes, pageRefs = [], rawBytesWritten = rawBytes.length } = await makeRecord(index);
-    const rawSha = await putRaw(store, rawBytes);
-    totalRawBytes += rawBytesWritten;
-    assert.equal(record.raw_sha256, rawSha, `${dataset} ${record.id} raw SHA binding`);
-    const packed = await packKccV2Record(store.derivedStore, { dataset, record, page_refs: pageRefs });
-    descriptors.push(packed.descriptor);
-    if ((index + 1) % 1_000 === 0 || index + 1 === count) {
-      await appendProgress(root, "prepare", {
-        at: nowIso(),
-        dataset,
-        done: index + 1,
-        total: count,
-        descriptors: descriptors.length,
-        raw_bytes_written: totalRawBytes,
-        phase_ms: elapsedMs(phaseStarted),
-        pid: process.pid,
-        ...metrics(),
-      });
+  let firstError;
+  let progressWrites = Promise.resolve();
+  const queueProgress = (record) => {
+    progressWrites = progressWrites.then(() => appendProgress(root, "prepare", record));
+    return progressWrites;
+  };
+  const worker = async () => {
+    while (!firstError) {
+      const index = nextIndex++;
+      if (index >= count) return;
+      try {
+        const { record, rawBytes, pageRefs = [], rawBytesWritten = rawBytes.length } = await makeRecord(index);
+        const rawSha = await putRaw(store, rawBytes);
+        assert.equal(record.raw_sha256, rawSha, `${dataset} ${record.id} raw SHA binding`);
+        const packed = await packKccV2Record(store.derivedStore, { dataset, record, page_refs: pageRefs });
+        descriptors[index] = packed.descriptor;
+        totalRawBytes += rawBytesWritten;
+        completed += 1;
+        if (completed % 1_000 === 0 || completed === count) {
+          await queueProgress({
+            at: nowIso(),
+            dataset,
+            done: completed,
+            total: count,
+            descriptors_completed: completed,
+            lanes: laneCount,
+            raw_bytes_written: totalRawBytes,
+            phase_ms: elapsedMs(phaseStarted),
+            pid: process.pid,
+            ...metrics(),
+          });
+        }
+      } catch (error) {
+        firstError ||= error;
+        throw error;
+      }
     }
-  }
+  };
+
+  // Wait for every active lane before propagating any error; no background file
+  // writes may continue after this function rejects.
+  const laneResults = await Promise.allSettled(Array.from({ length: laneCount }, () => worker()));
+  await progressWrites;
+  const laneFailure = laneResults.find((result) => result.status === "rejected");
+  if (laneFailure) throw firstError || laneFailure.reason;
+  assert.equal(completed, count, `${dataset} preparation must finish every record`);
+  assert.ok(descriptors.every((descriptor) => descriptor && typeof descriptor.id === "string"),
+    `${dataset} descriptors must be stored at their original record index`);
 
   assert.equal(descriptors.length, count);
   const snapshotId = fullSnapshotId(marker, dataset);
@@ -500,9 +533,11 @@ async function loadRegistry() {
 
 async function preparePhase(options, marker, markerPath, started) {
   checkPhasePid(marker, "prepare");
+  marker.fixture_prepare_concurrency = PREPARE_CONCURRENCY;
   await setPhase(marker, markerPath, "prepare", "running", {
     started_at: nowIso(),
     counts: { ...marker.counts },
+    fixture_prepare_concurrency: PREPARE_CONCURRENCY,
   });
   const store = new LocalStore(options.root, { readOnly: false });
   assert.ok(store.derivedStore instanceof DerivedStore, "must use the production DerivedStore implementation");
@@ -544,6 +579,7 @@ async function preparePhase(options, marker, markerPath, started) {
       started_at: marker.phases.prepare.started_at,
       finished_at: nowIso(),
       duration_ms: elapsedMs(started),
+      fixture_prepare_concurrency: PREPARE_CONCURRENCY,
       full_dataset_import_calls: Object.fromEntries(importCounts),
       snapshot_ids: Object.fromEntries(DATASETS.map((dataset) => [dataset, marker.snapshots[dataset].snapshot_id])),
     });
@@ -847,6 +883,7 @@ async function main() {
       run_id: marker.run_id,
       root: options.root,
       counts: marker.counts,
+      fixture_prepare_concurrency: marker.fixture_prepare_concurrency ?? PREPARE_CONCURRENCY,
       duration_ms: elapsedMs(phaseStarted),
       pid: process.pid,
       ...metrics(),

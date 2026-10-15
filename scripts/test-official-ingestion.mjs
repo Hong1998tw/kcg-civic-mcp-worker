@@ -129,6 +129,23 @@ try {
     const plainPrefix = { ...detail, bytes: Buffer.from(detail.bytes.toString().replace(badge, '廢/停')) };
     assert.throws(() => parseOfficialLaw(plainPrefix, history, { title: name }), /法規名稱與官方索引或沿革不一致/);
   });
+  await test("修正公告與明示空沿革保留來源限制，不冒充整編條文", async () => {
+    const url = 'https://outlaw.kcg.gov.tw/LawContent.aspx?id=GL000841', historyUrl = 'https://outlaw.kcg.gov.tw/LawContentSource.aspx?id=GL000841';
+    const name = '測試基層建設作業要點', header = `<table><tr><th>法規名稱：</th><td>${name}</td></tr><tr><th>公發布日：</th><td>民國103年02月06日</td></tr><tr><th>法規體系：</th><td>測試機關</td></tr></table>`;
+    const notice = `修正${name}第7.8.9點`, attachment = '<a href="Download.ashx?FileID=1103&id=GL000841&type=LAW">修正公告.pdf</a>';
+    const body = `<div id="ctl00_cp_content_divContent"><dl><dt>說明：</dt><dd id="ctl00_cp_content_ddLawContent0305">${notice}</dd></dl><dl><dt>辦法：</dt><dd id="ctl00_cp_content_ddLawContent040607">${notice}</dd></dl></div>`;
+    const detailHtml = `<form action="${url}">${header}${attachment}${body}</form>`;
+    const historyHtml = `<form action="${historyUrl}">${header}<div id="ctl00_cp_content_divLawContentSource"></div></form>`;
+    const detail = { url, bytes: Buffer.from(detailHtml) }, history = { url: historyUrl, sha256: 'a'.repeat(64), bytes: Buffer.from(historyHtml) };
+    const parsed = parseOfficialLaw(detail, history, { title: name });
+    assert.equal(parsed.law_record_type, 'amendment_notice'); assert.equal(parsed.articles_unavailable, true); assert.equal(parsed.fulltext_complete, false); assert.deepEqual(parsed.articles, []);
+    assert.equal(parsed.history, ''); assert.equal(parsed.history_status, 'not_provided'); assert.equal(parsed.history_source, 'official-history-empty'); assert.equal(parsed.attachments.length, 1);
+    assert.throws(() => parseOfficialLaw(detail, { ...history, bytes: Buffer.from(historyHtml.replace('id="ctl00_cp_content_divLawContentSource"', 'id="unknown"')) }, { title: name }), /沿革容器缺漏/);
+    assert.throws(() => parseOfficialLaw({ ...detail, bytes: Buffer.from(detailHtml.replace(attachment, '')) }, history, { title: name }), /修正公告缺少官方附件/);
+    assert.throws(() => parseOfficialLaw({ ...detail, bytes: Buffer.from(detailHtml.replaceAll(notice, '不明內容')) }, history, { title: name }), /完整法規沿革內容缺漏/);
+    assert.throws(() => parseOfficialLaw({ ...detail, bytes: Buffer.from(detailHtml.replaceAll(notice, `修正${name}補充說明中的另一法規第7點`)) }, history, { title: name }), /完整法規沿革內容缺漏/);
+    assert.throws(() => parseOfficialLaw({ ...detail, bytes: Buffer.from(detailHtml.replace('ctl00_cp_content_ddLawContent0305', 'unknown')) }, history, { title: name }), /完整法規沿革內容缺漏/);
+  });
   await test("官方新聞明示空發布機關保留未知，缺欄或缺正文仍拒絕", async () => {
     const url = 'https://www.kcg.gov.tw/CityNews_Detail1.aspx?n=3A379BB94CA5F12D&ss=598182DA152F961C';
     const html = `<form action="${url}"><div class="data_midlle_news_box01"><table><tr><td>測試新聞空發布者</td></tr></table></div><div id="data_midlle"><li><span>發布日期：</span>115-10-01</li><li><span>發布機關：</span></li><div class="data_midlle_news_box02"><p>原件完整正文。</p></div></div></form>`;

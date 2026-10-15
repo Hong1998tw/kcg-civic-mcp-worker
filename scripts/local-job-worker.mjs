@@ -5,8 +5,11 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { COLLECTION_DATASETS } from '../src/ingestion/dispatch.mjs';
+import { validateNewsIndexRoundState } from '../src/ingestion/official-news-round.mjs';
 
 const ID = /^[a-f0-9]{64}$/;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const OFFICIAL_NEWS_VERSION = 'official-html-2026-10-15-v5';
 const PROFILES = new Set(['health', ...Object.keys(COLLECTION_DATASETS)]);
 const CAPACITY_HELD_PROFILES = new Set(['kcc-proposal-details', 'kcc-meeting-records']);
 const sha = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex');
@@ -101,13 +104,75 @@ export async function readCollectorCommit(root, result, profile) {
 export function collectionAdvanced(previous, result) {
   if (!previous?.collector || result.collector?.attempted > 0) return true;
   const prior = previous.collector, next = result.collector;
+  const roundPrior = prior.index_round, roundNext = next?.index_round;
+  const roundStarted = !roundPrior && !!roundNext;
+  const verificationProgressed = Array.isArray(roundPrior?.verification_scopes) && Array.isArray(roundNext?.verification_scopes) &&
+    (roundPrior.verification_scopes.length !== roundNext.verification_scopes.length ||
+      [...roundPrior.verification_scopes].sort().join('\n') !== [...roundNext.verification_scopes].sort().join('\n'));
+  const roundProgressed = roundStarted || (!!roundPrior && !!roundNext && (
+    ['page_count', 'phase', 'verification_count'].some((key) => roundPrior[key] !== undefined && roundNext[key] !== undefined && roundPrior[key] !== roundNext[key]) ||
+    verificationProgressed));
   return ['record_count', 'prepared_count'].some((key) => prior[key] !== next?.[key]) ||
-    ['committed_cursor', 'prepared_cursor', 'current_id', 'batch_records'].some((key) => prior.progress?.[key] !== next?.progress?.[key]);
+    ['committed_cursor', 'prepared_cursor', 'current_id', 'batch_records'].some((key) => prior.progress?.[key] !== next?.progress?.[key]) ||
+    roundProgressed;
 }
 
-export function runCollector(profile, root) {
+function validateHeldNewsRoundCheckpoint(root, result, profile, exitCode) {
+  if (exitCode !== 0 || profile !== 'kcg-news' || result?.profile !== 'kcg-news' || result?.dataset !== 'kcg-news' ||
+      result.status !== 'paused' || result.continuation_required !== true || result.dry_run !== false ||
+      result.basic_validation !== 'passed' || result.failed !== 0 || result.error_code != null ||
+      result.commit_state !== 'held-for-prior-release' || result.publication_deferred !== true || result.receipt !== null ||
+      !Number.isSafeInteger(result.record_count) || result.record_count < 0 || !UUID.test(result.run_id || '')) {
+    throw new Error('NEWS_ROUND_HOLD_INVALID');
+  }
+  const rootPath = path.resolve(root);
+  if (fs.realpathSync(rootPath) !== rootPath) throw new Error('NEWS_ROUND_ROOT_INVALID');
+  const checkpoint = path.join(rootPath, 'staging', 'official', 'kcg-news', 'checkpoint.json');
+  if (result.checkpoint_path !== checkpoint) throw new Error('NEWS_ROUND_CHECKPOINT_PATH_INVALID');
+  const bytes = regular(checkpoint, 256 * 1024 * 1024);
+  if (fs.realpathSync(checkpoint) !== checkpoint) throw new Error('NEWS_ROUND_CHECKPOINT_PATH_INVALID');
+  const envelope = JSON.parse(bytes.toString('utf8'));
+  const state = envelope?.state;
+  if (!state || !ID.test(envelope.sha256 || '') || envelope.sha256 !== sha(Buffer.from(JSON.stringify(state)))) {
+    throw new Error('NEWS_ROUND_CHECKPOINT_HASH_INVALID');
+  }
+  validateNewsIndexRoundState(state);
+  const round = result.index_round;
+  const scopes = Object.keys(state.index_round_verifications).sort();
+  if (state.profile !== 'kcg-news' || state.version !== OFFICIAL_NEWS_VERSION || state.run_id !== result.run_id ||
+      state.index_round_version !== 1 || !UUID.test(state.index_round_id || '') ||
+      state.index_round_id !== round?.id || state.index_round_attempt !== round?.attempt ||
+      state.index_round_phase !== round?.phase || state.index_round_digest !== round?.digest ||
+      state.index_round_pages.length !== round?.page_count || state.records.length !== result.record_count ||
+      !Number.isSafeInteger(state.prior_published_count) || state.prior_published_count < 1 ||
+      state.prior_published_count !== round?.prior_published_count || state.records.length >= state.prior_published_count ||
+      round?.version !== state.index_round_version || !Array.isArray(round.verification_scopes) ||
+      scopes.join('\n') !== [...round.verification_scopes].sort().join('\n')) {
+    throw new Error('NEWS_ROUND_CHECKPOINT_RESULT_MISMATCH');
+  }
+  return state;
+}
+
+async function readHeldNewsPriorRelease(root, result, profile, exitCode) {
+  const state = validateHeldNewsRoundCheckpoint(root, result, profile, exitCode);
+  const { LocalStore } = await import('../src/local/store.mjs');
+  const readback = new LocalStore(root, { readOnly: true });
+  try {
+    const stored = await readback.queryRecords('kcg-news', { limit: 0 });
+    const release = stored.release;
+    if (release.dataset !== 'kcg-news' || typeof release.coverage?.scope !== 'string' || !release.coverage.scope.trim() ||
+        typeof release.coverage.complete !== 'boolean' ||
+        release.record_count !== state.prior_published_count || stored.local_match_count !== state.prior_published_count ||
+        stored.records.length !== 0 || !release.snapshot_id || !ID.test(release.manifest_sha256 || '')) {
+      throw new Error('NEWS_ROUND_PRIOR_RELEASE_MISMATCH');
+    }
+    return release;
+  } finally { readback.close(); }
+}
+
+export function runCollector(profile, root, { collectorScript = path.join(here, 'local-collect.mjs') } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [path.join(here, 'local-collect.mjs'), '--profile', profile, '--root', root, '--run'], {
+    const child = spawn(process.execPath, [collectorScript, '--profile', profile, '--root', root, '--run'], {
       stdio: ['ignore', 'pipe', 'pipe'], env: { PATH: process.env.PATH, HOME: process.env.HOME, TZ: 'Asia/Taipei' },
     });
     let stdout = ''; let stderr = ''; let exceeded = false;
@@ -126,6 +191,10 @@ export function runCollector(profile, root) {
           const checkpoint = path.resolve(result.checkpoint_path || '');
           if (!checkpoint.startsWith(path.resolve(root) + path.sep)) throw new Error('CHECKPOINT_PATH_INVALID');
           regular(checkpoint, 256 * 1024 * 1024);
+          if (result.commit_state === 'held-for-prior-release') {
+            const release = await readHeldNewsPriorRelease(root, result, profile, code);
+            return resolve({ status: 'running', collector: result, store_readback: release, store_readbacks: { 'kcg-news': release } });
+          }
           if (!result.receipt && result.commit_state === 'not-committed') return resolve({ status: 'running', collector: result });
         }
         if (!verifyCollectorReceipt(result, profile, code)) {
@@ -139,7 +208,7 @@ export function runCollector(profile, root) {
   });
 }
 
-async function processClaimed(queueRoot, dataRoot) {
+async function processClaimed(queueRoot, dataRoot, { collectorScript } = {}) {
   for (const name of ['', 'requests', 'processing', 'receipts', 'progress']) {
     const directory = path.join(queueRoot, name);
     fs.mkdirSync(directory, { recursive: true, mode: 0o770 });
@@ -188,7 +257,7 @@ async function processClaimed(queueRoot, dataRoot) {
         if (!fs.existsSync(file)) { const fd = fs.openSync(file, 'wx', 0o600); try { fs.writeFileSync(fd, bytes); fs.fsyncSync(fd); } finally { fs.closeSync(fd); } }
         if (!regular(file).equals(bytes)) throw new Error('STORAGE_READBACK_MISMATCH');
         result = { status: 'succeeded', health: { status: 'PASS', bytes: bytes.length, sha256: sha(bytes), root: dataRoot } };
-      } else result = await runCollector(request.profile, dataRoot);
+      } else result = await runCollector(request.profile, dataRoot, collectorScript ? { collectorScript } : undefined);
       const receipt = { schema_version: 1, job_id: request.job_id, profile: request.profile, started_at: started, finished_at: new Date().toISOString(), ...result };
       if (result.status === 'running') {
         let previous = null;
@@ -212,7 +281,7 @@ async function processClaimed(queueRoot, dataRoot) {
   return null;
 }
 
-export async function processOne(queueRoot, dataRoot) {
+export async function processOne(queueRoot, dataRoot, options = {}) {
   fs.mkdirSync(dataRoot, { recursive: true, mode: 0o700 });
   assertDirectory(dataRoot);
   const coordinatorPath = path.join(dataRoot, 'job-coordinator.sqlite');
@@ -226,7 +295,7 @@ export async function processOne(queueRoot, dataRoot) {
     throw error;
   }
   try {
-    const receipt = await processClaimed(queueRoot, dataRoot);
+    const receipt = await processClaimed(queueRoot, dataRoot, options);
     coordinator.exec('COMMIT');
     return receipt;
   } catch (error) {
