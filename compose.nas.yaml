@@ -7,6 +7,7 @@ services:
     environment:
       KCG_JOB_ROOT: /jobs
       KCG_DATA_ROOT: /data/kcg-civic
+      KCG_ENRICHMENT_ENABLED: "${CIVIC_ENRICHMENT_ENABLED:-false}"
       TZ: Asia/Taipei
     volumes:
       - type: bind

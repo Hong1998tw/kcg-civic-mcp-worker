@@ -78,6 +78,9 @@ n8n 的執行紀錄、binary data 或 Data Tables 不作正文語料庫；執行
 | `CIVIC_OAUTH_OWNER_KEY_FILE` | OAuth owner login key 的獨立私有檔案路徑參照 |
 | `CIVIC_PUBLIC_HOST` | OAuth issuer 與 ingress 使用的精確公開 hostname |
 | `CIVIC_TUNNEL_NETWORK` | 已存在 Cloudflare Tunnel Docker network 的名稱 |
+| `CIVIC_ENRICHMENT_ENABLED` | 預設 `false`；`kcc-proposal-details` 與 `kcc-meeting-records` 的容量閘門 |
+
+大量 `kcc-proposal-details` 與 `kcc-meeting-records` 工作先維持容量暫停。`CIVIC_ENRICHMENT_ENABLED` 未設定或設為 `true` 時，worker 保持既有行為；Compose 範本預設提供 `false`，此時 worker 驗證 request 後會把這兩類工作留在同一 job 的 processing/progress 狀態，標記 `held_capacity_review` 與 `ENRICHMENT_STORAGE_UPGRADE_REQUIRED`，不建立 terminal receipt，也不啟動採集器，並繼續處理其他 profile。只有在 compact/batch 儲存設計通過容量驗證後，才將該設定改為 `true`。此閘門不代表詳情、PDF 或完整資料已收錄。
 
 以上路徑、image 標籤、hostname 與 network 名稱由每台 NAS 的本機環境提供，不應把實際 NAS 路徑或秘密值提交到 repo。Bearer key 與 owner login key 是不同用途、不同檔案；Compose 只將檔案掛載為唯讀 secret，不使用 `MCP_ACCESS_KEY` 之類的明文環境值。兩個 secret 檔由 UID 1000 擁有，權限限制為該 UID 可讀；auth 目錄由 UID 1000 擁有且維持私有目錄權限。
 

@@ -8,6 +8,7 @@ import { processOne, validateRequest, verifyCollectorReceipt, dependencyReady } 
 import { LocalStore } from '../src/local/store.mjs';
 
 const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'TEST-kcg-jobs-'));
+const previousEnrichmentEnabled = process.env.KCG_ENRICHMENT_ENABLED;
 try {
   const queue = path.join(root, 'queue');
   const data = path.join(root, 'data');
@@ -54,8 +55,76 @@ try {
   assert.equal(await dependencyReady(queue, 'kcc-proposals-full', data), true);
   await store.importSnapshot({ ...input, snapshot_id: 'TEST-dependency-v2', coverage: { scope: 'TEST next run partial', complete: false, source_total: 2 } });
   assert.equal(await dependencyReady(queue, 'kcc-proposals-full', data), false);
-  await store.importSnapshot({ ...input, snapshot_id: 'TEST-dependency-v3' });
-  assert.equal(await dependencyReady(queue, 'kcc-proposals-full', data), false);
+  const completeProposalReceipt = await store.importSnapshot({ ...input, snapshot_id: 'TEST-dependency-v3' });
+  fs.writeFileSync(receiptFile, JSON.stringify({ profile: 'kcc-proposals-full', status: 'succeeded', store_readback: completeProposalReceipt }));
+  assert.equal(await dependencyReady(queue, 'kcc-proposals-full', data), true);
+
+  const meetingBytes = Buffer.from('TEST meeting dependency raw');
+  const meetingHash = crypto.createHash('sha256').update(meetingBytes).digest('hex');
+  const meetingInput = {
+    dataset: 'kcc-meetings',
+    snapshot_id: 'TEST-meetings-complete-v1',
+    coverage: { scope: 'TEST complete meeting母集', complete: true, source_total: 1 },
+    records: [{
+      id: 'M001',
+      title: 'TEST meeting',
+      text: 'TEST meeting',
+      data: { record_id: 'M001', test_fixture: true },
+      source_url: 'https://cissearch.kcc.gov.tw/System/Meeting/Default.aspx',
+      retrieved_at: '2026-10-15T00:00:00Z',
+      raw_sha256: meetingHash,
+    }],
+    raw_objects: [{ sha256: meetingHash, bytes_base64: meetingBytes.toString('base64') }],
+    parser_version: 'TEST',
+    validator_version: 'TEST',
+    validation_status: 'passed',
+  };
+  const completeMeetingReceipt = await store.importSnapshot(meetingInput);
+  fs.writeFileSync(path.join(queue, 'receipts', 'c'.repeat(64) + '.json'),
+    JSON.stringify({ profile: 'kcc-meetings-full', status: 'succeeded', store_readback: completeMeetingReceipt }));
+  assert.equal(await dependencyReady(queue, 'kcc-meetings-full', data), true);
   store.close();
-  console.log('PASS local jobs: decoded n8n code integration, concurrent claim exclusion, dry-run rejection, fixed profiles, request identity, idempotency, persistent read-back, symlink rejection');
-} finally { fs.rmSync(root, { recursive: true, force: true }); }
+
+  process.env.KCG_ENRICHMENT_ENABLED = 'false';
+  const enqueue = (profile, idempotencyKey) => {
+    const jobId = crypto.createHash('sha256').update(profile + ':' + idempotencyKey).digest('hex');
+    const value = { schema_version: 1, job_id: jobId, profile, idempotency_key: idempotencyKey, requested_at: new Date().toISOString() };
+    fs.writeFileSync(path.join(queue, 'requests', jobId + '.json'), JSON.stringify(value));
+    return value;
+  };
+  const heldRequests = [
+    enqueue('kcc-proposal-details', 'TEST-capacity-details-v1'),
+    enqueue('kcc-meeting-records', 'TEST-capacity-meeting-records-v1'),
+  ];
+  const healthRequest = enqueue('health', 'TEST-health-during-capacity-hold-v1');
+  let healthDuringHold;
+  const allHoldsRecorded = () => heldRequests.every((held) =>
+    fs.existsSync(path.join(queue, 'progress', held.job_id + '.json')));
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const result = await processOne(queue, data);
+    if (result?.job_id === healthRequest.job_id) healthDuringHold = result;
+    if (healthDuringHold && allHoldsRecorded()) break;
+    if (result === null && allHoldsRecorded()) break;
+  }
+  assert.equal(healthDuringHold?.status, 'succeeded');
+  assert.equal(healthDuringHold.health.status, 'PASS');
+  for (const held of heldRequests) {
+    const progressPath = path.join(queue, 'progress', held.job_id + '.json');
+    const processingPath = path.join(queue, 'processing', held.job_id + '.json');
+    const terminalPath = path.join(queue, 'receipts', held.job_id + '.json');
+    const progress = JSON.parse(fs.readFileSync(progressPath, 'utf8'));
+    const activeRequest = JSON.parse(fs.readFileSync(processingPath, 'utf8'));
+    assert.equal(progress.status, 'held_capacity_review');
+    assert.equal(progress.reason_code, 'ENRICHMENT_STORAGE_UPGRADE_REQUIRED');
+    assert.equal(progress.job_id, held.job_id);
+    assert.equal(progress.idempotency_key, held.idempotency_key);
+    assert.deepEqual(activeRequest, held);
+    assert.equal(fs.existsSync(path.join(queue, 'requests', held.job_id + '.json')), false);
+    assert.equal(fs.existsSync(terminalPath), false);
+  }
+  console.log('PASS local jobs: native complete-parent checks, capacity hold preserves request identity without terminal receipt, health job continues, prior queue/store cases');
+} finally {
+  if (previousEnrichmentEnabled === undefined) delete process.env.KCG_ENRICHMENT_ENABLED;
+  else process.env.KCG_ENRICHMENT_ENABLED = previousEnrichmentEnabled;
+  fs.rmSync(root, { recursive: true, force: true });
+}

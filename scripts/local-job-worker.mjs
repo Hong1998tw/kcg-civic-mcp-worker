@@ -8,6 +8,7 @@ import { COLLECTION_DATASETS } from '../src/ingestion/dispatch.mjs';
 
 const ID = /^[a-f0-9]{64}$/;
 const PROFILES = new Set(['health', ...Object.keys(COLLECTION_DATASETS)]);
+const CAPACITY_HELD_PROFILES = new Set(['kcc-proposal-details', 'kcc-meeting-records']);
 const sha = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex');
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -133,6 +134,18 @@ async function processClaimed(queueRoot, dataRoot) {
     let request;
     try {
       request = validateRequest(JSON.parse(regular(activeFile)), name);
+      if (CAPACITY_HELD_PROFILES.has(request.profile) && process.env.KCG_ENRICHMENT_ENABLED === 'false') {
+        atomicJson(progressFile, {
+          schema_version: 1,
+          job_id: request.job_id,
+          profile: request.profile,
+          idempotency_key: request.idempotency_key,
+          status: 'held_capacity_review',
+          reason_code: 'ENRICHMENT_STORAGE_UPGRADE_REQUIRED',
+          updated_at: new Date().toISOString(),
+        });
+        continue;
+      }
       const prerequisite = ({ 'kcc-proposal-details': 'kcc-proposals-full', 'kcc-meeting-records': 'kcc-meetings-full' })[request.profile];
       if (prerequisite) {
         const complete = await dependencyReady(queueRoot, prerequisite, dataRoot);
