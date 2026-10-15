@@ -1,6 +1,6 @@
 # NAS 在地化採集候選
 
-本 CLI 是獨立於 MCP Worker 的 Node.js 24+ 本機採集入口。n8n 後續只應觸發這裡列出的固定 profile/job，不傳任意網址、查詢 URL、記錄內容或憑證。現在支援的 profile 僅有 `budget-115` 與 `proposals-pilot`；兩者每次最多處理 1 個結果頁。CLI 預設為 dry-run，只有加上 `--run` 才會連線、保存 raw object 並匯入本機 store。
+本 CLI 是獨立於 MCP Worker 的 Node.js 24+ 本機採集入口。n8n 後續只應觸發這裡列出的固定 profile/job，不傳任意網址、查詢 URL、記錄內容或憑證。本頁說明早期 `budget-115` 與 `proposals-pilot`，兩者每次最多處理 1 個結果頁。完整來源另由 [KCC 分段採集](kcc-ingestion.md) 與 [法規／新聞採集](official-ingestion.md) 說明，統一透過本 CLI 的固定 profile 路由。CLI 預設為 dry-run，只有加上 `--run` 才會連線、保存 raw object 並匯入本機 store。
 
 ```sh
 node scripts/local-collect.mjs --profile budget-115 --root /data/civic-store --max-pages 1
@@ -26,12 +26,14 @@ node scripts/local-collect.mjs --profile proposals-pilot --root /data/civic-stor
 | --- | --- | --- | --- |
 | `kcg-budget-115` | `budget-115` | bounded profile | 登錄資源、單次摘要記錄、coverage 未知時標 partial |
 | `kcc-proposals-pilot` | `proposals-pilot` | bounded profile | 固定條件的官方索引第一頁 |
-| `kcc-meetings` | — | pending | 尚未有經 bounded 驗證的 collector/parser |
-| `kcc-meeting-records` | — | pending | 議事錄 PDF 尚未接入 local ingestion |
-| `kcg-laws` | — | pending | 不使用 legacy seed 或未驗證法規來源 |
-| `kcg-news` | — | pending | 不使用 legacy seed 或未驗證新聞來源 |
+| `kcc-proposals` | `kcc-proposals-full` | implemented-resumable | 全官方屆別、頁籤與分頁；完整性依當次回執 |
+| `kcc-proposal-details`／`kcc-proposal-attachments` | `kcc-proposal-details` | implemented-resumable | 已驗證完整議案母集、詳情與附件原件 |
+| `kcc-meetings` | `kcc-meetings-full` | implemented-resumable | 全官方屆別與分頁、保留原件型別 |
+| `kcc-meeting-records` | `kcc-meeting-records` | implemented-resumable | 保存所有原件、PDF 逐頁文字；非PDF文字另列未索引 |
+| `kcg-laws` | `kcg-laws` | implemented-resumable | 全分類現存官方頁面、沿革與附件；公告不冒充歷史條文 |
+| `kcg-news` | `kcg-news` | implemented-resumable | 最新消息與市政新聞兩種官方來源 |
 
-pending dataset 不接受 CLI 執行。若未來啟用的 parser 失敗或回傳空集合，工作必須標為 `blocked`，不能用空成功快照推進狀態。採集結果是有界本機候選，不能宣稱整個資料集已全量遷移，也不會呼叫 R2、啟動排程或部署 Worker。
+未列入固定清單的 dataset 不接受 CLI 執行。若 parser 失敗或回傳無法證實的空集合，工作必須標為 `blocked`，不能用空成功快照推進狀態。採集結果是有界本機候選，不能宣稱整個資料集已全量遷移，也不會呼叫 R2、啟動排程或部署 Worker。
 
 ## 本輪真實來源樣本
 

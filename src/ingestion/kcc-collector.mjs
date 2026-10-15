@@ -9,7 +9,7 @@ export const KCC_PROFILE_MANIFEST = Object.freeze({
   'kcc-proposals-full': { dataset: 'kcc-proposals', scope: 'all-official-sessions/all-tabs/all-pages', state: 'implemented-resumable' },
   'kcc-meetings-full': { dataset: 'kcc-meetings', scope: 'all-official-sessions/all-pages', state: 'implemented-resumable' },
   'kcc-proposal-details': { dataset: 'kcc-proposal-details', scope: 'verified-local-proposal-index/all-details-and-attachments', state: 'implemented-resumable' },
-  'kcc-meeting-records': { dataset: 'kcc-meeting-records', scope: 'verified-local-meetings/all-pdf-versions/page-text', state: 'implemented-resumable' },
+  'kcc-meeting-records': { dataset: 'kcc-meeting-records', scope: 'verified-local-meetings/all-original-versions/pdf-page-text', state: 'implemented-resumable' },
 });
 const digest = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const pause = () => new CollectorError('COLLECTION_YIELD', '本段資源上限，已保存可續作進度');
@@ -159,8 +159,8 @@ function postForm(html, query, target, tab, page, pageSize) {
   }
   return form.toString();
 }
-async function post(ctx, url, html, query, target, tab, page, pageSize) {
-  const result = await capture(ctx, url, { method: 'POST', body: postForm(html, query, target, tab, page, pageSize), headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: [...ctx.cookies].map(([k,v])=>`${k}=${v}`).join('; '), Referer: url } });
+async function post(ctx, url, html, query, target, tab, page, pageSize, limits = {}) {
+  const result = await capture(ctx, url, { ...limits,method: 'POST', body: postForm(html, query, target, tab, page, pageSize), headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: [...ctx.cookies].map(([k,v])=>`${k}=${v}`).join('; '), Referer: url } });
   if (new URL(result.url).pathname.toLowerCase() !== new URL(url).pathname.toLowerCase()) throw new CollectorError('PARSER_CONTRACT_CHANGED', '官方查詢導向非預期頁面');
   assertQuery(result.html, query); return result;
 }
@@ -171,6 +171,35 @@ function normalizedRow(row, query, tab, response, meetings) {
   const data = { ...JSON.parse(JSON.stringify(row)), period: query.period, session: query.session, session_code: query.session, term: Number(query.session.slice(-2)), session_period: Number(query.session.slice(-2)), query, official_tab: tab.tab, source_page: tab.page, source_page_count: tab.pages, source_tab_total: tab.total };
   if (!meetings) data.detail_url = official(row.detail_url, PROPOSAL_URL);
   return { id, title, text: [title, row.proposer, row.status, row.date].filter(Boolean).join('\n'), data, source_url: response.url, retrieved_at: response.retrieved_at, raw_sha256: response.sha256 };
+}
+async function reconcileCompleteTab(ctx,{url,response,query,key,current,parse,dataset,meetings}) {
+  const previous = ctx.state.queries[key].tabs[current.tab];
+  if (previous.total > 20000) throw new CollectorError('SOURCE_RECONCILIATION_LIMIT','官方分頁不穩定且單回應完整列舉超過20000列安全界線');
+  const full = await post(ctx,url,response.html,query,'',current,1,previous.total,{maxBytes:64*1024*1024,timeoutMs:25000});
+  const observed = parse(full.html), known = ctx.state.queries[key];
+  if (known.tab_ids.join(',') !== observed.map((t)=>t.tab).join(',') || observed.some((t)=>known.tabs[t.tab].total!==t.total)) throw new CollectorError('SOURCE_DRIFT','完整列舉期間tab集合或總數改變');
+  const tab = observed.find((t)=>t.tab===current.tab);
+  if (!tab || tab.page!==1 || tab.pages!==1 || tab.pageSize!==previous.total || tab.total!==previous.total || tab.nextTarget || tab.rows.length!==previous.total) throw new CollectorError('SOURCE_RECONCILIATION_FAILED','官方未回傳單一完整tab，拒絕以去重猜完整');
+  const records = tab.rows.map((row)=>normalizedRow(row,query,tab,full,meetings)), ids=records.map((r)=>r.id), idSet=new Set(ids), priorSet=new Set(previous.ids);
+  if (idSet.size!==previous.total || previous.ids.some((id)=>!idSet.has(id))) throw new CollectorError('SOURCE_RECONCILIATION_FAILED','完整tab不唯一或未涵蓋既有成功識別碼');
+  const next=structuredClone(ctx.state);next.records[dataset] ||= {};
+  for (const record of records) {
+    const existing=next.records[dataset][record.id];
+    if (existing && !priorSet.has(record.id)) throw new CollectorError('DUPLICATE_SCOPE_ID','完整列舉識別碼已出現在其他tab或屆次');
+    if (existing) {
+      for (const field of meetings?['meeting_name','date']:['proposal_kind','number','category','proposer','subject','status','detail_url']) {
+        if (String(existing.data[field]??'')!==String(record.data[field]??'')) throw new CollectorError('SOURCE_DRIFT',`完整列舉期間既有資料${record.id}/${field}改變`);
+      }
+    } else next.records[dataset][record.id]=record;
+  }
+  const progress=next.queries[key].tabs[current.tab];
+  // Keep the original successful records, page receipts, and cursor. A separate
+  // stronger proof establishes the whole tab without pretending page 5 is new.
+  progress.ids.push(...ids.filter((id)=>!priorSet.has(id)));progress.complete=true;
+  progress.reconciliation={strategy:'single-response-complete-tab-v1',trigger:'DUPLICATE_PAGE_OR_ID',preserved_next_page:previous.next_page,preserved_pages:previous.pages_proof.length,preserved_record_count:previous.ids.length,response:{page:1,pages:1,page_size:tab.pageSize,source_total:tab.total,raw_row_count:tab.source_row_count,row_count:ids.length,unique_count:idSet.size,byte_length:full.bytes.length,ids_sha256:digest(ids),raw_sha256:full.sha256,source_url:full.url,retrieved_at:full.retrieved_at},prior_ids_covered:true};
+  next.queries[key].complete=Object.values(next.queries[key].tabs).every((t)=>t.complete);
+  const totals=indexTotals(next);await publishState(ctx,next,[{dataset,coverage:coverage(next,totals.complete,totals.sourceTotal)}]);ctx.pages++;
+  return full;
 }
 async function collectIndex(ctx, meetings) {
   const url = meetings ? MEETING_URL : PROPOSAL_URL, dataset = meetings ? 'kcc-meetings' : 'kcc-proposals';
@@ -227,7 +256,14 @@ async function collectIndex(ctx, meetings) {
         if (!current || current.total !== progress.total || current.page !== progress.next_page || current.pageSize !== ctx.config.pageSize) throw new CollectorError('PAGER_NOT_ADVANCED', '官方頁序或每頁筆數未確認');
         const normalized = current.rows.map((row) => normalizedRow(row, query, current, response, meetings));
         const ids = normalized.map((row)=>row.id);
-        if (new Set(ids).size !== ids.length || ids.some((id) => progress.ids.includes(id))) throw new CollectorError('DUPLICATE_PAGE_OR_ID', '同tab分頁出現重複識別碼');
+        if (new Set(ids).size !== ids.length || ids.some((id) => progress.ids.includes(id))) {
+          if(meetings)throw new CollectorError('DUPLICATE_PAGE_OR_ID','議事錄分頁含重複識別碼；未驗證議事錄單回應恢復策略');
+          response=await reconcileCompleteTab(ctx,{url,response,query,key,current,parse,dataset,meetings});
+          // The complete response carries an unusually large pager setting.
+          // End this segment after its successful receipt; the next segment
+          // obtains a fresh GET/query before touching another tab.
+          throw pause();
+        }
         const next = structuredClone(ctx.state); const nextTab = next.queries[key].tabs[original.tab];
         next.records[dataset] ||= {};
         for (const record of normalized) {
@@ -329,29 +365,66 @@ export function validatePdfExtraction(result) {
   const empty = result.pages.filter((p)=>!p.text.trim()).map((p)=>p.page);
   return { ...result, empty_text_pages:empty, text_layer_status:empty.length === result.total_pages ? 'absent' : empty.length ? 'partial' : 'present', speaker_attribution:'not-inferred' };
 }
+function contentIndexed(record) {
+  return record.data.content_index_status === 'indexed' || (!record.data.content_index_status && record.data.text_layer_status === 'present' && Array.isArray(record.data.pages) && record.data.pages.length > 0);
+}
+const allContentIndexed = (state) => Object.values(state.records['kcc-meeting-records'] || {}).every(contentIndexed);
+function validateNonPdfOriginal(bytes,fileType,contentType='') {
+  const head=bytes.subarray(0,1024).toString('utf8').replace(/^\uFEFF/,'').trimStart();
+  if(/^text\/html/i.test(contentType)||/^(?:<!doctype\s+html|<html\b|<head\b|<body\b)/i.test(head))throw new CollectorError('ORIGINAL_SIGNATURE_INVALID','非PDF下載回應是HTML，不能當原件歸檔完成');
+  if(fileType!=='doc')throw new CollectorError('ORIGINAL_FORMAT_UNSUPPORTED',`尚未驗證議事錄${fileType||'unknown'}格式，raw已保留但不宣稱原件完整`);
+  if(bytes.length<8||bytes.subarray(0,8).toString('hex')!=='d0cf11e0a1b11ae1')throw new CollectorError('ORIGINAL_SIGNATURE_INVALID','DOC原件缺少完整8-byte CFBF檔頭');
+  return {status:'passed',validation_version:'cfbf-magic-8-v1',declared_file_type:'doc',detected_container:'CFBF'};
+}
+async function verifyStoredNonPdf(ctx,version) {
+  if(version.format_validation?.status==='passed'&&version.format_validation?.validation_version==='cfbf-magic-8-v1'&&version.file_type==='doc')return;
+  const bytes=typeof ctx.store.readRawObject==='function'?await ctx.store.readRawObject(version.raw_sha256):await readFile(path.join(ctx.rawDirectory,`${version.raw_sha256}.bin`));
+  if(sha256Bytes(bytes)!==version.raw_sha256)throw new CollectorError('STAGING_COLLISION','既存非PDF原件hash不一致');
+  version.format_validation=validateNonPdfOriginal(bytes,version.file_type);
+}
 async function collectPdfs(ctx) {
   const rows = await initializeEnrichment(ctx, 'kcc-meetings');
+  const legacyRecords=Object.values(ctx.state.records['kcc-meeting-records']||{}).filter((record)=>(record.data.original_versions||[]).some((version)=>!version.pdf_url&&(version.file_type!=='doc'||version.format_validation?.status!=='passed'||version.format_validation?.validation_version!=='cfbf-magic-8-v1')));
+  if(legacyRecords.length){
+    const next=structuredClone(ctx.state);
+    for(const record of legacyRecords)for(const version of next.records['kcc-meeting-records'][record.id].data.original_versions)if(!version.pdf_url)await verifyStoredNonPdf(ctx,version);
+    const complete=next.cursor===rows.length&&sourceComplete(next)&&allContentIndexed(next);
+    await publishState(ctx,next,[{dataset:'kcc-meeting-records',coverage:coverage(next,complete,rows.length)}]);
+  }
   for (let cursor = ctx.state.cursor; cursor < rows.length; cursor = ctx.state.cursor) {
     const row = rows[cursor], id = row.id;
-    let work = ctx.state.work || { id, versions:[] };
-    const urls = row.data.pdf_urls || [row.data.pdf_url];
-    for (let index = work.versions.length; index < urls.length; index++) {
-      const url = official(urls[index], MEETING_URL);
+    const work = ctx.state.work || { id, versions:[] };
+    for (const version of work.versions) { version.source_url ||= version.pdf_url;version.download_url ||= version.source_url;version.file_type ||= version.pdf_url?'pdf':'unknown'; }
+    for(const version of work.versions)if(!version.pdf_url)await verifyStoredNonPdf(ctx,version);
+    const files = row.data.original_files || (row.data.pdf_urls || [row.data.pdf_url]).filter(Boolean).map((url)=>({download_url:url,file_type:'pdf'}));
+    for (const file of files) {
+      const url = official(file.download_url,MEETING_URL);
+      if (work.versions.some((version)=>(version.source_url || version.pdf_url)===url)) continue;
       assertOriginalIdentity(url,url,'MeetingRecord',id);
-      const response = await capture(ctx, url, { maxBytes: 96 * 1024 * 1024 });
+      const response = await capture(ctx,url,{maxBytes:96*1024*1024});
       assertOriginalIdentity(url,response.url,'MeetingRecord',id);
-      if (response.bytes.subarray(0,5).toString() !== '%PDF-') throw new CollectorError('PDF_SIGNATURE_INVALID', '官方回應沒有PDF檔頭');
-      const extraction = validatePdfExtraction(await ctx.pdfExtractor(response.bytes));
-      work.versions.push({ pdf_url:response.url,raw_sha256:response.sha256,retrieved_at:response.retrieved_at,byte_length:response.bytes.length,...extraction }); await saveWork(ctx, work);
+      const isPdf = file.file_type === 'pdf';
+      let extraction;
+      if (isPdf) {
+        if (response.bytes.subarray(0,5).toString() !== '%PDF-') throw new CollectorError('PDF_SIGNATURE_INVALID','官方回應沒有PDF檔頭');
+        extraction=validatePdfExtraction(await ctx.pdfExtractor(response.bytes));
+      } else {
+        const validation=validateNonPdfOriginal(response.bytes,file.file_type,response.headers?.get?.('content-type')||'');
+        extraction={format_validation:validation,extraction_status:'unsupported_text_extraction',text_layer_status:'not_indexed',total_pages:null,pages:[],speaker_attribution:'not-inferred'};
+      }
+      work.versions.push({source_url:response.url,download_url:url,...(isPdf?{pdf_url:response.url}:{}),file_type:file.file_type,raw_sha256:response.sha256,retrieved_at:response.retrieved_at,byte_length:response.bytes.length,...extraction});await saveWork(ctx,work);
     }
-    const selected = work.versions.at(-1), next = structuredClone(ctx.state);
-    next.records['kcc-meeting-records'] ||= {};
-    next.records['kcc-meeting-records'][id] = { id, title:row.title, text:selected.pages.map((p)=>p.text).join('\n') || 'PDF原件無可擷取文字層；尚未OCR', data:{ ...row.data,...selected,record_id:id,pdf_versions:work.versions,selected_version_policy:'last-official-listed-file',pdf_originals_complete:true },source_url:selected.pdf_url,retrieved_at:selected.retrieved_at,raw_sha256:selected.raw_sha256 };
-    next.cursor++; next.work = null;
-    const complete = next.cursor === rows.length && sourceComplete(next);
-    await publishState(ctx,next,[{ dataset:'kcc-meeting-records',coverage:coverage(next,complete,rows.length) }]);
+    const pdfs=work.versions.filter((version)=>version.pdf_url),selected=pdfs.at(-1),original=selected || work.versions.at(-1);
+    const unindexed=work.versions.filter((version)=>!version.pdf_url || version.text_layer_status!=='present').length;
+    const contentStatus=selected?(unindexed?'partial_text_layer':'indexed'):work.versions.length?'unindexed_non_pdf':'no_original_published';
+    const next=structuredClone(ctx.state);next.records['kcc-meeting-records'] ||= {};
+    next.records['kcc-meeting-records'][id]={id,title:row.title,text:selected?.pages.map((page)=>page.text).join('\n') || (work.versions.length?'官方原件已保存；此列無已索引PDF文字，尚未處理非PDF文字。':'官方索引列未發布原件，沒有可索引文字。'),data:{...row.data,...(selected||{}),record_id:id,pdf_url:selected?.pdf_url||null,pages:selected?.pages||[],total_pages:selected?.total_pages??null,pdf_versions:pdfs,original_versions:work.versions,originals_complete:true,pdf_originals_complete:true,content_index_status:contentStatus,fulltext_complete:contentStatus==='indexed',unindexed_original_count:unindexed,selected_version_policy:'last-official-listed-pdf',speaker_attribution:'not-inferred'},source_url:original?.source_url||original?.pdf_url||row.source_url,retrieved_at:original?.retrieved_at||row.retrieved_at,raw_sha256:original?.raw_sha256||row.raw_sha256};
+    next.cursor++;next.work=null;
+    const complete=next.cursor===rows.length&&sourceComplete(next)&&allContentIndexed(next);
+    await publishState(ctx,next,[{dataset:'kcc-meeting-records',coverage:coverage(next,complete,rows.length)}]);
   }
 }
+
 export async function runKccCollection(options = {}, dependencies = {}) {
   const config = normalizeOptions(options), root = path.resolve(options.root), scope = JSON.stringify({ profile:config.profile,periods:config.periods,sessions:config.sessions,keyword:config.keyword,pageSize:config.pageSize });
   const directory = await safeDirectory(root,['.kcc-collection',config.profile,digest(scope).slice(0,24)]);
@@ -387,11 +460,11 @@ export async function runKccCollection(options = {}, dependencies = {}) {
   const indexProfile=config.profile.endsWith('-full');
   const exhausted=state && (indexProfile?totals.complete:state.dependency&&state.cursor===state.source_ids?.length);
   const blocked=Boolean(error&&error.code!=='COLLECTION_YIELD');
-  const complete=Boolean(!blocked&&exhausted&&(indexProfile||sourceComplete(state)));
+  const complete=Boolean(!blocked&&exhausted&&(indexProfile||sourceComplete(state))&&(config.profile!=='kcc-meeting-records'||allContentIndexed(state)));
   const dataset=KCC_PROFILE_MANIFEST[config.profile].dataset;
   const pending = ctx.pendingPublication;
   const receipts = {...state?.receipts,...pending?.confirmed_receipts};
   const uncertainDatasets = Object.entries(pending?.publication_states || {}).filter(([,status])=>status==='publishing'||status==='unknown').map(([name])=>name);
   const commitState = uncertainDatasets.length ? 'unknown' : pending && Object.keys(pending.confirmed_receipts || {}).length ? 'partial' : Object.keys(receipts).length ? 'committed' : 'not-committed';
-  return { profile:config.profile,dataset,status:blocked?'blocked':exhausted?(complete?'complete':'partial'):'paused',continuation_required:!blocked&&!exhausted,source_exhausted:Boolean(exhausted),dry_run:false,commit_state:commitState,publication_status:pending&&Object.keys(pending.confirmed_receipts||{}).length?'partial':uncertainDatasets.length?'unknown':'confirmed',uncertain_datasets:uncertainDatasets,needs_reconciliation:Boolean(uncertainDatasets.length||error?.code==='RELEASE_DRIFT'),record_count:receipts[dataset]?.record_count??Object.keys(state?.records?.[dataset]||{}).length,attempted:ctx.requests,succeeded:ctx.pages,failed:blocked?1:0,error_code:blocked?(error.code||error.reasonCode||'COLLECTION_FAILED'):null,error_message:blocked?String(error.message).slice(0,500):null,coverage:state?coverage(state,complete,indexProfile?totals.sourceTotal:state.source_ids?.length??null):{scope,complete:false,source_total:null},checkpoint_path:ctx.statePath,checkpoint_status:state?'persisted':'not-created',receipts,receipt:receipts[dataset]||null,source_discovery:state?.discovery||null,progress:indexProfile?{queries:Object.fromEntries(Object.entries(state?.queries||{}).map(([key,q])=>[key,{complete:q.complete,tabs:Object.fromEntries(Object.entries(q.tabs).map(([id,t])=>[id,{total:t.total,next_page:t.next_page,collected_ids:t.ids.length,collected_pages:t.pages_proof.length,complete:t.complete,last_page:t.pages_proof.at(-1)||null}]))}])),source_total_estimate:totals.sourceTotal,discovered_total_so_far:totals.tabs.reduce((n,t)=>n+t.total,0)}:{cursor:state?.cursor??0,total:state?.source_ids?.length??null,current_id:state?.work?.id??null,dependency:state?.dependency||null},basic_validation:blocked?'not-passed':'passed',human_semantic_validation:'pending' };
+  return { profile:config.profile,dataset,status:blocked?'blocked':exhausted?(complete?'complete':'partial'):'paused',continuation_required:!blocked&&!exhausted,source_exhausted:Boolean(exhausted),...(config.profile==='kcc-meeting-records'?{archive_complete:Boolean(!blocked&&exhausted&&sourceComplete(state)),fulltext_complete:complete,unindexed_records:Object.values(state?.records?.['kcc-meeting-records']||{}).filter((record)=>!contentIndexed(record)).length}:{}),dry_run:false,commit_state:commitState,publication_status:pending&&Object.keys(pending.confirmed_receipts||{}).length?'partial':uncertainDatasets.length?'unknown':'confirmed',uncertain_datasets:uncertainDatasets,needs_reconciliation:Boolean(uncertainDatasets.length||error?.code==='RELEASE_DRIFT'),record_count:receipts[dataset]?.record_count??Object.keys(state?.records?.[dataset]||{}).length,attempted:ctx.requests,succeeded:ctx.pages,failed:blocked?1:0,error_code:blocked?(error.code||error.reasonCode||'COLLECTION_FAILED'):null,error_message:blocked?String(error.message).slice(0,500):null,coverage:state?coverage(state,complete,indexProfile?totals.sourceTotal:state.source_ids?.length??null):{scope,complete:false,source_total:null},checkpoint_path:ctx.statePath,checkpoint_status:state?'persisted':'not-created',receipts,receipt:receipts[dataset]||null,source_discovery:state?.discovery||null,progress:indexProfile?{queries:Object.fromEntries(Object.entries(state?.queries||{}).map(([key,q])=>[key,{complete:q.complete,tabs:Object.fromEntries(Object.entries(q.tabs).map(([id,t])=>[id,{total:t.total,next_page:t.next_page,collected_ids:t.ids.length,collected_pages:t.pages_proof.length,complete:t.complete,last_page:t.pages_proof.at(-1)||null,reconciliation:t.reconciliation||null}]))}])),source_total_estimate:totals.sourceTotal,discovered_total_so_far:totals.tabs.reduce((n,t)=>n+t.total,0)}:{cursor:state?.cursor??0,total:state?.source_ids?.length??null,current_id:state?.work?.id??null,dependency:state?.dependency||null},basic_validation:blocked?'not-passed':'passed',human_semantic_validation:'pending' };
 }

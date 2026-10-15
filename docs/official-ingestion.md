@@ -69,6 +69,12 @@ const result = await runOfficialCollection({
 
 法規保留官方 ID、名稱、機關分類、原日期、解析日期、修正／廢止日期（原件有提供時）、完整正文、條文陣列、沿革、沿革 hash 與附件來源。原 HTML 條號跨標籤拆字仍可正確分條；不將正文中的法條引用誤當條文標題。沒有可確認條號的行政規則保留 `article_no: 全文`、`article_segmentation: unsegmented-full-text`，不自造編號。圖表附件預設下載原件；PDF 要求 `%PDF-` 檔頭，HTML 錯誤頁不能冒充附件。
 
+法規名稱欄的精確官方狀態元素 `ctl00_cp_content_lawheader1_spanCauseCode`（例如「廢/停」badge）屬展示狀態，與真正法規名稱分離。保留 `status_label`、原展示名稱及「廢止/停止適用日期」的 `repealed_or_suspended_at`／原日期；正文與沿革的真正名稱及狀態仍需一致，未標記的字首不任意刪除，也不把「廢/停」擅自判定為其中一種法律狀態。此相容性修正沿用 v5 checkpoint，已保存的明細、raw 與工作身分保持不動。
+
+若官方目前「法規內容」僅保留該法規停止適用／廢止／整編通知，存為 `law_record_type: repeal_notice`、`articles_unavailable: true`、`fulltext_complete: false`、`articles: []`，`notice_text` 與 `full_text` 保存官方通知原文。它仍是可搜尋的官方法規紀錄，不能漏掉後宣稱完整；也不能把通知轉成條文。正常正文則使用 `law_record_type: law_text`、`articles_unavailable: false`、`fulltext_complete: true`。查詢端應在 notice 情況拒絕提供條文全文並回報 `SOURCE_FULLTEXT_UNAVAILABLE` 及官方 URL。
+
+法規的 **collection coverage 只表示目前官方各分類、索引及內容頁已捕獲**，不代表已取得停止適用法規的歷史條文全文。回傳的 `law_text_count` 與 `repeal_notice_count` 分開呈現兩種原件，驗收時需同時看這些數量與 `fulltext_complete`。2026-10-15 NAS r3 的 `GL001565` 原件只有43字停止適用公告，已由該次CAS正文與沿革重新驗證；其歷史條文不可由公告推造。
+
 新聞 ID 與來源身分如下，避免兩來源相同 native ID 碰撞：
 
 | 欄位 | 最新消息 | 市政新聞 |
@@ -80,11 +86,13 @@ const result = await runOfficialCollection({
 
 `agency` 與 `publisher` 取自明細的「發布機關」，日期取自明細「發布日期」，分別與索引已提供的欄位比對。完整正文存於 `content`；為相容既有 schema，`content_summary` 同樣保存全文，並標示 `content_summary_kind: official-full-text`，不假裝產生摘要。官方圖片與外站媒體不自動下載；正文與完整原 HTML 都保留。
 
+官方明細確實存在「發布機關：」但內容為空時，保留 `agency`／`publisher` 空字串，標示 `publisher_status: not_provided`、`publisher_source: official-detail-empty`，不推猜新聞局或其他機關。有明示值則為 `publisher_status: provided`、`publisher_source: official-detail`。發布機關欄位整個不存在、正文或日期缺失，仍為結構錯誤並停止；索引有機關但明細空白也保留身分不一致阻擋。NAS r3 的 `city:598182DA152F961C` 即為明示空欄、正文與日期齊全的已驗證實例。
+
 這些檢查證明原件來源、身分與本機內容一致；沒有把 schema 合格當成法規法律效力或新聞主張均已查證。
 
 ## 驗證紀錄與限制
 
-執行 `node scripts/test-official-ingestion.mjs`。十三項結構與安全測試涵蓋跨段累積、來源總數、raw 先保存、來源身分、redirect allowlist、byte limit、來源漂移保留前段、分散 HTML 標籤條號、附件中斷續作、WebForms 原生 POST 及 namespace、symlink 與 checkpoint 契約，並在完整 law snapshot 後刪除／竄改沿革與附件 bytes、竄改各 receipt metadata 欄位，核對無重新抓取且不得回報 complete；另測三種 URL 形式及外站／未知格式拒絕。測試使用明確的合成結構 fixture，不能代替 live authority 證據。
+執行 `node scripts/test-official-ingestion.mjs`。十五項結構與安全測試涵蓋跨段累積、來源總數、raw 先保存、來源身分、redirect allowlist、byte limit、來源漂移保留前段、分散 HTML 標籤條號、廢停狀態badge與日期、發布機關空欄及缺欄反證、附件中斷續作、WebForms 原生 POST 及 namespace、symlink 與 checkpoint 契約，並在完整 law snapshot 後刪除／竄改沿革與附件 bytes、竄改各 receipt metadata 欄位，核對無重新抓取且不得回報 complete；另測三種 URL 形式及外站／未知格式拒絕。測試使用明確的合成結構 fixture，不能代替 live authority 證據。
 
 2026-10-15 實際官方 canary 已核驗：`GL000020` 的41條完整正文（含跨標籤的第二十八條）、沿革及 PDF；`GL000021` 的15條、沿革及 PDF；最新消息兩則與市政新聞兩則全文，以及市政新聞第2頁 POST。當次兩新聞來源宣告總數為 1,726 + 610 = 2,336；此為擷取時點的觀察值，不是固定設定。bounded canary 均維持 partial coverage，沒有宣稱全站已下載。
 

@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { loadTypeScriptParser } from '../src/ingestion/collector.mjs';
 import { runKccCollection, validatePdfExtraction } from '../src/ingestion/kcc-collector.mjs';
-import { parseMeetingPage, parseAttachments, parseDetail } from '../src/ingestion/kcc-html.mjs';
+import { parseMeetingPage, parseAttachments, parseDetail, assertQuery } from '../src/ingestion/kcc-html.mjs';
 const P='ctl00$ContentPlaceHolder1$', M=`${P}uscPeriodSessionMeeting$`;
 const e=(s)=>String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;');
 const input=(name,value='')=>`<input name="${e(name)}" value="${e(value)}"/>`;
@@ -14,14 +14,14 @@ const select=(name,values,selected)=>`<select name="${e(name)}">${values.map((v)
 function proposalRow(id){return `<tr><td>${input(`${P}gvIndex$ctl${id}$hidProposalSN`,id)}${input(`${P}gvIndex$ctl${id}$hidProposalKind`,'1')}</td><td>${id}</td><td>工務</td><td>測試提案人</td><td onclick="location.href='Detail.aspx?s=ENCRYPTED${id}'">議案${id}</td><td>結案</td></tr>`;}
 const totals={1:3,2:1,3:0,4:2,5:0,6:0,7:0,8:0,9:0};
 function fixture(query={period:'07',session:'0704',keyword:''},pages={},sizes={},duplicate=false){
- const form=input('__VIEWSTATE','public-state')+input('__EVENTVALIDATION','public-validation')+select(`${M}ddlPeriod`,['07'],query.period)+select(`${M}ddlSession`,['0701','0704'],query.session)+input(`${M}ddlMeeting`)+input(`${P}txtKeyword`,query.keyword);
+ const form=input('__VIEWSTATE','public-state')+input('__EVENTVALIDATION','public-validation')+select(`${M}ddlPeriod`,['07'],query.period)+select(`${M}ddlSession`,['0701','0704'],query.session)+select(`${M}ddlMeeting`,[''],'')+input(`${P}txtKeyword`,query.keyword);
  return form+Object.keys(totals).map(id=>`<a href="#tabs-${id}">tab${id}</a>`).join('')+Object.entries(totals).map(([id,total])=>{
   const page=pages[id]||1,size=sizes[id]||2,pageCount=Math.ceil(total/size),first=duplicate&&page===2?0:(page-1)*size;
   const rows=Array.from({length:Math.min(size,Math.max(0,total-(page-1)*size))},(_,i)=>proposalRow(String(Number(id)*100+first+i)));
   return `<div id="tabs-${id}">${rows.join('')}${total?`<span id="ContentPlaceHolder1_DataPager${id}">共 ${total} 筆 | ${page} / ${pageCount} 頁 | ${page<pageCount?`<a href="javascript:__doPostBack('ctl00$ContentPlaceHolder1$DataPager${id}$ctl01$ctl02','')">下一頁</a>`:'<a>下一頁</a>'}${input(`${P}DataPager${id}$ctl02$txtCurrentPage`)}${input(`${P}DataPager${id}$ctl02$txtPageSize`,size)}</span>`:'尚無任何資料!'}</div>`;
  }).join('')+'<div id="tabs-10"></div>';
 }
-function harness({duplicate=false,failImport=false}={}){
+function harness({duplicate=false,failImport=false,failReconciliation=false}={}){
  let time=0,failed=false;const starts=[],requests=[],raw=new Map(),snapshots=new Map(),releases=new Map();
  const store={close(){},async putRawObject(o){raw.set(o.sha256,o.bytes_base64);},async importSnapshot(s){
   if(failImport&&!failed){failed=true;throw Object.assign(new Error('test publication failure'),{code:'IMPORT_FAILED'});}
@@ -33,7 +33,7 @@ function harness({duplicate=false,failImport=false}={}){
   if(options.method==='POST'){
    const f=new URLSearchParams(options.body),query={period:f.get(`${M}ddlPeriod`),session:f.get(`${M}ddlSession`),keyword:f.get(`${P}txtKeyword`)},pages={},sizes={};
    for(const id of Object.keys(totals)){ pages[id]=Number(f.get(`${P}DataPager${id}$ctl02$txtCurrentPage`))||1; sizes[id]=Number(f.get(`${P}DataPager${id}$ctl02$txtPageSize`))||2; }
-   html=fixture(query,pages,sizes,duplicate);
+   html=fixture(query,pages,sizes,duplicate);if(failReconciliation&&sizes[1]===3)html=html.replace(proposalRow('102'),proposalRow('100'));
   }
   return new Response(html,{status:200,headers:{'content-type':'text/html;charset=utf-8'}});
  };
@@ -67,7 +67,7 @@ try{
   const resumed=await runKccCollection({...opts,maxPages:20},h.dependencies);assert.equal(resumed.status,'complete');assert.equal(resumed.record_count,6);
  });
  await test('重複頁拒絕完整宣告並保留上一頁cursor',async()=>{
-  const h=harness({duplicate:true});const result=await runKccCollection({profile:'kcc-proposals-full',root:path.join(temp,'duplicate'),sessions:['0704'],pageSize:2,maxRequests:20},h.dependencies);assert.equal(result.status,'blocked');assert.equal(result.error_code,'DUPLICATE_PAGE_OR_ID');assert.equal(result.record_count,2);assert.equal(result.coverage.complete,false);
+  const h=harness({duplicate:true,failReconciliation:true});const result=await runKccCollection({profile:'kcc-proposals-full',root:path.join(temp,'duplicate'),sessions:['0704'],pageSize:2,maxRequests:20},h.dependencies);assert.equal(result.status,'blocked');assert.equal(result.error_code,'DUPLICATE_SOURCE_ROW');assert.equal(result.record_count,2);assert.equal(result.coverage.complete,false);
  });
  await test('來源失敗不建立空成功快照',async()=>{
   const h=harness();const result=await runKccCollection({profile:'kcc-proposals-full',root:path.join(temp,'http'),sessions:['0704'],pageSize:2},{...h.dependencies,fetchImpl:async()=>new Response('failure',{status:503})});assert.equal(result.status,'blocked');assert.equal(result.record_count,0);assert.equal(h.snapshots.size,0);
@@ -90,7 +90,7 @@ try{
   const source={id,title:'會議',text:'會議',data:{record_id:id,pdf_url:urls[1],pdf_urls:urls},source_url:'https://cissearch.kcc.gov.tw/System/meetingrecord/default.aspx',raw_sha256:'b'.repeat(64),retrieved_at:'2026-10-15T00:00:00Z'};
   bindSource(h,'kcc-meetings',[source]);
   const deps={...h.dependencies,fetchImpl:async(url)=>new Response(`%PDF-${url}`),pdfExtractor:async(bytes)=>({total_pages:2,pages:[{page:1,text:bytes.toString()},{page:2,text:''}]})};
-  const options={profile:'kcc-meeting-records',root,maxRequests:1};const first=await runKccCollection(options,deps);assert.equal(first.status,'paused');assert.equal(first.record_count,0);const last=await runKccCollection(options,deps);assert.equal(last.status,'complete');const pdf=h.snapshots.get('kcc-meeting-records').records[0];assert.equal(pdf.data.pdf_versions.length,2);assert.equal(pdf.data.pdf_url,urls[1]);assert.equal(pdf.raw_sha256,pdf.data.pdf_versions[1].raw_sha256);assert.equal(pdf.data.text_layer_status,'partial');assert.deepEqual(pdf.data.empty_text_pages,[2]);assert(h.raw.has(pdf.data.pdf_versions[0].raw_sha256));
+  const options={profile:'kcc-meeting-records',root,maxRequests:1};const first=await runKccCollection(options,deps);assert.equal(first.status,'paused');assert.equal(first.record_count,0);const last=await runKccCollection(options,deps);assert.equal(last.status,'partial');assert.equal(last.archive_complete,true);assert.equal(last.fulltext_complete,false);const pdf=h.snapshots.get('kcc-meeting-records').records[0];assert.equal(pdf.data.pdf_versions.length,2);assert.equal(pdf.data.pdf_url,urls[1]);assert.equal(pdf.raw_sha256,pdf.data.pdf_versions[1].raw_sha256);assert.equal(pdf.data.text_layer_status,'partial');assert.deepEqual(pdf.data.empty_text_pages,[2]);assert(h.raw.has(pdf.data.pdf_versions[0].raw_sha256));
  });
  await test('onclick的HTML編碼引號不污染詳情URL',async()=>{
   const parser=await loadTypeScriptParser('../kcc/search.ts',{forceNative:true,replace:(source)=>source.replace(/^import[^\n]+from "\.\/client";?\s*$/m,"const fetchWebFormsTokens=()=>{};")});
@@ -164,6 +164,72 @@ try{
   const options={profile:'kcc-proposal-details',root,maxRequests:3},first=await runKccCollection(options,deps);assert.equal(first.commit_state,'unknown');assert.equal(first.publication_status,'partial');assert.equal(first.record_count,1);assert.equal(first.progress.cursor,0);
   const native=new LocalStore(root);assert.equal((await native.queryRecords('kcc-proposal-details',{limit:0})).release.record_count,1);assert.equal((await native.queryRecords('kcc-proposal-attachments',{limit:0})).release.record_count,1);native.close();
   const recovered=await runKccCollection(options,deps);assert.equal(recovered.status,'complete');assert.equal(recovered.attempted,0);assert.equal(detailCalls,1);assert.equal(unchanged,1);assert.equal(recovered.progress.cursor,1);
+ });
+ await test('真實排序類型碰撞以單回應完整列舉恢復且保留成功cursor及原件',async()=>{
+  const h=harness({duplicate:true}),root=path.join(temp,'single-response-recovery'),options={profile:'kcc-proposals-full',root,sessions:['0704'],pageSize:2,maxRequests:20,maxPages:1};
+  const first=await runKccCollection(options,h.dependencies);const before=JSON.parse(await readFile(first.checkpoint_path,'utf8'));assert.equal(first.record_count,2);
+  const resumed=await runKccCollection({...options,maxPages:20},h.dependencies);assert.equal(resumed.status,'paused');assert.equal(resumed.record_count,3);const last=await runKccCollection({...options,maxPages:20},h.dependencies);assert.equal(last.status,'complete');assert.equal(last.record_count,6);
+  const state=JSON.parse(await readFile(first.checkpoint_path,'utf8')),tab=state.queries['07/0704'].tabs['1'];assert.equal(tab.complete,true);assert.equal(tab.next_page,2);assert.equal(tab.pages_proof.length,1);assert.equal(tab.reconciliation.response.unique_count,3);assert.equal(tab.reconciliation.response.row_count,3);assert.equal(tab.reconciliation.prior_ids_covered,true);
+  for(const [id,record]of Object.entries(before.records['kcc-proposals']))assert.deepEqual(state.records['kcc-proposals'][id],record);
+ });
+ await test('議事錄只含Word的列照計入官方100筆分頁，不冒充PDF或略過',async()=>{
+  const header='<table id="ContentPlaceHolder1_gvIndex">',row=`<tr><td>1</td><td>103/08/22</td><td>早期議事錄</td><td>${input(`${P}gvIndex$ctl02$rptAttachment$ctl00$hidDataSN`,'1449')}<a href="/Upload/Attachment/MeetingRecord/1449/original.doc">Word</a></td><td></td></tr>`;
+  const footer=`</table><span id="ContentPlaceHolder1_DataPager1">共 1 筆 | 1 / 1 頁 | <a>下一頁</a>${input(`${P}DataPager1$ctl02$txtPageSize`,'100')}</span>`;
+  const parsed=parseMeetingPage(header+row+footer)[0];assert.equal(parsed.rows.length,1);assert.equal(parsed.rows[0].record_id,'1449');assert.deepEqual(parsed.rows[0].pdf_urls,[]);assert.equal(parsed.rows[0].original_files[0].file_type,'doc');assert.equal(parsed.rows[0].original_availability,'non_pdf_originals_only');
+ });
+ await test('Word原件可信歸檔後回partial與未索引，完整母集不減筆',async()=>{
+  const h=harness(),id='1449',url=`https://cissearch.kcc.gov.tw/Upload/Attachment/MeetingRecord/${id}/original.doc`;
+  bindSource(h,'kcc-meetings',[{id,title:'Word議事錄',text:'會議',data:{record_id:id,pdf_url:null,pdf_urls:[],original_files:[{download_url:url,file_type:'doc'}]},source_url:'https://cissearch.kcc.gov.tw/System/meetingrecord/default.aspx'}]);
+  let extracted=0;const result=await runKccCollection({profile:'kcc-meeting-records',root:path.join(temp,'word-original'),maxRequests:2},{...h.dependencies,fetchImpl:async()=>new Response(Buffer.from('d0cf11e0a1b11ae1','hex')),pdfExtractor:async()=>{extracted++;throw new Error('must not interpret Word as PDF');}});
+  assert.equal(result.status,'partial');assert.equal(result.source_exhausted,true);assert.equal(result.archive_complete,true);assert.equal(result.fulltext_complete,false);assert.equal(result.record_count,1);assert.equal(result.coverage.source_total,1);assert.equal(result.coverage.complete,false);assert.equal(result.unindexed_records,1);assert.equal(extracted,0);
+  const record=h.snapshots.get('kcc-meeting-records').records[0];assert.equal(record.data.content_index_status,'unindexed_non_pdf');assert.equal(record.data.originals_complete,true);assert.equal(record.data.original_versions.length,1);assert(h.raw.has(record.data.original_versions[0].raw_sha256));assert.equal(record.data.pdf_url,null);assert.equal(record.data.total_pages,null);assert.deepEqual(record.data.pages,[]);
+ });
+ await test('PDF加Word混合原件完整保存仍明示fulltext未完整',async()=>{
+  const h=harness(),id='1449',base=`https://cissearch.kcc.gov.tw/Upload/Attachment/MeetingRecord/${id}/`,files=[{download_url:base+'original.pdf',file_type:'pdf'},{download_url:base+'correction.doc',file_type:'doc'}];
+  bindSource(h,'kcc-meetings',[{id,title:'混合議事錄',text:'會議',data:{record_id:id,pdf_url:files[0].download_url,pdf_urls:[files[0].download_url],original_files:files},source_url:'https://cissearch.kcc.gov.tw/System/meetingrecord/default.aspx'}]);
+  const result=await runKccCollection({profile:'kcc-meeting-records',root:path.join(temp,'mixed-originals'),maxRequests:2},{...h.dependencies,fetchImpl:async(url)=>new Response(url.endsWith('.pdf')?'%PDF-test':Buffer.from('d0cf11e0a1b11ae1','hex')),pdfExtractor:async()=>({total_pages:1,pages:[{page:1,text:'PDF頁面'}]})});
+  assert.equal(result.status,'partial');assert.equal(result.archive_complete,true);assert.equal(result.fulltext_complete,false);const record=h.snapshots.get('kcc-meeting-records').records[0];assert.equal(record.data.original_versions.length,2);assert.equal(record.data.pdf_versions.length,1);assert.equal(record.data.unindexed_original_count,1);assert.equal(record.data.fulltext_complete,false);assert.equal(record.source_url,files[0].download_url);assert.equal(record.raw_sha256,record.data.pdf_versions[0].raw_sha256);for(const original of record.data.original_versions){assert(original.download_url);assert(h.raw.has(original.raw_sha256));}
+ });
+ await test('P1 大於16MiB完整tab成功後立即yield，下一段其他tab恢復正常尺寸',async()=>{
+  const old=totals[4];totals[4]=3;
+  try{
+   const h=harness({duplicate:true}),root=path.join(temp,'large-recovery-boundary'),options={profile:'kcc-proposals-full',root,sessions:['0704'],pageSize:2,maxRequests:30};let largeResponses=0;
+   const fetchImpl=async(url,options)=>{const response=await h.dependencies.fetchImpl(url,options),form=new URLSearchParams(options.body||'');if(options.method==='POST'&&form.get(`${P}DataPager1$ctl02$txtPageSize`)==='3'){largeResponses++;return new Response((await response.text())+'<!--'+'x'.repeat(16*1024*1024)+'-->',{headers:{'content-type':'text/html'}});}return response;};
+   const first=await runKccCollection(options,{...h.dependencies,fetchImpl});assert.equal(first.status,'paused');assert.equal(first.continuation_required,true);assert.equal(first.record_count,3);assert.equal(first.progress.queries['07/0704'].tabs['1'].reconciliation.response.raw_row_count,3);assert(first.progress.queries['07/0704'].tabs['1'].reconciliation.response.byte_length>16*1024*1024);assert.equal(largeResponses,1);
+   const last=await runKccCollection(options,{...h.dependencies,fetchImpl});assert.equal(last.status,'complete');assert.equal(last.record_count,7);assert.equal(last.error_code,null);assert.equal(largeResponses,1);
+  }finally{totals[4]=old;}
+ });
+ await test('P1 原始4列含重複ID不准由TS Map去重成3列完整證明',async()=>{
+  const h=harness({duplicate:true});const fetchImpl=async(url,options)=>{const response=await h.dependencies.fetchImpl(url,options),form=new URLSearchParams(options.body||'');if(form.get(`${P}DataPager1$ctl02$txtPageSize`)==='3')return new Response((await response.text()).replace('<div id="tabs-1">','<div id="tabs-1">'+proposalRow('100')));return response;};
+  const result=await runKccCollection({profile:'kcc-proposals-full',root:path.join(temp,'raw-duplicate-row'),sessions:['0704'],pageSize:2,maxRequests:20},{...h.dependencies,fetchImpl});assert.equal(result.status,'blocked');assert.equal(result.error_code,'DUPLICATE_SOURCE_ROW');assert.equal(result.record_count,2);assert.equal(result.coverage.complete,false);assert.equal(result.progress.queries['07/0704'].tabs['1'].complete,false);assert.equal(result.progress.queries['07/0704'].tabs['1'].next_page,2);
+ });
+ await test('P1 實際assertQuery要求所有官方控制項存在且唯一，空期望亦適用',async()=>{
+  const query={period:'07',session:'0704',keyword:''},valid=fixture();assert.doesNotThrow(()=>assertQuery(valid,query));
+  const missingKeyword=valid.replace(input(`${P}txtKeyword`,''),''),missingMeeting=valid.replace(select(`${M}ddlMeeting`,[''],''),'');
+  const conflictingPeriod=select(`${M}ddlPeriod`,['09'],'09')+valid,duplicateKeyword=valid+input(`${P}txtKeyword`,''),wrongId=valid.replace(`name="${M}ddlPeriod"`,`name="${M}ddlPeriod" id="ContentPlaceHolder1_wrong"`);
+  for(const html of [missingKeyword,missingMeeting,conflictingPeriod,duplicateKeyword,wrongId,missingKeyword+input('ctl00$txtKeyword','')])assert.throws(()=>assertQuery(html,query),{code:'FILTER_NOT_CONFIRMED'});
+  const idOnly=valid.replace(`name="${M}ddlPeriod"`,'id="ContentPlaceHolder1_uscPeriodSessionMeeting_ddlPeriod"');assert.doesNotThrow(()=>assertQuery(idOnly,query));
+ });
+ await test('P1 collector及recovery實際路徑拒缺少空keyword或矛盾period',async()=>{
+  for(const mode of ['missing-keyword','duplicate-period']){
+   const h=harness(),fetchImpl=async(url,options)=>{const response=await h.dependencies.fetchImpl(url,options);if(options.method!=='POST')return response;const html=await response.text();return new Response(mode==='missing-keyword'?html.replace(input(`${P}txtKeyword`,''),''):select(`${M}ddlPeriod`,['09'],'09')+html);};
+   const result=await runKccCollection({profile:'kcc-proposals-full',root:path.join(temp,mode),sessions:['0704'],pageSize:2,maxRequests:20},{...h.dependencies,fetchImpl});assert.equal(result.error_code,'FILTER_NOT_CONFIRMED');assert.equal(result.record_count,0);assert.equal(h.snapshots.size,0);
+  }
+  const h=harness({duplicate:true}),fetchImpl=async(url,options)=>{const response=await h.dependencies.fetchImpl(url,options),form=new URLSearchParams(options.body||'');return form.get(`${P}DataPager1$ctl02$txtPageSize`)==='3'?new Response((await response.text()).replace(input(`${P}txtKeyword`,''),'')):response;};
+  const result=await runKccCollection({profile:'kcc-proposals-full',root:path.join(temp,'recovery-missing-control'),sessions:['0704'],pageSize:2,maxRequests:20},{...h.dependencies,fetchImpl});assert.equal(result.error_code,'FILTER_NOT_CONFIRMED');assert.equal(result.record_count,2);assert.equal(result.coverage.complete,false);
+ });
+ await test('P1 DOC的HTML/octet-stream、錯magic與未驗證格式保留raw但不完成原件',async()=>{
+  const cases=[['html','doc',Buffer.from('<!DOCTYPE html><html><body>temporary upstream error</body></html>'),'ORIGINAL_SIGNATURE_INVALID'],['bad-magic','doc',Buffer.from('not a Word original'),'ORIGINAL_SIGNATURE_INVALID'],['short-cfbf','doc',Buffer.from('d0cf11e0a1b11a','hex'),'ORIGINAL_SIGNATURE_INVALID'],['unknown-docx','docx',Buffer.from('504b030400000000','hex'),'ORIGINAL_FORMAT_UNSUPPORTED'],['unknown-odt','odt',Buffer.from('504b030400000000','hex'),'ORIGINAL_FORMAT_UNSUPPORTED']];
+  for(const [label,fileType,body,code]of cases){
+   const h=harness(),id='1449',url=`https://cissearch.kcc.gov.tw/Upload/Attachment/MeetingRecord/${id}/original.${fileType}`;bindSource(h,'kcc-meetings',[{id,title:'會議',text:'會議',data:{record_id:id,pdf_urls:[],original_files:[{download_url:url,file_type:fileType}]},source_url:'https://cissearch.kcc.gov.tw/System/meetingrecord/default.aspx'}]);
+   const result=await runKccCollection({profile:'kcc-meeting-records',root:path.join(temp,label),maxRequests:2},{...h.dependencies,fetchImpl:async()=>new Response(body,{headers:{'content-type':'application/octet-stream'}})});assert.equal(result.status,'blocked');assert.equal(result.error_code,code);assert.equal(result.archive_complete,false);assert.equal(result.record_count,0);assert.equal(h.snapshots.size,0);assert.equal(h.raw.size,1);assert.deepEqual(Buffer.from([...h.raw.values()][0],'base64'),body);
+  }
+ });
+ await test('舊checkpoint有效DOC原件以CAS補驗CFBF證據，原cursor及raw不重設',async()=>{
+  const h=harness(),root=path.join(temp,'legacy-doc-revalidation'),id='1449',url=`https://cissearch.kcc.gov.tw/Upload/Attachment/MeetingRecord/${id}/original.doc`;bindSource(h,'kcc-meetings',[{id,title:'會議',text:'會議',data:{record_id:id,pdf_urls:[],original_files:[{download_url:url,file_type:'doc'}]},source_url:'https://cissearch.kcc.gov.tw/System/meetingrecord/default.aspx'}]);
+  const options={profile:'kcc-meeting-records',root,maxRequests:1},deps={...h.dependencies,fetchImpl:async()=>new Response(Buffer.from('d0cf11e0a1b11ae1','hex'))};const first=await runKccCollection(options,deps),state=JSON.parse(await readFile(first.checkpoint_path,'utf8')),snapshot=structuredClone(h.snapshots.get('kcc-meeting-records'));
+  delete snapshot.records[0].data.original_versions[0].format_validation;snapshot.snapshot_id='legacy-doc-unverified-container';const receipt=await h.store.importSnapshot(snapshot);state.records['kcc-meeting-records'][id]=snapshot.records[0];state.receipts['kcc-meeting-records']=receipt;await import('node:fs/promises').then(fs=>fs.writeFile(first.checkpoint_path,JSON.stringify(state)));
+  const result=await runKccCollection(options,deps);assert.equal(result.status,'partial');assert.equal(result.archive_complete,true);assert.equal(result.attempted,0);assert.equal(result.progress.cursor,1);const migrated=h.snapshots.get('kcc-meeting-records').records[0];assert.equal(migrated.raw_sha256,snapshot.records[0].raw_sha256);assert.equal(migrated.data.original_versions[0].format_validation.validation_version,'cfbf-magic-8-v1');
  });
  console.log(`${passed} meaningful KCC ingestion tests passed`);
 }finally{await rm(temp,{recursive:true,force:true});}

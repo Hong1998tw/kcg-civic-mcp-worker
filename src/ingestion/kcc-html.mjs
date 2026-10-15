@@ -35,10 +35,30 @@ export function optionsFor(html, suffix) {
   }
   throw new CollectorError('PARSER_CONTRACT_CHANGED', `官方選單 ${suffix} 不存在`);
 }
+function exactControlValue(html,name,id,kind) {
+  const readAttribute=(tag,key)=>{const match=tag.match(new RegExp(`(?:^|\\s)${key}\\s*=\\s*(["'])(.*?)\\1`,'i'));return match?decodeHtml(match[2]):undefined;};
+  const candidates=(html.match(/<(?:input|select)\b[^>]*>/gi)||[]).filter((tag)=>{
+    const actualName=readAttribute(tag,'name'),actualId=readAttribute(tag,'id');
+    if(actualName!==name&&actualId!==id)return false;
+    if((actualName!==undefined&&actualName!==name)||(actualId!==undefined&&actualId!==id))throw new CollectorError('FILTER_NOT_CONFIRMED','官方控制項name/id矛盾');
+    return true;
+  });
+  if(candidates.length!==1)throw new CollectorError('FILTER_NOT_CONFIRMED',`官方控制項${name}缺少或不唯一`);
+  const tag=candidates[0];
+  if(!new RegExp(`^<${kind}\\b`,'i').test(tag))throw new CollectorError('FILTER_NOT_CONFIRMED','官方控制項類型不一致');
+  if(kind==='input')return readAttribute(tag,'value')??'';
+  const start=html.indexOf(tag)+tag.length,end=html.slice(start).search(/<\/select\s*>/i);
+  if(end<0)throw new CollectorError('FILTER_NOT_CONFIRMED','官方下拉控制項未結束');
+  const options=html.slice(start,start+end).match(/<option\b[^>]*>/gi)||[],selected=options.filter((option)=>/(?:^|\s)selected(?:\s|=|>)/i.test(option));
+  if(!options.length||selected.length>1)throw new CollectorError('FILTER_NOT_CONFIRMED','官方下拉控制項選取值不唯一');
+  const value=readAttribute(selected[0]||options[0],'value');
+  if(value===undefined)throw new CollectorError('FILTER_NOT_CONFIRMED','官方選項缺少明確value');
+  return value;
+}
 export function assertQuery(html, query) {
-  const values = controls(html);
-  for (const [field, name] of [['period', `${MEETING_PREFIX}ddlPeriod`], ['session', `${MEETING_PREFIX}ddlSession`], ['keyword', `${PREFIX}txtKeyword`]]) {
-    if ((values.get(name) || '') !== (query[field] || '')) throw new CollectorError('FILTER_NOT_CONFIRMED', `${field} 未被來源確認`);
+  for (const [field, name] of [['period', `${MEETING_PREFIX}ddlPeriod`], ['session', `${MEETING_PREFIX}ddlSession`], ['meeting', `${MEETING_PREFIX}ddlMeeting`], ['keyword', `${PREFIX}txtKeyword`]]) {
+    const id=name.replace(/^ctl00\$/,'').replaceAll('$','_'),kind=field==='keyword'?'input':'select';
+    if(exactControlValue(html,name,id,kind)!==(query[field]||''))throw new CollectorError('FILTER_NOT_CONFIRMED',`${field}未被來源確認`);
   }
 }
 function pager(section) {
@@ -51,7 +71,7 @@ function pager(section) {
   const counts = rendered.match(/共\s*([\d,]+)\s*筆\s*\|\s*(\d+)\s*\/\s*(\d+)\s*頁/);
   if (!counts) throw new CollectorError('PARSER_CONTRACT_CHANGED', '無法解析獨立頁碼總數');
   const total = Number(counts[1].replace(/,/g, '')), page = Number(counts[2]), pages = Number(counts[3]);
-  const inputs = controls(section), pageSize = Number(inputs.get(`${PREFIX}DataPager${match[1]}$ctl02$txtPageSize`));
+  const pageSize=Number(exactControlValue(section,`${PREFIX}DataPager${match[1]}$ctl02$txtPageSize`,`ContentPlaceHolder1_DataPager${match[1]}_ctl02_txtPageSize`,'input'));
   if (!Number.isSafeInteger(pageSize) || pageSize < 1 || page < 1 || pages < 1 || pages !== Math.ceil(total / pageSize) || page > pages) throw new CollectorError('PAGER_INCONSISTENT', '總數、頁碼與每頁筆數不一致');
   const nextAnchor = [...match[2].matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi)].find((m) => text(m[2]).includes('下一頁'));
   const nextTarget = nextAnchor ? attr(nextAnchor[1], 'href').match(/__doPostBack\('([^']+)'/)?.[1] || null : null;
@@ -70,9 +90,16 @@ export function parseProposalTabs(html, parseRows) {
       if (/hidProposalSN|ContentPlaceHolder1_DataPager/i.test(section)) throw new CollectorError('PARSER_CONTRACT_CHANGED', '未列於官方tab導覽的容器出現資料，拒絕遺漏');
       continue;
     }
+    const sourceIds=(section.match(/<tr\b[\s\S]*?<\/tr>/gi)||[]).filter((row)=>/hidProposalSN/i.test(row)).map((row)=>{
+      const ids=(row.match(/<input\b[^>]*>/gi)||[]).filter((tag)=>attr(tag,'name').endsWith('$hidProposalSN')).map((tag)=>attr(tag,'value'));
+      if(ids.length!==1||!/^\d+$/.test(ids[0]))throw new CollectorError('RECORD_INVALID','議案原始資料列缺少唯一數字識別碼');
+      return ids[0];
+    });
+    if(new Set(sourceIds).size!==sourceIds.length)throw new CollectorError('DUPLICATE_SOURCE_ROW','同一官方回應含重複議案原始資料列，拒絕以parser去重掩蓋');
     const rows = parseRows(section), metadata = pager(section);
+    if(rows.length!==sourceIds.length)throw new CollectorError('ROWS_TOTAL_MISMATCH','正規化列數與原始議案資料列數不一致');
     if (rows.length !== Math.min(metadata.pageSize, Math.max(0, metadata.total - (metadata.page - 1) * metadata.pageSize))) throw new CollectorError('ROWS_TOTAL_MISMATCH', `tab${m[1]}列數與頁碼不一致`);
-    result.push({ tab: m[1], rows, ...metadata });
+    result.push({ tab:m[1],rows,source_row_count:sourceIds.length,source_unique_id_count:new Set(sourceIds).size,...metadata });
   }
   return result;
 }
@@ -83,10 +110,19 @@ export function parseMeetingPage(html) {
   for (const match of table.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gi)) {
     const cells = [...match[1].matchAll(/<td\b[^>]*>([\s\S]*?)<\/td>/gi)].map((m) => m[1]);
     if (cells.length < 3 || /尚無任何資料/.test(match[1])) continue;
-    const pdfs = [...match[1].matchAll(/<a\b([^>]*)>/gi)].map((m) => attr(m[1], 'href')).filter((v) => /\.pdf(?:\?|$)/i.test(v)).map((v) => official(v, MEETING_URL));
-    const ids = [...new Set(pdfs.map((url) => new URL(url).pathname.match(/\/MeetingRecord\/(\d+)\//i)?.[1]).filter(Boolean))];
-    if (ids.length !== 1 || !pdfs.length) throw new CollectorError('MEETING_PDF_ID_MISSING', '議事錄列缺少唯一識別碼或官方PDF');
-    rows.push({ record_id: ids[0], meeting: text(cells[2]), meeting_name: text(cells[2]), date: text(cells[1]), meeting_date: text(cells[1]), record_type: '議事錄', pdf_url: pdfs.at(-1), pdf_urls: [...new Set(pdfs)] });
+    // Historical rows may publish Word originals without a PDF. All official
+    // originals belong in the index; extension is availability, not identity.
+    const originals = [...new Set([...String(cells[3] || '').matchAll(/<a\b([^>]*)>/gi)].map((m)=>attr(m[1],'href')).filter(Boolean))].map((href)=>{
+      const url = official(href,MEETING_URL), file = new URL(url).pathname;
+      if (!/^\/Upload\/Attachment\/MeetingRecord\/\d+\/[^/]+$/i.test(file)) throw new CollectorError('SOURCE_ID_MISMATCH','議事錄原件URL不符合官方record檔案身分');
+      const fileType = file.match(/\.([a-z0-9]+)$/i)?.[1]?.toLowerCase() || 'unknown';
+      return { download_url:url,file_type:fileType };
+    });
+    const hiddenIds = (match[1].match(/<input\b[^>]*>/gi) || []).filter((tag)=>/\$rptAttachment\$[^$]+\$hidDataSN$/.test(attr(tag,'name'))).map((tag)=>attr(tag,'value'));
+    const ids = [...new Set([...originals.map((item)=>new URL(item.download_url).pathname.match(/\/MeetingRecord\/(\d+)\//i)?.[1]),...hiddenIds].filter(Boolean))];
+    if (ids.length !== 1 || !/^\d+$/.test(ids[0])) throw new CollectorError('MEETING_SOURCE_ID_MISSING',`議事錄第${text(cells[0])}列缺少一致且唯一的官方識別碼`);
+    const pdfs = originals.filter((item)=>item.file_type==='pdf').map((item)=>item.download_url);
+    rows.push({ record_id:ids[0],meeting:text(cells[2]),meeting_name:text(cells[2]),date:text(cells[1]),meeting_date:text(cells[1]),record_type:'議事錄',pdf_url:pdfs.at(-1)||null,pdf_urls:pdfs,original_files:originals,original_availability:pdfs.length?'pdf_available':originals.length?'non_pdf_originals_only':'no_originals_published',content_index_status:pdfs.length?'pending_pdf_extraction':originals.length?'unindexed_non_pdf':'no_original_published' });
   }
   const metadata = pager(html);
   if (rows.length !== Math.min(metadata.pageSize, Math.max(0, metadata.total - (metadata.page - 1) * metadata.pageSize))) throw new CollectorError('ROWS_TOTAL_MISMATCH', '議事錄列數與來源分頁不一致');

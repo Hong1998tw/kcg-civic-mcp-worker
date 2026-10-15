@@ -9,12 +9,34 @@ const resource = `${issuer}/mcp`;
 const lines = createInterface({ input: process.stdin, crlfDelay: Infinity })[Symbol.asyncIterator]();
 let stage = 'input';
 const expect = (condition) => { if (!condition) throw new Error('ACCEPTANCE_CHECK_FAILED'); };
-const request = (url, options = {}) => fetch(url, { ...options, redirect: 'manual', signal: AbortSignal.timeout(15000) });
+let dispatcher;
+const publicDns = process.argv.includes('--public-dns');
+if (publicDns) {
+  // A new record can remain negatively cached in the LAN resolver. This
+  // process-only diagnostic preserves hostname/SNI/certificate validation.
+  const { Agent } = await import('undici');
+  const { Resolver } = await import('node:dns/promises');
+  const resolver = new Resolver({ timeout: 5000, tries: 1 });
+  resolver.setServers(['1.1.1.1', '8.8.8.8']);
+  dispatcher = new Agent({ connect: { lookup: (hostname, options, callback) => {
+    if (hostname !== 'kcg-civic-mcp.kshong.com') { callback(new Error('UNEXPECTED_VERIFICATION_HOST')); return; }
+    resolver.resolve4(hostname).then((addresses) => {
+      if (!addresses.length) throw new Error('NO_PUBLIC_DNS_ANSWER');
+      if (options.all) callback(null, addresses.map((address) => ({ address, family: 4 })));
+      else callback(null, addresses[0], 4);
+    }).catch(() => callback(new Error('PUBLIC_DNS_LOOKUP_FAILED')));
+  } } });
+}
+const fixedFetch = (input, options = {}) => {
+  expect(new URL(input instanceof Request ? input.url : input).origin === issuer);
+  return fetch(input, { ...options, redirect: 'manual', signal: options.signal || AbortSignal.timeout(15000), ...(dispatcher ? { dispatcher } : {}) });
+};
+const request = (url, options = {}) => fixedFetch(url, options);
 const postForm = (pathname, value, extra = {}) => request(issuer + pathname, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', ...extra }, body: new URLSearchParams(value) });
 async function sdk(token, business = false) {
   const client = new Client({ name: 'NAS public acceptance verifier', version: '1.0' });
   try {
-    await client.connect(new StreamableHTTPClientTransport(new URL(resource), { requestInit: { headers: { Authorization: `Bearer ${token}` } } }));
+    await client.connect(new StreamableHTTPClientTransport(new URL(resource), { fetch: fixedFetch, requestInit: { headers: { Authorization: `Bearer ${token}` } } }));
     const catalog = await client.listTools(); expect(catalog.tools.length === 21);
     expect(catalog.tools.every((tool) => tool._meta?.securitySchemes?.[0]?.type === 'oauth2'));
     const evidence = { tool_count: catalog.tools.length };
@@ -66,7 +88,7 @@ try {
   stage = 'public_SDK_business';
   const business = await sdk(tokens.access_token, true);
   await sdk(secrets.bearer);
-  process.stdout.write(JSON.stringify({ phase: 'awaiting_query_restart', status: 'PASS', tls: true, oauth: true, bearer_compatibility: true, negative_auth: true, consent_csrf: true, ...business }) + '\n');
+  process.stdout.write(JSON.stringify({ phase: 'awaiting_query_restart', status: 'PASS', tls: true, dns_mode: publicDns ? 'process_only_public_resolver' : 'system_resolver', oauth: true, bearer_compatibility: true, negative_auth: true, consent_csrf: true, ...business }) + '\n');
   // Parent restarts only this task's query container, leaving ingestion running.
   stage = 'restart_signal'; const command = await lines.next(); expect(command.value === 'query_restarted');
   stage = 'persistent_access_and_refresh';
@@ -80,4 +102,4 @@ try {
 } catch {
   process.stdout.write(JSON.stringify({ status: 'FAIL', stage, secrets_logged: false }) + '\n');
   process.exitCode = 1;
-} finally { process.stdin.destroy(); }
+} finally { process.stdin.destroy(); await dispatcher?.close(); }

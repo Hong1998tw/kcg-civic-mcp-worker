@@ -24,7 +24,7 @@ try {
   assert.equal(await processOne(queue, data), null);
   assert.equal(JSON.parse(fs.readFileSync(path.join(queue, 'receipts', id + '.json'))).job_id, id);
   assert.equal(verifyCollectorReceipt({ profile: 'budget-115', status: 'pending', dry_run: true }, 'budget-115', 0), false);
-  const sdk = fs.readFileSync(new URL('../../workflow-src/kcg-civic-00-health.ts', import.meta.url), 'utf8');
+  const sdk = fs.readFileSync(new URL('../n8n/kcg-civic-00-health.ts', import.meta.url), 'utf8');
   const literal = sdk.match(/jsCode: ("(?:[^"\\]|\\.)*")/)[1];
   const code = JSON.parse(literal).replace("'/data/storage/kcg-civic-jobs'", JSON.stringify(queue));
   const executeCode = new (Object.getPrototypeOf(async function () {}).constructor)('require', '$execution', code);

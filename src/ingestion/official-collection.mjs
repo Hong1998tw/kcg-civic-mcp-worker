@@ -33,12 +33,18 @@ function detailIdentity(url, profile) {
 }
 const newsKind = (url) => new URL(url).pathname === "/CityNews_Detail1.aspx" ? "city" : "messages";
 const namespacedId = (url, profile) => profile === "kcg-laws" ? detailIdentity(url, profile) : `${newsKind(url)}:${detailIdentity(url, profile)}`;
-function labeledRow(tree, name) {
+function labeledCell(tree, name) {
   for (const row of allNodes(tree, (node) => node.tag === "tr")) {
     const items = cells(row);
-    if (items.length >= 2 && normalized(cleanText(items[0])).replace(/[：:]$/, "") === name) return cleanText(items[1]);
+    if (items.length >= 2 && normalized(cleanText(items[0])).replace(/[：:]$/, "") === name) return items[1];
   }
-  return "";
+  return null;
+}
+function labeledRow(tree, name) { return cleanText(labeledCell(tree, name)); }
+function lawNameHeader(tree) {
+  const cell = labeledCell(tree, "法規名稱"), badge = byId(cell, "ctl00_cp_content_lawheader1_spanCauseCode");
+  const omitBadge = (node) => typeof node === "string" ? node : { ...node, children: node.children.filter((child) => child !== badge).map(omitBadge) };
+  return { name: cell ? cleanText(omitBadge(cell)) : "", display_name: cleanText(cell), status_label: cleanText(badge) };
 }
 function dateIso(text) {
   const match = /(?:民國\s*)?(\d{2,4})\s*[-/.年]\s*(\d{1,2})\s*[-/.月]\s*(\d{1,2})/.exec(text);
@@ -60,10 +66,11 @@ export function parseOfficialLaw(detail, history, expected) {
   const id = detailIdentity(detail.url, "kcg-laws");
   documentIdentity(tree, id, "kcg-laws"); documentIdentity(historyTree, id, "kcg-laws");
   if (new URL(history.url).pathname !== "/LawContentSource.aspx" || new URL(history.url).searchParams.get("id") !== id) fail("SOURCE_ID_MISMATCH", "法規沿革身分不一致");
-  const name = labeledRow(tree, "法規名稱");
-  if (!name || normalized(name) !== normalized(expected.title) || normalized(labeledRow(historyTree, "法規名稱")) !== normalized(name)) fail("SOURCE_ID_MISMATCH", "法規名稱與官方索引或沿革不一致");
+  const nameHeader = lawNameHeader(tree), historyNameHeader = lawNameHeader(historyTree), name = nameHeader.name;
+  if (!name || normalized(name) !== normalized(expected.title) || normalized(historyNameHeader.name) !== normalized(name) || nameHeader.status_label !== historyNameHeader.status_label) fail("SOURCE_ID_MISMATCH", "法規名稱與官方索引或沿革不一致");
   const category = labeledRow(tree, "法規體系"), publishedRaw = labeledRow(tree, "公發布日");
   const amendedRaw = labeledRow(tree, "修正日期") || labeledRow(tree, "廢止日期");
+  const ceasedRaw = labeledRow(tree, "廢止/停止適用日期");
   const contentNode = byId(tree, "ctl00_cp_content_divContent");
   const fullText = cleanText(contentNode), historyText = cleanText(byId(historyTree, "ctl00_cp_content_divLawContentSource"));
   if (!category || !fullText || !historyText) fail("SOURCE_STRUCTURE_CHANGED", "法規完整正文、分類或沿革缺漏");
@@ -74,6 +81,9 @@ export function parseOfficialLaw(detail, history, expected) {
     articles = markers.map((match, index) => ({ article_no: match[1].replace(/\s+/g, ""), content: fullText.slice(match.index + match[0].length, markers[index + 1]?.index ?? fullText.length).trim() }));
     if (new Set(articles.map((item) => item.article_no)).size !== articles.length || articles.some((item) => !item.content)) fail("SOURCE_STRUCTURE_CHANGED", "條文編號重複或正文空白");
   } else articles = [{ article_no: "全文", content: fullText }];
+  const cessationNotice = !!ceasedRaw && markers.length === 0 && fullText.length <= 1000 &&
+    normalized(fullText).startsWith(`「${normalized(name)}」`) && /(?:停止適用|廢止|整編至)/.test(fullText);
+  if (cessationNotice) articles = [];
   const attachmentAreas = allNodes(tree, (node) => /_(?:ul|tr)AnnFiles\d+$/.test(node.attrs.id || "") || (node.tag === "tr" && /附件[：:]?$/.test(normalized(cleanText(cells(node)[0])))));
   const attachmentLinks = new Set(attachmentAreas.flatMap((area) => allNodes(area, (node) => node.tag === "a")));
   for (const node of allNodes(tree, (node) => node.tag === "a" && node.attrs.href)) {
@@ -88,9 +98,13 @@ export function parseOfficialLaw(detail, history, expected) {
     return { title: cleanText(node), url: url.toString() };
   });
   return { law_id: id, law_name: name, category, published_at: dateIso(publishedRaw), published_at_source: publishedRaw,
+    law_record_type: cessationNotice ? "repeal_notice" : "law_text", articles_unavailable: cessationNotice, fulltext_complete: !cessationNotice,
+    ...(cessationNotice ? { notice_text: fullText } : {}),
+    ...(nameHeader.status_label ? { status_label: nameHeader.status_label, law_name_display_source: nameHeader.display_name } : {}),
+    ...(ceasedRaw ? { repealed_or_suspended_at: dateIso(ceasedRaw), repealed_or_suspended_at_source: ceasedRaw } : {}),
     ...(amendedRaw ? { amended_at: dateIso(amendedRaw), amended_at_source: amendedRaw } : {}), official_url: detail.url,
     history: historyText, history_source_url: history.url, history_raw_sha256: history.sha256, articles,
-    full_text: fullText, article_segmentation: markers.length ? "official-numbered-articles" : "unsegmented-full-text",
+    full_text: fullText, article_segmentation: cessationNotice ? "not-applicable-repeal-notice" : markers.length ? "official-numbered-articles" : "unsegmented-full-text",
     attachments, attachments_downloaded: false, legal_effect_verified: false };
 }
 export function parseOfficialNews(detail, expected) {
@@ -99,12 +113,12 @@ export function parseOfficialNews(detail, expected) {
   const titleNode = allNodes(tree, (node) => node.tag === "meta" && node.attrs.name === "DC.Subject")[0];
   const title = kind === "city" ? cleanText(allNodes(byClass(tree, "data_midlle_news_box01")[0], (node) => node.tag === "td")[0]) : titleNode?.attrs.content?.trim();
   if (!title || normalized(title) !== normalized(expected.title)) fail("SOURCE_ID_MISMATCH", "最新消息標題與官方索引不一致");
-  const listItem = (label) => allNodes(byId(tree, "data_midlle") || tree, (node) => node.tag === "li").map(cleanText).find((text) => text.startsWith(label))?.slice(label.length).trim() || "";
+  const listItem = (label) => allNodes(byId(tree, "data_midlle") || tree, (node) => node.tag === "li").map(cleanText).find((text) => text.startsWith(label))?.slice(label.length).trim();
   const agency = listItem("發布機關："), dateRaw = listItem("發布日期：");
   const content = byClass(tree, "data_midlle_news_box02").map(cleanText).filter(Boolean).join("\n\n");
-  if (!agency || !dateRaw || !content) fail("SOURCE_STRUCTURE_CHANGED", "最新消息正文、發布機關或日期缺漏");
+  if (agency === undefined || !dateRaw || !content) fail("SOURCE_STRUCTURE_CHANGED", "最新消息正文、發布機關或日期缺漏");
   if ((expected.agency && normalized(agency) !== normalized(expected.agency)) || dateIso(dateRaw) !== dateIso(expected.published_at)) fail("SOURCE_ID_MISMATCH", "新聞發布資訊與官方索引不一致");
-  return { news_id: id, source_native_id: nativeId, source_kind: kind, title, agency, publisher: agency, category: expected.category || "最新消息", published_at: dateIso(dateRaw), published_at_source: dateRaw,
+  return { news_id: id, source_native_id: nativeId, source_kind: kind, title, agency, publisher: agency, publisher_status: agency ? "provided" : "not_provided", publisher_source: agency ? "official-detail" : "official-detail-empty", category: expected.category || "最新消息", published_at: dateIso(dateRaw), published_at_source: dateRaw,
     content, content_summary: content, content_summary_kind: "official-full-text", source_link: detail.url,
     index_source_url: expected.index_url, index_raw_sha256: expected.index_raw_sha256 };
 }
@@ -375,6 +389,7 @@ export async function runOfficialCollection(options = {}, dependencies = {}) {
     return { profile, dataset: config.dataset, status: errorCode ? "blocked" : complete ? "complete" : "paused", continuation_required: !errorCode && !complete,
       checkpoint_path: checkpoint, run_id: state.run_id, record_count: state.records.length, segment_added: added, attempted: requests, succeeded: Object.keys(state.captures).length - startingCaptureCount, failed: errorCode ? 1 : 0,
       pages_processed: pages, coverage, receipt, error_code: errorCode, commit_state: receipt ? "committed" : "not-committed", raw_capture_count: Object.keys(state.captures).length, raw_validation: rawValidation,
-      caveats: profile === "kcg-laws" ? [options.downloadAttachments === false ? "已明確略過圖表附件 bytes，僅保存官方連結。" : "圖表附件保存官方原件 bytes；附件內文未另做OCR或條文解讀。", "法規效力需依原公告判斷。"] : [] };
+      ...(profile === "kcg-laws" ? { law_text_count: state.records.filter((record) => record.data.law_record_type !== "repeal_notice").length, repeal_notice_count: state.records.filter((record) => record.data.law_record_type === "repeal_notice").length } : {}),
+      caveats: profile === "kcg-laws" ? [options.downloadAttachments === false ? "已明確略過圖表附件 bytes，僅保存官方連結。" : "圖表附件保存官方原件 bytes；附件內文未另做OCR或條文解讀。", "Collection coverage僅表示目前官方頁面捕獲，不代表停止適用法規的歷史條文全文可取得。", "法規效力需依原公告判斷。"] : [] };
   } finally { store.close?.(); }
 }

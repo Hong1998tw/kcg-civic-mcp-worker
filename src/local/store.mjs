@@ -632,8 +632,12 @@ export class LocalStore {
       fail("FILTER_NOT_CONFIRMED", "本機排序欄位或頁面範圍無效");
     }
     const compare = (left, right) => {
-      const a = String(left.data[order.field] ?? "");
-      const b = String(right.data[order.field] ?? "");
+      // Match the meeting registry's date fallback before top-K truncation.
+      const value = (record) => order.field === "date"
+        ? record.data.date ?? record.data.meeting_date ?? record.retrieved_at
+        : record.data[order.field] ?? "";
+      const a = String(value(left));
+      const b = String(value(right));
       const difference = a < b ? -1 : a > b ? 1 : 0;
       return (order.descending ? -difference : difference) || (left.id < right.id ? -1 : left.id > right.id ? 1 : 0);
     };

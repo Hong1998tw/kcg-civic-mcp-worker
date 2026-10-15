@@ -3,7 +3,7 @@ import { mkdtemp, readFile, writeFile, realpath, rm, mkdir, symlink } from "node
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { runOfficialCollection, parseOfficialLaw } from "../src/ingestion/official-collection.mjs";
+import { runOfficialCollection, parseOfficialLaw, parseOfficialNews } from "../src/ingestion/official-collection.mjs";
 import { LocalStore } from "../src/local/store.mjs";
 
 // These are deliberately synthetic structural fixtures. They exercise the
@@ -108,6 +108,39 @@ try {
     const parsed = parseOfficialLaw(law, history, { title: "測試法規" });
     assert.equal(parsed.articles.length, 3); assert.equal(parsed.articles[1].content, "依第一條規定辦理。"); assert.equal(parsed.articles[2].article_no, "第二十八條"); assert.equal(parsed.history, "測試沿革");
     assert.throws(() => parseOfficialLaw(law, { ...history, url: historyUrl.replace("999999", "999998") }, { title: "測試法規" }), /沿革身分不一致/);
+  });
+  await test("廢停法規展示badge與真正名稱分離並保留官方停止適用日期", async () => {
+    const url = 'https://outlaw.kcg.gov.tw/LawContent.aspx?id=GL001565', historyUrl = 'https://outlaw.kcg.gov.tw/LawContentSource.aspx?id=GL001565';
+    const name = '高雄市政府所屬各機關購置公務車輛作業要點';
+    const badge = '<span id="ctl00_cp_content_lawheader1_spanCauseCode" class="label-fei">廢/停</span>';
+    const header = `<table><tr><th>法規名稱：</th><td>${badge}${name}</td></tr><tr><th>公發布日：</th><td>民國101年05月08日</td></tr><tr><th>廢止/停止適用日期：</th><td>民國107年12月31日</td></tr><tr><th>法規體系：</th><td>行政暨國際處</td></tr></table>`;
+    const detail = { url, bytes: Buffer.from(`<form action="${url}">${header}<div id="ctl00_cp_content_divContent">一、測試完整正文。</div></form>`) };
+    const history = { url: historyUrl, sha256: 'a'.repeat(64), bytes: Buffer.from(`<form action="${historyUrl}">${header}<div id="ctl00_cp_content_divLawContentSource">測試停止適用沿革。</div></form>`) };
+    const law = parseOfficialLaw(detail, history, { title: name });
+    assert.equal(law.law_name, name); assert.equal(law.status_label, '廢/停'); assert.equal(law.law_name_display_source, '廢/停' + name); assert.equal(law.repealed_or_suspended_at, '2018-12-31'); assert.equal(law.legal_effect_verified, false);
+    assert.equal(law.law_record_type, 'law_text'); assert.equal(law.fulltext_complete, true);
+    const noticeText = `「${name}」自中華民國107年12月31日起停止適用。`;
+    const noticeDetail = { ...detail, bytes: Buffer.from(detail.bytes.toString().replace('一、測試完整正文。', noticeText)) };
+    const notice = parseOfficialLaw(noticeDetail, history, { title: name });
+    assert.equal(notice.law_record_type, 'repeal_notice'); assert.equal(notice.articles_unavailable, true); assert.equal(notice.fulltext_complete, false); assert.deepEqual(notice.articles, []); assert.equal(notice.notice_text, noticeText); assert.equal(notice.full_text, noticeText); assert.equal(notice.article_segmentation, 'not-applicable-repeal-notice');
+    assert.throws(() => parseOfficialLaw(detail, history, { title: '不同法規名稱' }), /法規名稱與官方索引或沿革不一致/);
+    const changedHistory = { ...history, bytes: Buffer.from(history.bytes.toString().replaceAll(name, '另一個法規名稱')) };
+    assert.throws(() => parseOfficialLaw(detail, changedHistory, { title: name }), /法規名稱與官方索引或沿革不一致/);
+    const plainPrefix = { ...detail, bytes: Buffer.from(detail.bytes.toString().replace(badge, '廢/停')) };
+    assert.throws(() => parseOfficialLaw(plainPrefix, history, { title: name }), /法規名稱與官方索引或沿革不一致/);
+  });
+  await test("官方新聞明示空發布機關保留未知，缺欄或缺正文仍拒絕", async () => {
+    const url = 'https://www.kcg.gov.tw/CityNews_Detail1.aspx?n=3A379BB94CA5F12D&ss=598182DA152F961C';
+    const html = `<form action="${url}"><div class="data_midlle_news_box01"><table><tr><td>測試新聞空發布者</td></tr></table></div><div id="data_midlle"><li><span>發布日期：</span>115-10-01</li><li><span>發布機關：</span></li><div class="data_midlle_news_box02"><p>原件完整正文。</p></div></div></form>`;
+    const expected = { title: '測試新聞空發布者', category: '市政新聞', published_at: '115-10-01' }, captured = (source) => ({ url, bytes: Buffer.from(source) });
+    const item = parseOfficialNews(captured(html), expected);
+    assert.equal(item.agency, ''); assert.equal(item.publisher, ''); assert.equal(item.publisher_status, 'not_provided'); assert.equal(item.publisher_source, 'official-detail-empty'); assert.equal(item.content, '原件完整正文。');
+    const provided = parseOfficialNews(captured(html.replace('<span>發布機關：</span></li>', '<span>發布機關：</span>官方明示機關</li>')), expected);
+    assert.equal(provided.publisher, '官方明示機關'); assert.equal(provided.publisher_status, 'provided'); assert.equal(provided.publisher_source, 'official-detail');
+    assert.throws(() => parseOfficialNews(captured(html.replace('<li><span>發布機關：</span></li>', '')), expected), /正文、發布機關或日期缺漏/);
+    assert.throws(() => parseOfficialNews(captured(html.replace('<p>原件完整正文。</p>', '')), expected), /正文、發布機關或日期缺漏/);
+    assert.throws(() => parseOfficialNews(captured(html.replace('<li><span>發布日期：</span>115-10-01</li>', '')), expected), /正文、發布機關或日期缺漏/);
+    assert.throws(() => parseOfficialNews(captured(html), { ...expected, agency: '索引有機關但明細為空' }), /發布資訊與官方索引不一致/);
   });
   await test("法規附件預設保存原件，request中斷後續作不遺失", async () => {
     const root = path.join(base, "law-attachments"), lawUrl = "https://outlaw.kcg.gov.tw/LawContent.aspx?id=GL999999", historyUrl = "https://outlaw.kcg.gov.tw/LawContentSource.aspx?id=GL999999";

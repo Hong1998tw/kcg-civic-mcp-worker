@@ -55,3 +55,43 @@ n8n 的執行紀錄、binary data 或 Data Tables 不作正文語料庫；執行
 正式切換前仍須確認：所有需要的來源採集器、分頁與 tab、資料覆蓋／缺漏、備份還原、來源更新與下架、實際用戶端的 HTTPS／認證與工具呼叫。舊 Worker／R2 只有在替代服務及回滾 Gate 通過、且有對應切換授權時才調整或退役。
 
 備份需包含一致的 SQLite、歷史快照、原始檔、版本清單及秘密的原生安全備份。不可只複製執行中的 SQLite 主檔；應使用 SQLite backup，或停止本次 writer、確認 journal 終態後備份，並做還原查詢與 hash 驗證。同 NAS 的第二磁碟不等於異地備援。
+
+## 可攜式 NAS Compose 模板
+
+`compose.nas.yaml` 是可攜式角色與隔離設定模板，供 NAS 本機環境填入實際路徑與既有 tunnel network 名稱後檢查。它不代表目前 NAS 的即時部署狀態；專案狀態、實際部署與收錄範圍仍以本文件開頭所列 MCP 主檔與 CTX 為準。
+
+| 角色 | 本機資料與網路權限 | 容器隔離 |
+| --- | --- | --- |
+| `jobs` | `data` 與 `queue` 可寫；加入 `ingestion` 官方來源採集網路 | UID 1000、唯讀根檔案系統、1.5 CPU、1024 MiB、200 秒停止寬限 |
+| `query` | `data` 唯讀、`auth` 可寫、Bearer 與 owner key 以唯讀檔案 secret 注入；只加入 `local_private` 內部網路 | UID 1000、唯讀根檔案系統、384 MiB；沒有 host port |
+| `ingress` | 沒有資料 volume 或 secret；同時加入 `local_private` 與既有 tunnel network，以 `kcg-civic-ingress` alias 提供固定 Host 入口 | 可選 `tunnel` profile、UID 1000、唯讀根檔案系統、`cap_drop: ALL`；沒有 host port |
+
+三個服務共用 `CIVIC_LOCAL_IMAGE` 指定的同一映像。模板沒有 `build` 區塊；先在 NAS 本機明確建置 `Dockerfile.local`，再由 Compose 使用本機映像，避免隱性拉取或在 NAS 上改用不同來源建置。
+
+| Compose 變數 | 用途 |
+| --- | --- |
+| `CIVIC_LOCAL_IMAGE` | 本機建立並供三個角色共用的映像標籤 |
+| `CIVIC_DATA_DIR` | NAS 本機原生檔案系統上的資料目錄；禁止指向 SMB／NFS 掛載 |
+| `CIVIC_AUTH_DIR` | NAS 本機原生檔案系統上的私有 OAuth SQLite 目錄 |
+| `CIVIC_QUEUE_DIR` | NAS 本機原生檔案系統上的工作佇列目錄 |
+| `CIVIC_MCP_ACCESS_KEY_FILE` | MCP Bearer key 的私有檔案路徑參照 |
+| `CIVIC_OAUTH_OWNER_KEY_FILE` | OAuth owner login key 的獨立私有檔案路徑參照 |
+| `CIVIC_PUBLIC_HOST` | OAuth issuer 與 ingress 使用的精確公開 hostname |
+| `CIVIC_TUNNEL_NETWORK` | 已存在 Cloudflare Tunnel Docker network 的名稱 |
+
+以上路徑、image 標籤、hostname 與 network 名稱由每台 NAS 的本機環境提供，不應把實際 NAS 路徑或秘密值提交到 repo。Bearer key 與 owner login key 是不同用途、不同檔案；Compose 只將檔案掛載為唯讀 secret，不使用 `MCP_ACCESS_KEY` 之類的明文環境值。兩個 secret 檔由 UID 1000 擁有，權限限制為該 UID 可讀；auth 目錄由 UID 1000 擁有且維持私有目錄權限。
+
+資料目錄只由 `jobs` 寫入，`query` 以唯讀方式開啟；SQLite/OAuth 狀態留在獨立 `auth` 目錄，工作 request/receipt 留在 `queue`。n8n 來源工作流在 repo 的 `n8n/` 目錄；執行時需將同一 NAS-native queue 目錄掛載到 worker 的 `/jobs` 與 n8n 設定的工作流可見路徑。n8n 不掛載語料資料或 OAuth DB。完整官方原始檔與供查詢使用的全文索引是不同產物：索引可支援搜尋，但不能替代原件、來源雜湊或完整性驗證。
+
+`query` 僅接 `local_private`，該網路設為 `internal: true`；官方來源出站只由 `jobs` 經 `ingestion` 網路執行。`ingress` 僅連到 query 與既有 tunnel network，固定轉送至 `http://query:8787`，監聽容器內 `8788`。Tunnel origin 應使用該服務的 `kcg-civic-ingress` alias、保留 `CIVIC_PUBLIC_HOST` 作為 Host，並選擇啟用 `tunnel` profile。模板不發布任何 host port。
+
+Query 的 `OAUTH_ISSUER_URL` 固定由 `https://${CIVIC_PUBLIC_HOST}` 組成；owner consent 頁面由同一 issuer 提供。支援的 MCP OAuth 用戶端由伺服器端 SDK 執行授權碼與 PKCE 流程。直接從另一個網站 origin 以瀏覽器跨來源呼叫 MCP 尚未提供 CORS 支援。健康探測使用 Node 原生 `node:http` 的 `http.get`，明確傳入 `Host: ${CIVIC_PUBLIC_HOST}`；不要用 `fetch` 設定自訂 Host，該探測方式可能忽略覆寫而得到 403。
+
+`Dockerfile.local` 的映像建置與 Compose 啟動分開執行。設定本機必要變數與唯讀 secret 檔後，先在 shell 匯出同一個 `CIVIC_LOCAL_IMAGE` 並建置映像；Compose 則從當前環境或未追蹤的本機 `.env` 讀取其他變數。檢查 Compose 展開結果；只有在核對來源目錄位於 NAS 本機原生檔案系統、external tunnel network 已存在且 UID 權限正確後，才執行服務更新：
+
+```sh
+docker build -f Dockerfile.local -t "$CIVIC_LOCAL_IMAGE" .
+docker compose -f compose.nas.yaml --profile tunnel config --quiet
+```
+
+OAuth 備份需同時保存可一致還原的 `auth` SQLite 狀態與 Proton Pass 中的秘密參照及復原資訊。不要只複製執行中的 `oauth.sqlite` 主檔，也不要將 Bearer 或 owner key 值寫入 `.env`、Compose、repo、日誌或一般備份說明。備份後要在隔離位置驗證 SQLite 還原與兩個秘密參照的安全取回流程；此流程不改變本文件所列唯一專案狀態來源。

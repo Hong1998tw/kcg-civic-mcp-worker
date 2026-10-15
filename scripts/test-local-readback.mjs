@@ -29,6 +29,49 @@ try {
   const registry = module.exports.createLocalRegistry(store);
   const latest = await registry.find((tool) => tool.name === 'get_kcg_latest_news').handler({ limit: 3 });
   assert.equal(latest.data[0].news_id, records.at(-1).id);
+  const unknownNews = structuredClone(records.at(-1));
+  unknownNews.id = unknownNews.data.news_id = 'city:FFFFFFFFFFFFFFF0';
+  unknownNews.data.source_link = unknownNews.source_url = 'https://www.kcg.gov.tw/CityNews_Detail1.aspx?ss=FFFFFFFFFFFFFFF0';
+  unknownNews.data.agency = ''; unknownNews.data.publisher_status = 'not_provided';
+  await store.importSnapshot({ dataset: 'kcg-news', snapshot_id: 'TEST-publisher-not-provided', coverage: { scope: 'TEST complete source with unknown publisher', complete: true, source_total: 1006 }, records: [...records, unknownNews], raw_objects: [], parser_version: 'TEST', validator_version: 'TEST', validation_status: 'passed' });
+  const agencyNews = await registry.find((tool) => tool.name === 'get_kcg_latest_news').handler({ limit: 3, agency: 'TEST' });
+  assert.equal(agencyNews.status, 'partial'); assert.equal(agencyNews.meta.publisher_not_provided_count, 1);
+
+  const meetings = Array.from({ length: 1005 }, (_, i) => {
+    const id = String(10000 + i), pdf = `https://cissearch.kcc.gov.tw/Upload/Attachment/MeetingRecord/${id}/TEST.pdf`;
+    return { id, title: 'TEST 議事', text: 'TEST 全文', data: { record_id: id, term: 4, date: new Date(Date.UTC(2020, 0, 1) + i * 86400000).toISOString(), meeting_name: 'TEST 議事', pdf_url: pdf, total_pages: 1, pages: [{ page: 1, text: i === 1004 ? 'TEST 最新關鍵字' : 'TEST 舊內容' }] }, source_url: pdf, retrieved_at: '2026-10-15T00:00:00Z', raw_sha256: rawHash };
+  });
+  const doc = 'https://cissearch.kcc.gov.tw/Upload/Attachment/MeetingRecord/99999/TEST.doc';
+  const unindexed = { id: '99999', title: 'TEST Word原件', text: 'TEST Word尚未索引', data: { record_id: '99999', term: 4, date: '2031-01-01', meeting_name: 'TEST Word', pages: [], total_pages: null, pdf_url: null, original_files: [{ download_url: doc, file_type: 'doc' }], original_versions: [{ source_url: doc, raw_sha256: rawHash, byte_length: raw.length, file_type: 'doc' }], content_index_status: 'unindexed_non_pdf', fulltext_complete: false, originals_complete: true }, source_url: doc, retrieved_at: '2026-10-15T00:00:00Z', raw_sha256: rawHash };
+  await store.importSnapshot({ dataset: 'kcc-meeting-records', snapshot_id: 'TEST-global-meetings-with-doc', coverage: { scope: 'TEST all original files; Word text pending', complete: false, source_total: 1006 }, records: [...meetings, unindexed], raw_objects: [], parser_version: 'TEST', validator_version: 'TEST', validation_status: 'passed' });
+  const cross = await registry.find((tool) => tool.name === 'kcc_search_meeting_record_content').handler({ keyword: '最新關鍵字', limit_records: 2 });
+  assert.equal(cross.status, 'partial');
+  assert.equal(cross.data.records[0].record_id, '11004');
+  assert.equal(cross.data.failed_records_count, 1);
+  assert.equal(cross.data.failures[0].reason_code, 'SOURCE_FULLTEXT_UNAVAILABLE');
+  assert.equal(cross.meta.unindexed_records, 1);
+  assert.equal(cross.meta.omitted_local_records, 1004);
+  const fallback = structuredClone(meetings.at(-1));
+  fallback.id = '88888'; fallback.data.record_id = '88888';
+  fallback.data.pdf_url = fallback.source_url = 'https://cissearch.kcc.gov.tw/Upload/Attachment/MeetingRecord/88888/TEST.pdf';
+  delete fallback.data.date; fallback.data.meeting_date = '2032-01-01'; fallback.data.pages[0].text = 'TEST 日期備援';
+  await store.importSnapshot({ dataset: 'kcc-meeting-records', snapshot_id: 'TEST-meeting-date-fallback', coverage: { scope: 'TEST date fallback', complete: false, source_total: 1007 }, records: [...meetings, unindexed, fallback], raw_objects: [], parser_version: 'TEST', validator_version: 'TEST', validation_status: 'passed' });
+  const newestFallback = await registry.find((tool) => tool.name === 'kcc_search_meeting_record_content').handler({ keyword: '日期備援', limit_records: 1 });
+  assert.equal(newestFallback.data.records[0].record_id, '88888');
+  const meetingGet = registry.find((tool) => tool.name === 'kcc_get_meeting_record');
+  await assert.rejects(meetingGet.handler({ record_id: '99999' }), (error) => error.reasonCode === 'SOURCE_FULLTEXT_UNAVAILABLE');
+  const exactPdf = meetings.at(-1).data.pdf_url;
+  assert.equal((await meetingGet.handler({ record_id: '11004', pdf_url: exactPdf })).data.total_pages, 1);
+  await assert.rejects(meetingGet.handler({ record_id: '11004', pdf_url: exactPdf.replace('11004', '11003') }), (error) => error.reasonCode === 'SOURCE_ID_MISMATCH');
+  const keywordSearch = await registry.find((tool) => tool.name === 'search_kcg_council_interpellations').handler({ keyword: '不存在的TEST詞' });
+  assert.equal(keywordSearch.status, 'partial'); assert.equal(keywordSearch.meta.unindexed_records, 1);
+
+  const lawUrl = 'https://outlaw.kcg.gov.tw/LawContent.aspx?id=GL001565';
+  const repeal = { id: 'GL001565', title: 'TEST 廢止要點', text: 'TEST 自某日起停止適用', data: { law_id: 'GL001565', law_name: 'TEST 廢止要點', category: 'TEST', published_at: '2018-12-31', official_url: lawUrl, articles: [], law_record_type: 'repeal_notice', articles_unavailable: true, fulltext_complete: false, notice_text: 'TEST 自某日起停止適用' }, source_url: lawUrl, retrieved_at: '2026-10-15T00:00:00Z', raw_sha256: rawHash };
+  await store.importSnapshot({ dataset: 'kcg-laws', snapshot_id: 'TEST-repeal-not-fulltext', coverage: { scope: 'TEST current official notice', complete: true, source_total: 1 }, records: [repeal], raw_objects: [], parser_version: 'TEST', validator_version: 'TEST', validation_status: 'passed' });
+  const lawSearch = await registry.find((tool) => tool.name === 'search_kcg_laws').handler({ keyword: '廢止要點' });
+  assert.equal(lawSearch.data[0].law_record_type, 'repeal_notice'); assert.equal(lawSearch.data[0].articles_unavailable, true);
+  await assert.rejects(registry.find((tool) => tool.name === 'get_kcg_law_detail').handler({ law_id: 'GL001565' }), (error) => error.reasonCode === 'SOURCE_FULLTEXT_UNAVAILABLE');
 
   const detailUrl = 'https://cissearch.kcc.gov.tw/System/Proposal/Detail.aspx?s=DEADBEEF1234ABCD&ct=TEST';
   const detailHtml = Buffer.from('<input name="ctl00$ContentPlaceHolder1$uscAttachment$hidDataSN" id="ContentPlaceHolder1_uscAttachment_hidDataSN" value="100"><input name="ctl00$ContentPlaceHolder1$uscAttachment$hidDataType" id="ContentPlaceHolder1_uscAttachment_hidDataType" value="1">');
@@ -51,5 +94,5 @@ try {
   await store.importSnapshot({ dataset: 'kcc-proposal-details', snapshot_id: 'TEST-conflicting-detail', coverage: { scope: 'TEST', complete: true, source_total: 1 }, records: [{ ...detail, raw_sha256: conflictHash }], raw_objects: [{ sha256: conflictHash, bytes_base64: conflict.toString('base64') }], parser_version: 'TEST', validator_version: 'TEST', validation_status: 'passed' });
   await assert.rejects(get.handler({ proposal_sn: '100' }), (error) => error.reasonCode === 'SOURCE_ID_MISMATCH');
   store.close();
-  console.log('PASS full-snapshot top-K beyond 1000, encrypted detail raw identity, conflicting identity rejection, cache tamper/mtime restoration');
+  console.log('PASS global news/meeting top-K beyond 1000, Word original and repeal notice honesty, exact PDF URL, encrypted detail raw identity, conflicting identity rejection, cache tamper/mtime restoration');
 } finally { fs.rmSync(root, { recursive: true, force: true }); }
