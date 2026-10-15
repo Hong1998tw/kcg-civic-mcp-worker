@@ -3,6 +3,7 @@ import { mkdir, readFile, writeFile, rename, lstat, unlink, realpath } from 'nod
 import path from 'node:path';
 import { CollectorError, fetchBounded, loadTypeScriptParser, sha256Bytes } from './collector.mjs';
 import { PROPOSAL_URL, MEETING_URL, KCC_HOST, PREFIX, MEETING_PREFIX, controls, optionsFor, assertQuery, parseProposalTabs, parseMeetingPage, parseDetail, parseAttachments, official } from './kcc-html.mjs';
+import { KccEnrichmentStage, enrichmentBatchReady } from './kcc-enrichment-stage.mjs';
 
 const VERSION = 'kcc-all-tabs-resumable-v1';
 export const KCC_PROFILE_MANIFEST = Object.freeze({
@@ -429,6 +430,547 @@ async function collectPdfs(ctx) {
   }
 }
 
+const ENRICHMENT_V2_PARSER = 'kcc-enrichment-v2';
+const ENRICHMENT_V2_VALIDATOR = 'official-raw-envelope-page-refs-v2';
+
+function sameV2Release(left, right) {
+  return Boolean(left && right && ['dataset', 'snapshot_id', 'manifest_sha256', 'record_count'].every((key) => left[key] === right[key]));
+}
+
+async function activeV2Release(ctx, dataset) {
+  if (typeof ctx.store.queryV2 !== 'function') throw new CollectorError('STORE_API_UNAVAILABLE', '缺少 LocalStore.queryV2 原生 active release 核對 API');
+  try {
+    const result = await ctx.store.queryV2(dataset, { limit: 0, metadataOnly: true });
+    return result.release || null;
+  } catch (error) {
+    const code = error.reasonCode || error.code;
+    if (['LOCAL_DATA_UNAVAILABLE', 'NO_ACTIVE_RELEASE'].includes(code)) return null;
+    throw error;
+  }
+}
+
+async function readV2Archive(ctx, release) {
+  if (!release) return [];
+  if (typeof ctx.store.readSnapshotVersionV2 !== 'function') throw new CollectorError('STORE_API_UNAVAILABLE', '缺少 v2 archive descriptor 原生讀取 API');
+  const archived = await ctx.store.readSnapshotVersionV2(release.dataset, release.snapshot_id);
+  if (!sameV2Release(release, archived) || archived.records?.length !== release.record_count) throw new CollectorError('RELEASE_DRIFT', `${release.dataset} v2 archive 與 active receipt 不一致`);
+  return archived.records;
+}
+
+async function loadV2Codec(ctx) {
+  if (ctx.v2Codec) return ctx.v2Codec;
+  ctx.v2Codec = await import('../local/kcc-payload.mjs');
+  if (typeof ctx.v2Codec.packKccV2PdfPage !== 'function' || typeof ctx.v2Codec.packKccV2Record !== 'function') {
+    throw new CollectorError('STORE_API_UNAVAILABLE', 'KCC payload v2 page/record pack API 尚未就緒');
+  }
+  return ctx.v2Codec;
+}
+
+function recordPageGroups(record) {
+  const data = record.data || {};
+  const groups = [];
+  const versions = Array.isArray(data.pdf_versions) ? data.pdf_versions : [];
+  const selected = data.pdf_url
+    ? [...versions].reverse().find((version) => [version?.pdf_url, version?.source_url, version?.download_url].includes(data.pdf_url))
+    : versions.at(-1);
+  if (Array.isArray(data.pages)) groups.push({ pages: data.pages, version: selected || { source_url: data.pdf_url || record.source_url, raw_sha256: data.raw_sha256 || record.raw_sha256 } });
+  for (const version of versions) if (Array.isArray(version?.pages)) groups.push({ pages: version.pages, version });
+  for (const version of Array.isArray(data.original_versions) ? data.original_versions : []) if (Array.isArray(version?.pages)) groups.push({ pages: version.pages, version });
+  return groups;
+}
+
+function assignPath(root, parts, value) {
+  let cursor = root;
+  for (const part of parts.slice(0, -1)) cursor = cursor[part];
+  cursor[parts.at(-1)] = value;
+}
+
+async function packRecordV2(ctx, dataset, sourceRecord, savedPageRefs = []) {
+  const codec = await loadV2Codec(ctx);
+  const record = structuredClone(sourceRecord);
+  const pageRefs = [...savedPageRefs];
+  const byPage = new Map(pageRefs.map((entry) => [`${entry.page_ref.raw_sha256}:${entry.page_ref.page_number}`, entry]));
+  const data = record.data || {};
+  const groups = recordPageGroups(record);
+  const paths = [];
+  if (Array.isArray(data.pages)) {
+    const versions = Array.isArray(data.pdf_versions) ? data.pdf_versions : [];
+    const selected = data.pdf_url ? [...versions].reverse().find((version) => [version?.pdf_url, version?.source_url, version?.download_url].includes(data.pdf_url)) : versions.at(-1);
+    paths.push({ path: ['pages'], pages: data.pages, version: selected || { source_url: data.pdf_url || record.source_url, raw_sha256: data.raw_sha256 || record.raw_sha256 } });
+  }
+  for (const [index, version] of (Array.isArray(data.pdf_versions) ? data.pdf_versions : []).entries()) if (Array.isArray(version?.pages)) paths.push({ path: ['pdf_versions', index, 'pages'], pages: version.pages, version });
+  for (const [index, version] of (Array.isArray(data.original_versions) ? data.original_versions : []).entries()) if (Array.isArray(version?.pages)) paths.push({ path: ['original_versions', index, 'pages'], pages: version.pages, version });
+  for (const group of paths) {
+    const version = group.version || {};
+    const rawSha = version.raw_sha256 || record.raw_sha256;
+    const source = version.source_url || version.download_url || version.pdf_url || record.source_url;
+    if (!/^[a-f0-9]{64}$/i.test(rawSha || '') || !source) throw new CollectorError('PAGE_REF_INVALID', `${record.id} PDF 頁面缺少來源與 raw SHA-256`);
+    const cleanPages = [];
+    for (const page of group.pages) {
+      if (!Number.isInteger(page?.page) || page.page < 1) throw new CollectorError('PAGE_REF_INVALID', `${record.id} PDF 頁碼無效`);
+      const key = `${rawSha.toLowerCase()}:${page.page}`;
+      let packed = byPage.get(key);
+      if (!packed && typeof page.text === 'string') {
+        packed = await codec.packKccV2PdfPage(ctx.store.derivedStore, {
+          dataset, id: record.id, source, raw_sha256: rawSha, page_number: page.page, text: page.text,
+        });
+        byPage.set(key, packed); pageRefs.push(packed);
+      }
+      if (!packed) throw new CollectorError('PAGE_REF_MISSING', `${record.id} 第 ${page.page} 頁缺少既存 PDF derived ref`);
+      const clean = { ...page }; delete clean.text; cleanPages.push(clean);
+    }
+    assignPath(record.data, group.path, cleanPages);
+  }
+  const result = await codec.packKccV2Record(ctx.store.derivedStore, { dataset, record, page_refs: pageRefs });
+  if (!result?.descriptor) throw new CollectorError('DESCRIPTOR_MISSING', `${record.id} KCC v2 pack 未回傳 descriptor`);
+  return { descriptor: result.descriptor, page_refs: pageRefs };
+}
+
+function sourceRecordIds(rows) { return rows.map((row) => row.id); }
+
+function batchKey(profile, scope, mother, start, end, candidates) {
+  const summaries = Object.fromEntries(Object.entries(candidates).map(([dataset, value]) => [dataset, {
+    snapshot_id: value.header.snapshot_id,
+    record_count: value.records.length,
+    descriptors_sha256: digest(value.records),
+  }]));
+  return digest({ profile, scope, mother, start, end, summaries }).slice(0, 48);
+}
+
+async function makeV2Candidates(ctx, stage, datasets, sourceTotal, complete) {
+  const staged = await stage.readPreparedRecords();
+  const candidates = {}, baseReleases = {};
+  for (const dataset of datasets) {
+    const active = await activeV2Release(ctx, dataset);
+    const priorReceipt = stage.journal.receipts[dataset] || null;
+    if (!sameV2Release(active, priorReceipt) && !(active === null && priorReceipt === null)) {
+      throw new CollectorError('RELEASE_DRIFT', `${dataset} active v2 release 與 staging 已確認收據不同`);
+    }
+    baseReleases[dataset] = active;
+    const prior = await readV2Archive(ctx, active);
+    const pendingRows = staged[dataset] || [];
+    const merged = new Map(prior.map((descriptor) => [descriptor.id, descriptor]));
+    for (const descriptor of pendingRows) {
+      if (merged.has(descriptor.id)) throw new CollectorError('SOURCE_ID_MISMATCH', `${dataset} staged descriptor 重複既有 prefix id=${descriptor.id}`);
+      merged.set(descriptor.id, descriptor);
+    }
+    const records = [...merged.values()].sort((left, right) => left.id.localeCompare(right.id));
+    const snapshotId = `kcc-v2-${digest({ dataset, scope: ctx.scope, mother: stage.journal.mother_release, end: stage.journal.prepared_cursor, records }).slice(0, 40)}`;
+    const header = {
+      schema_version: 'local-snapshot-v2', dataset, snapshot_id: snapshotId,
+      coverage: { scope: ctx.scope, complete, source_total: sourceTotal },
+      parser_version: ENRICHMENT_V2_PARSER, validator_version: ENRICHMENT_V2_VALIDATOR, validation_status: 'passed',
+    };
+    candidates[dataset] = { header, records };
+  }
+  return { candidates, baseReleases };
+}
+
+function v2ReceiptMatches(receipt, dataset, candidate) {
+  return Boolean(receipt && receipt.dataset === dataset && receipt.snapshot_id === candidate.header.snapshot_id &&
+    receipt.record_count === candidate.records.length && /^[a-f0-9]{64}$/i.test(receipt.manifest_sha256 || ''));
+}
+
+async function verifyV2Candidate(ctx, dataset, candidate, receipt = null) {
+  const archived = await ctx.store.readSnapshotVersionV2(dataset, candidate.header.snapshot_id);
+  if (archived.dataset !== dataset || archived.snapshot_id !== candidate.header.snapshot_id ||
+      archived.record_count !== candidate.records.length || archived.records.length !== candidate.records.length ||
+      archived.records.some((descriptor, index) => JSON.stringify(descriptor) !== JSON.stringify(candidate.records[index])) ||
+      !/^[a-f0-9]{64}$/i.test(archived.manifest_sha256 || '')) {
+    throw new CollectorError('READBACK_MISMATCH', `${dataset} v2 archive descriptors 原生讀回不一致`);
+  }
+  const active = await activeV2Release(ctx, dataset);
+  if (!active || active.snapshot_id !== candidate.header.snapshot_id || active.manifest_sha256 !== archived.manifest_sha256 || active.record_count !== candidate.records.length) {
+    throw new CollectorError('READBACK_MISMATCH', `${dataset} v2 active release 未指向候選 archive`);
+  }
+  if (receipt && (!v2ReceiptMatches(receipt, dataset, candidate) || receipt.manifest_sha256 !== archived.manifest_sha256)) {
+    throw new CollectorError('RECEIPT_INVALID', `${dataset} v2 import receipt 與原生 archive 不一致`);
+  }
+  return receipt || {
+    status: 'unchanged', schema_version: 'local-snapshot-v2', dataset,
+    snapshot_id: candidate.header.snapshot_id, record_count: candidate.records.length,
+    coverage: candidate.header.coverage, manifest_sha256: archived.manifest_sha256, idempotent: true,
+  };
+}
+
+async function publishV2Stage(ctx, stage, datasets, sourceTotal, complete) {
+  if (ctx.verifyMotherRelease) {
+    const activeMother = await ctx.verifyMotherRelease();
+    if (!sameRelease(activeMother, stage.journal.mother_release)) throw new CollectorError('DEPENDENCY_DRIFT', 'enrichment 發布期間母集 active release 改變，拒絕推進 cursor');
+  }
+  let pendingDoc = await stage.readPending();
+  if (!pendingDoc) {
+    const { candidates, baseReleases } = await makeV2Candidates(ctx, stage, datasets, sourceTotal, complete);
+    const key = batchKey(ctx.config.profile, ctx.scope, stage.journal.mother_release, stage.journal.committed_cursor, stage.journal.prepared_cursor, candidates);
+    await stage.writePending(key, candidates, baseReleases);
+    pendingDoc = await stage.readPending();
+  }
+  const receipts = {};
+  for (const dataset of datasets) {
+    const candidate = pendingDoc.candidates[dataset], pendingRef = stage.journal.pending_ref;
+    if (!candidate || !pendingRef) throw new CollectorError('PENDING_INVALID', `${dataset} pending candidate 缺漏`);
+    const base = pendingRef.base_releases[dataset] || null;
+    const active = await activeV2Release(ctx, dataset);
+    const confirmed = pendingRef.confirmed[dataset];
+    if (confirmed) {
+      if (!sameV2Release(active, confirmed)) throw new CollectorError('RELEASE_DRIFT', `${dataset} 已確認部分發布後 active release 改變`);
+      receipts[dataset] = await verifyV2Candidate(ctx, dataset, candidate, confirmed);
+      continue;
+    }
+    const sameCandidate = active?.snapshot_id === candidate.header.snapshot_id;
+    const sameBase = sameV2Release(active, base) || (!active && !base);
+    if (!sameCandidate && !sameBase) throw new CollectorError('RELEASE_DRIFT', `${dataset} 發布期間 active release 漂移，拒絕覆蓋`);
+    if (sameCandidate) {
+      receipts[dataset] = await verifyV2Candidate(ctx, dataset, candidate);
+      await stage.updatePendingDataset(dataset, { state: 'confirmed', receipt: receipts[dataset] });
+      continue;
+    }
+    await stage.updatePendingDataset(dataset, { state: 'publishing' });
+    try {
+      const receipt = await ctx.store.importV2({ ...candidate.header, records: candidate.records });
+      receipts[dataset] = await verifyV2Candidate(ctx, dataset, candidate, receipt);
+      await stage.updatePendingDataset(dataset, { state: 'confirmed', receipt: receipts[dataset] });
+    } catch (error) {
+      await stage.updatePendingDataset(dataset, { state: 'unknown' }).catch(() => {});
+      throw error;
+    }
+  }
+  await stage.commitPending(receipts);
+  return receipts;
+}
+
+export async function publishKccEnrichmentV2Stage(ctx, stage, datasets, sourceTotal, complete) {
+  return publishV2Stage(ctx, stage, datasets, sourceTotal, complete);
+}
+
+function candidateComplete(profile, cursor, total, dependency) {
+  return cursor === total && dependency?.coverage?.complete === true && profile !== 'kcc-meeting-records';
+}
+
+async function captureAndPrepareDetail(ctx, stage, row, cursor) {
+  const id = row.id;
+  let work = await stage.readWork(id) || { id, detail: null, attachments: null, list: null, downloaded: 0, estimated_bytes: 0 };
+  if (!Number.isSafeInteger(work.estimated_bytes) || work.estimated_bytes < 0) work.estimated_bytes = 0;
+  if (!work.detail) {
+    const url = official(row.data.detail_url.replace(/(?:%27|')$/i, ''), PROPOSAL_URL);
+    if (new URL(url).pathname !== '/System/Proposal/Detail.aspx') throw new CollectorError('URL_REJECTED', '提案詳情來源必須為Detail.aspx');
+    const response = await capture(ctx, url); const data = parseDetail(response.html, id, response.url);
+    work.detail = { id, title: data.subject, text: [data.subject, data.explanation, data.method, data.remarks].filter(Boolean).join('\n'), data: { ...row.data, ...data }, source_url: response.url, raw_sha256: response.sha256, retrieved_at: response.retrieved_at };
+    work.estimated_bytes = Buffer.byteLength(JSON.stringify(work.detail), 'utf8');
+    await stage.saveWork(id, work);
+  }
+  if (work.attachments === null) {
+    const url = `https://${KCC_HOST}/Common/GetAttachmentList.ashx?f=1&s=${id}&t=False`;
+    const response = await capture(ctx, url, { headers: { Referer: work.detail.source_url, 'X-Requested-With': 'XMLHttpRequest', Cookie: [...ctx.cookies].map(([key, value]) => `${key}=${value}`).join('; ') } });
+    const actual = new URL(response.url);
+    if (actual.pathname !== '/Common/GetAttachmentList.ashx' || actual.searchParams.get('s') !== id) throw new CollectorError('SOURCE_ID_MISMATCH', '附件清單來源不一致');
+    work.attachments = parseAttachments(response.html, id); work.list = { source_url: response.url, raw_sha256: response.sha256, retrieved_at: response.retrieved_at };
+    work.estimated_bytes += Buffer.byteLength(JSON.stringify(work.attachments), 'utf8');
+    await stage.saveWork(id, work);
+  }
+  while (work.downloaded < work.attachments.length) {
+    const attachment = work.attachments[work.downloaded];
+    assertOriginalIdentity(attachment.download_url, attachment.download_url, 'Proposal', id);
+    const response = await capture(ctx, attachment.download_url, { maxBytes: 64 * 1024 * 1024, headers: { Referer: work.detail.source_url } });
+    assertOriginalIdentity(attachment.download_url, response.url, 'Proposal', id);
+    if (!response.bytes.length || /^text\/html/i.test(response.headers?.get?.('content-type') || '')) throw new CollectorError('ATTACHMENT_CONTENT_INVALID', '附件回應不是有效原件');
+    Object.assign(attachment, { raw_sha256: response.sha256, byte_length: response.bytes.length, retrieved_at: response.retrieved_at, source_url: response.url });
+    work.downloaded += 1; work.estimated_bytes += response.bytes.length;
+    await stage.saveWork(id, work);
+  }
+  const detail = structuredClone(work.detail); detail.data.attachments = work.attachments; detail.data.attachment_list_raw_sha256 = work.list.raw_sha256;
+  const attachmentRecord = { id, title: `${work.detail.title} 附件清單`, text: work.attachments.map((item) => item.name).join('\n') || '官方來源明示無附件', data: { proposal_sn: id, attachments: work.attachments, total_files: work.attachments.length, attachment_originals_complete: true }, ...work.list };
+  const detailPacked = await packRecordV2(ctx, 'kcc-proposal-details', detail);
+  const attachmentPacked = await packRecordV2(ctx, 'kcc-proposal-attachments', attachmentRecord);
+  await stage.prepareRecord({ id, cursor, descriptors: [
+    { dataset: 'kcc-proposal-details', descriptor: detailPacked.descriptor },
+    { dataset: 'kcc-proposal-attachments', descriptor: attachmentPacked.descriptor },
+  ], estimatedBytes: Math.max(work.estimated_bytes, Buffer.byteLength(JSON.stringify(detail), 'utf8') + Buffer.byteLength(JSON.stringify(attachmentRecord), 'utf8')) });
+  return work;
+}
+
+async function processMeetingVersion(ctx, stage, id, version) {
+  const rawBytes = typeof ctx.store.readRawObject === 'function'
+    ? await ctx.store.readRawObject(version.raw_sha256)
+    : await readFile(path.join(ctx.rawDirectory, `${version.raw_sha256}.bin`));
+  if (sha256Bytes(rawBytes) !== version.raw_sha256) throw new CollectorError('STAGING_COLLISION', '既存議事原件 hash 不一致');
+  if (version.file_type !== 'pdf') {
+    version.format_validation ||= validateNonPdfOriginal(rawBytes, version.file_type);
+    version.extraction_status = 'unsupported_text_extraction'; version.text_layer_status = 'not_indexed';
+    version.total_pages = null; version.pages = []; version.extraction_complete = true;
+    return;
+  }
+  if (rawBytes.subarray(0, 5).toString() !== '%PDF-') throw new CollectorError('PDF_SIGNATURE_INVALID', '官方回應沒有PDF檔頭');
+  if (version.extraction_complete) return;
+  const codec = await loadV2Codec(ctx);
+  const extraction = validatePdfExtraction(await ctx.pdfExtractor(rawBytes));
+  version.total_pages = extraction.total_pages;
+  version.empty_text_pages = extraction.empty_text_pages;
+  version.text_layer_status = extraction.text_layer_status;
+  version.speaker_attribution = 'not-inferred';
+  version.pages = [];
+  version.page_refs = [];
+  version.estimated_page_bytes = 0;
+  for (const page of extraction.pages) {
+    const packed = await codec.packKccV2PdfPage(ctx.store.derivedStore, {
+      dataset: 'kcc-meeting-records', id, source: version.source_url, raw_sha256: version.raw_sha256, page_number: page.page, text: page.text,
+    });
+    version.pages.push({ page: page.page, has_text_layer: page.has_text_layer });
+    version.page_refs.push(packed);
+    version.estimated_page_bytes = (version.estimated_page_bytes || 0) + Buffer.byteLength(page.text, 'utf8');
+    await stage.saveWork(id, stage.currentWork);
+  }
+  version.extraction_status = 'indexed'; version.extraction_complete = true;
+}
+
+async function captureAndPrepareMeeting(ctx, stage, row, cursor) {
+  const id = row.id;
+  let work = await stage.readWork(id) || { id, versions: [], page_refs: [], estimated_bytes: 0 };
+  const files = row.data.original_files || (row.data.pdf_urls || [row.data.pdf_url]).filter(Boolean).map((url) => ({ download_url: url, file_type: 'pdf' }));
+  for (const file of files) {
+    const url = official(file.download_url, MEETING_URL);
+    if (work.versions.some((version) => (version.source_url || version.pdf_url) === url)) continue;
+    assertOriginalIdentity(url, url, 'MeetingRecord', id);
+    const response = await capture(ctx, url, { maxBytes: 96 * 1024 * 1024 });
+    assertOriginalIdentity(url, response.url, 'MeetingRecord', id);
+    const isPdf = file.file_type === 'pdf';
+    if (!isPdf) validateNonPdfOriginal(response.bytes, file.file_type, response.headers?.get?.('content-type') || '');
+    const version = {
+      source_url: response.url, download_url: url, ...(isPdf ? { pdf_url: response.url } : {}),
+      file_type: file.file_type, raw_sha256: response.sha256, retrieved_at: response.retrieved_at,
+      byte_length: response.bytes.length, pages: [], extraction_complete: false,
+    };
+    work.versions.push(version);
+    await stage.saveWork(id, work);
+  }
+  stage.currentWork = work;
+  for (const version of work.versions) {
+    if (version.extraction_complete) continue;
+    await processMeetingVersion(ctx, stage, id, version);
+    if (version.page_refs) work.page_refs.push(...version.page_refs);
+    await stage.saveWork(id, work);
+  }
+  work.estimated_bytes = Buffer.byteLength(JSON.stringify(row.data), 'utf8') + work.versions.reduce((total, version) => total + (version.estimated_page_bytes || version.byte_length || 0), 0);
+  delete stage.currentWork;
+  const pdfs = work.versions.filter((version) => version.pdf_url), selected = pdfs.at(-1), original = selected || work.versions.at(-1);
+  const unindexed = work.versions.filter((version) => !version.pdf_url || version.text_layer_status !== 'present').length;
+  const contentStatus = selected ? (unindexed ? 'partial_text_layer' : 'indexed') : work.versions.length ? 'unindexed_non_pdf' : 'no_original_published';
+  const data = {
+    ...row.data,
+    ...(selected || {}),
+    record_id: id, pdf_url: selected?.pdf_url || null,
+    pages: selected?.pages || [], total_pages: selected?.total_pages ?? null,
+    pdf_versions: pdfs, original_versions: work.versions,
+    originals_complete: true, pdf_originals_complete: true,
+    content_index_status: contentStatus, fulltext_complete: contentStatus === 'indexed',
+    unindexed_original_count: unindexed, selected_version_policy: 'last-official-listed-pdf', speaker_attribution: 'not-inferred',
+  };
+  const record = {
+    id, title: row.title,
+    text: selected ? '' : (work.versions.length ? '官方原件已保存；此列無已索引PDF文字，尚未處理非PDF文字。' : '官方索引列未發布原件，沒有可索引文字。'),
+    ...(selected ? { text_recipe: { kind: 'page-join', slot: 'data.pages', separator: '\n' } } : {}),
+    data, source_url: original?.source_url || original?.pdf_url || row.source_url,
+    retrieved_at: original?.retrieved_at || row.retrieved_at,
+    raw_sha256: original?.raw_sha256 || row.raw_sha256,
+  };
+  const packed = await packRecordV2(ctx, 'kcc-meeting-records', record, work.page_refs);
+  await stage.prepareRecord({ id, cursor, descriptors: [{ dataset: 'kcc-meeting-records', descriptor: packed.descriptor }], estimatedBytes: Math.max(work.estimated_bytes, Buffer.byteLength(JSON.stringify(record), 'utf8')), contentIndexed: contentStatus === 'indexed' });
+  return { record, content_complete: contentStatus === 'indexed' };
+}
+
+function enrichedStatus(error, cursor, total, complete) {
+  if (error && error.code !== 'COLLECTION_YIELD') return 'blocked';
+  if (cursor < total) return 'paused';
+  return complete ? 'complete' : 'partial';
+}
+
+async function migrateLegacyEnrichment(ctx, stage, legacy, rows, datasets) {
+  if (!legacy || stage.journal.committed_cursor > 0) return;
+  if (legacy.version !== VERSION || legacy.scope !== ctx.scope || !legacy.dependency ||
+      legacy.source_ids?.length !== rows.length || legacy.source_ids.some((id, index) => id !== rows[index].id) ||
+      !Number.isSafeInteger(legacy.cursor) || legacy.cursor < 0 || legacy.cursor > rows.length) {
+    throw new CollectorError('CHECKPOINT_MISMATCH', '舊 enrichment checkpoint 的母集或 scope 無法確認，拒絕遷移與重抓');
+  }
+  if (!sameRelease(legacy.dependency, stage.journal.mother_release)) throw new CollectorError('DEPENDENCY_DRIFT', '舊 checkpoint 母集 release 已改變，拒絕遷移');
+  const legacyCtx = { ...ctx, state: legacy };
+  await assertActiveReceipts(legacyCtx, legacy.receipts || {});
+  if (stage.journal.prepared_cursor > legacy.cursor) throw new CollectorError('CHECKPOINT_MIGRATION_INCOMPLETE', 'stage prepared cursor 超過舊 checkpoint 已確認 cursor');
+  for (let cursor = stage.journal.prepared_cursor; cursor < legacy.cursor; cursor += 1) {
+    const id = rows[cursor].id;
+    const descriptors = [];
+    for (const dataset of datasets) {
+      const record = legacy.records?.[dataset]?.[id];
+      if (!record) throw new CollectorError('CHECKPOINT_MIGRATION_INCOMPLETE', `舊 checkpoint 已確認 cursor=${legacy.cursor}，但 ${dataset}/${id} 記錄缺漏`);
+      const packed = await packRecordV2(ctx, dataset, record);
+      descriptors.push({ dataset, descriptor: packed.descriptor });
+    }
+    const estimatedBytes = descriptors.reduce((totalBytes, entry) => totalBytes + Buffer.byteLength(JSON.stringify(entry.descriptor), 'utf8'), 0);
+    const indexed = ctx.config.profile !== 'kcc-meeting-records' || contentIndexed(legacy.records?.['kcc-meeting-records']?.[id]);
+    await stage.prepareRecord({ id, cursor, descriptors, estimatedBytes, contentIndexed: indexed });
+  }
+  if (legacy.work && legacy.cursor < rows.length) {
+    const id = rows[legacy.cursor].id;
+    if (legacy.work.id !== id) throw new CollectorError('CHECKPOINT_MIGRATION_INCOMPLETE', '舊 checkpoint 未提交 work 與母集 cursor 身分不符');
+    // A crash after importing the legacy work may already have advanced the
+    // v2 work. Preserve that durable work rather than overwriting it on resume.
+    if (!await stage.readWork(id)) {
+      const work = structuredClone(legacy.work);
+      if (Array.isArray(work.versions)) {
+        const codec = await loadV2Codec(ctx), allPageRefs = [];
+        work.estimated_bytes ||= 0;
+        for (const version of work.versions) {
+          const pages = version.pages || [], pageRefs = [];
+          const rawSha = version.raw_sha256, source = version.source_url || version.pdf_url || version.download_url;
+          for (const page of pages) {
+            if (typeof page.text !== 'string') throw new CollectorError('CHECKPOINT_MIGRATION_INCOMPLETE', `舊 work ${id} 頁面缺少正文或 ref，無法安全遷移`);
+            const packed = await codec.packKccV2PdfPage(ctx.store.derivedStore, { dataset: 'kcc-meeting-records', id, source, raw_sha256: rawSha, page_number: page.page, text: page.text });
+            pageRefs.push(packed); allPageRefs.push(packed); work.estimated_bytes += Buffer.byteLength(page.text, 'utf8');
+          }
+          version.pages = pages.map(({ text, ...page }) => page);
+          if (pages.length) { version.page_refs = pageRefs; version.extraction_complete = pages.length === version.total_pages; }
+        }
+        work.page_refs = allPageRefs;
+      }
+      await stage.saveWork(id, work);
+    }
+  } else if (legacy.work && legacy.cursor >= rows.length) {
+    throw new CollectorError('CHECKPOINT_MIGRATION_INCOMPLETE', '舊 checkpoint cursor 已終止但仍有未提交 work');
+  }
+  if (legacy.cursor > 0) {
+    const terminal = legacy.cursor === rows.length;
+    const complete = ctx.config.profile === 'kcc-meeting-records'
+      ? terminal && sourceComplete(legacy) && allContentIndexed(legacy)
+      : terminal && sourceComplete(legacy);
+    const imported = await publishV2Stage(ctx, stage, datasets, rows.length, complete);
+    if (stage.journal.committed_cursor !== legacy.cursor) throw new CollectorError('CHECKPOINT_MIGRATION_FAILED', '舊 checkpoint 等價 v2 發布未推進到原 cursor');
+    for (const [dataset, receipt] of Object.entries(imported)) ctx.migratedReceipts[dataset] = receipt;
+  }
+  await stage.markLegacyMigrated(digest(legacy), legacy.cursor);
+}
+
+async function runEnrichmentV2Profile(ctx, stage, rows, sourceRelease, dependencies = {}) {
+  const datasets = ctx.config.profile === 'kcc-proposal-details'
+    ? ['kcc-proposal-details', 'kcc-proposal-attachments']
+    : ['kcc-meeting-records'];
+  const legacy = stage.journal.legacy_migration?.schema_version === 'kcc-legacy-migration-v1'
+    ? null : await jsonRead(ctx.legacyStatePath, null);
+  await migrateLegacyEnrichment(ctx, stage, legacy, rows, datasets);
+  await stage.readMotherIds();
+  const total = rows.length;
+  let flushes = 0, error = null;
+  const shouldFlush = (terminal) => enrichmentBatchReady(ctx.config.profile, stage.journal.batch_refs.length, stage.journal.batch_bytes, terminal);
+  try {
+    if (stage.journal.prepared_cursor > stage.journal.committed_cursor && shouldFlush(stage.journal.prepared_cursor === total)) {
+      const fulltextComplete = ctx.config.profile !== 'kcc-meeting-records' || stage.journal.all_content_indexed;
+      await publishV2Stage(ctx, stage, datasets, total, stage.journal.prepared_cursor === total && sourceComplete({ dependency: sourceRelease }) && fulltextComplete);
+      flushes += 1;
+    }
+    for (let cursor = stage.journal.prepared_cursor; cursor < total; cursor = stage.journal.prepared_cursor) {
+      if (flushes >= 1 && shouldFlush(cursor === total)) throw pause();
+      if (cursor !== stage.journal.prepared_cursor) throw new CollectorError('PREPARED_CURSOR_INVALID', 'prepared cursor 與來源位置失配');
+      const row = rows[cursor];
+      if (ctx.config.profile === 'kcc-proposal-details') {
+        await captureAndPrepareDetail(ctx, stage, row, cursor);
+      } else {
+        await captureAndPrepareMeeting(ctx, stage, row, cursor);
+      }
+      ctx.pages += 1;
+      const terminal = stage.journal.prepared_cursor === total;
+      if (shouldFlush(terminal)) {
+        if (flushes >= 1) throw pause();
+        const fulltextComplete = ctx.config.profile !== 'kcc-meeting-records' || stage.journal.all_content_indexed;
+        const complete = terminal && sourceComplete({ dependency: sourceRelease }) && fulltextComplete;
+        await publishV2Stage(ctx, stage, datasets, total, complete);
+        flushes += 1;
+      }
+      if (ctx.requests >= ctx.config.maxRequests || ctx.now() - ctx.started >= ctx.config.maxDurationMs) throw pause();
+    }
+  } catch (caught) { error = caught; }
+  if (!error && stage.journal.prepared_cursor === total && stage.journal.batch_refs.length) {
+    if (flushes >= 1) error = pause();
+    else {
+      const complete = sourceComplete({ dependency: sourceRelease }) && (ctx.config.profile !== 'kcc-meeting-records' || stage.journal.all_content_indexed);
+      try { await publishV2Stage(ctx, stage, datasets, total, complete); flushes += 1; }
+      catch (caught) { error = caught; }
+    }
+  }
+  const blocked = Boolean(error && error.code !== 'COLLECTION_YIELD');
+  const receipts = { ...stage.journal.receipts, ...(stage.journal.pending_ref?.confirmed || {}) };
+  const confirmedAll = datasets.every((dataset) => Boolean(stage.journal.receipts[dataset]));
+  const fulltextComplete = ctx.config.profile !== 'kcc-meeting-records' || stage.journal.all_content_indexed;
+  const complete = !blocked && stage.journal.committed_cursor === total && sourceComplete({ dependency: sourceRelease }) && fulltextComplete;
+  const status = enrichedStatus(error, stage.journal.committed_cursor, total, complete);
+  const publishedReceipt = receipts[datasets[0]] || null;
+  return {
+    profile: ctx.config.profile, dataset: datasets[0], status,
+    continuation_required: !blocked && (stage.journal.prepared_cursor < total || stage.journal.committed_cursor < total),
+    source_exhausted: stage.journal.prepared_cursor === total,
+    ...(ctx.config.profile === 'kcc-meeting-records' ? { archive_complete: !blocked && stage.journal.committed_cursor === total && sourceComplete({ dependency: sourceRelease }), fulltext_complete: complete } : {}),
+    dry_run: false,
+    commit_state: stage.journal.pending_ref ? (Object.keys(stage.journal.pending_ref.confirmed || {}).length ? 'partial' : 'unknown') : confirmedAll ? 'committed' : 'not-committed',
+    publication_status: stage.journal.pending_ref ? (Object.keys(stage.journal.pending_ref.confirmed || {}).length ? 'partial' : 'unknown') : confirmedAll ? 'confirmed' : 'not-started',
+    uncertain_datasets: Object.entries(stage.journal.pending_ref?.states || {}).filter(([, state]) => ['publishing', 'unknown'].includes(state)).map(([dataset]) => dataset),
+    needs_reconciliation: Boolean(stage.journal.pending_ref && Object.keys(stage.journal.pending_ref.states || {}).some((dataset) => ['publishing', 'unknown'].includes(stage.journal.pending_ref.states[dataset])) || error?.code === 'RELEASE_DRIFT'),
+    record_count: publishedReceipt?.record_count ?? 0,
+    prepared_count: stage.journal.prepared_cursor,
+    attempted: ctx.requests, succeeded: ctx.pages, failed: blocked ? 1 : 0,
+    error_code: blocked ? (error.code || error.reasonCode || 'COLLECTION_FAILED') : null,
+    error_message: blocked ? String(error.message).slice(0, 500) : null,
+    coverage: { scope: ctx.scope, complete, source_total: total },
+    checkpoint_path: stage.journalPath, checkpoint_status: 'persisted',
+    receipts, receipt: publishedReceipt,
+    progress: { committed_cursor: stage.journal.committed_cursor, prepared_cursor: stage.journal.prepared_cursor, total, current_id: stage.journal.work_ref?.id || null, batch_records: stage.journal.batch_refs.length, batch_bytes: stage.journal.batch_bytes },
+    basic_validation: blocked ? 'not-passed' : 'passed', human_semantic_validation: 'pending',
+  };
+}
+
+export async function runKccEnrichmentV2(options = {}, dependencies = {}) {
+  const config = normalizeOptions(options);
+  if (!['kcc-proposal-details', 'kcc-meeting-records'].includes(config.profile)) throw new CollectorError('PROFILE_INVALID', 'v2 enrichment 僅適用提案詳情或議事錄');
+  const root = path.resolve(options.root), scope = JSON.stringify({ profile: config.profile, periods: config.periods, sessions: config.sessions, keyword: config.keyword, pageSize: config.pageSize });
+  const directory = await safeDirectory(root, ['.kcc-collection', config.profile, digest(scope).slice(0, 24)]);
+  const stageDirectory = await safeDirectory(directory, ['enrichment-v2']);
+  const lockPath = path.join(root, '.kcc-collection', 'collector.lock'); let lockAcquired = false, store, stage = null, error = null, result = null;
+  const now = dependencies.now || Date.now, sleep = dependencies.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const ctx = {
+    config, scope, directory, rawDirectory: await safeDirectory(root, ['.kcc-collection', 'raw']),
+    captureDirectory: await safeDirectory(root, ['.kcc-collection', 'captures']),
+    legacyStatePath: path.join(directory, 'checkpoint.json'), now, sleep, started: now(), requests: 0, pages: 0,
+    cookies: new Map(), fetchImpl: dependencies.fetchImpl || fetch, pdfExtractor: dependencies.pdfExtractor || extractPdfPages,
+    v2Codec: dependencies.v2Codec || null, migratedReceipts: {},
+  };
+  try {
+    try { await writeFile(lockPath, JSON.stringify({ pid: process.pid, started_at: new Date(now()).toISOString() }), { flag: 'wx', mode: 0o600 }); lockAcquired = true; }
+    catch (caught) { if (caught.code === 'EEXIST') throw new CollectorError('COLLECTION_LOCKED', '同scope已有採集鎖；確認原程序終止後才可移除鎖'); throw caught; }
+    const factory = dependencies.storeFactory || (async (location) => { const { LocalStore } = await import('../local/store.mjs'); return new LocalStore(location, { readOnly: false }); });
+    store = await factory(root); ctx.store = store;
+    if (typeof store.putRawObject !== 'function' || typeof store.importV2 !== 'function' || typeof store.queryV2 !== 'function' || typeof store.readSnapshotVersionV2 !== 'function') throw new CollectorError('STORE_API_UNAVAILABLE', 'LocalStore enrichment v2 API 尚未完整提供');
+    const sourceDataset = config.profile === 'kcc-proposal-details' ? 'kcc-proposals' : 'kcc-meetings';
+    const source = await readAll(store, sourceDataset);
+    stage = await KccEnrichmentStage.open({ directory: stageDirectory, scope, profile: config.profile, motherRelease: source.release, sourceIds: sourceRecordIds(source.rows) });
+    ctx.verifyMotherRelease = () => activeRelease(ctx, sourceDataset);
+    let lastStart = -Infinity;
+    ctx.rateLimiter = async () => { const wait = Math.max(0, 1000 - (now() - lastStart)); if (wait) await sleep(wait); lastStart = now(); };
+    result = await runEnrichmentV2Profile(ctx, stage, source.rows, source.release, dependencies);
+  } catch (caught) { error = caught; }
+  finally { if (store?.close) store.close(); if (lockAcquired) await unlink(lockPath); }
+  if (result) return { ...result, ...(Object.keys(ctx.migratedReceipts).length ? { migration_receipts: ctx.migratedReceipts } : {}) };
+  const code = error?.code || error?.reasonCode || 'COLLECTION_FAILED';
+  const stagedReceipts = { ...(stage?.journal?.receipts || {}), ...(stage?.journal?.pending_ref?.confirmed || {}) };
+  const dataset = KCC_PROFILE_MANIFEST[config.profile].dataset;
+  return {
+    profile: config.profile, dataset,
+    status: code === 'COLLECTION_YIELD' ? 'paused' : 'blocked', continuation_required: code === 'COLLECTION_YIELD',
+    source_exhausted: false, dry_run: false, commit_state: 'unknown', publication_status: 'unknown',
+    record_count: stagedReceipts[dataset]?.record_count ?? 0, prepared_count: stage?.journal?.prepared_cursor ?? 0, attempted: ctx.requests, succeeded: ctx.pages, failed: code === 'COLLECTION_YIELD' ? 0 : 1,
+    error_code: code === 'COLLECTION_YIELD' ? null : code, error_message: code === 'COLLECTION_YIELD' ? null : String(error?.message || code).slice(0, 500),
+    coverage: { scope, complete: false, source_total: stage?.journal?.mother_release?.record_count ?? null }, checkpoint_path: path.join(stageDirectory, 'journal.json'),
+    checkpoint_status: stage ? 'persisted' : 'not-created', receipts: stagedReceipts, receipt: stagedReceipts[dataset] || null,
+    progress: { committed_cursor: stage?.journal?.committed_cursor ?? 0, prepared_cursor: stage?.journal?.prepared_cursor ?? 0, total: stage?.journal?.mother_release?.record_count ?? null, current_id: stage?.journal?.work_ref?.id ?? null, batch_records: stage?.journal?.batch_refs?.length ?? 0, batch_bytes: stage?.journal?.batch_bytes ?? 0 },
+    basic_validation: code === 'COLLECTION_YIELD' ? 'passed' : 'not-passed', human_semantic_validation: 'pending',
+  };
+}
+
 export async function runKccCollection(options = {}, dependencies = {}) {
   const config = normalizeOptions(options), root = path.resolve(options.root), scope = JSON.stringify({ profile:config.profile,periods:config.periods,sessions:config.sessions,keyword:config.keyword,pageSize:config.pageSize });
   const directory = await safeDirectory(root,['.kcc-collection',config.profile,digest(scope).slice(0,24)]);
@@ -472,3 +1014,7 @@ export async function runKccCollection(options = {}, dependencies = {}) {
   const commitState = uncertainDatasets.length ? 'unknown' : pending && Object.keys(pending.confirmed_receipts || {}).length ? 'partial' : Object.keys(receipts).length ? 'committed' : 'not-committed';
   return { profile:config.profile,dataset,status:blocked?'blocked':exhausted?(complete?'complete':'partial'):'paused',continuation_required:!blocked&&!exhausted,source_exhausted:Boolean(exhausted),...(config.profile==='kcc-meeting-records'?{archive_complete:Boolean(!blocked&&exhausted&&sourceComplete(state)),fulltext_complete:complete,unindexed_records:Object.values(state?.records?.['kcc-meeting-records']||{}).filter((record)=>!contentIndexed(record)).length}:{}),dry_run:false,commit_state:commitState,publication_status:pending&&Object.keys(pending.confirmed_receipts||{}).length?'partial':uncertainDatasets.length?'unknown':'confirmed',uncertain_datasets:uncertainDatasets,needs_reconciliation:Boolean(uncertainDatasets.length||error?.code==='RELEASE_DRIFT'),record_count:receipts[dataset]?.record_count??Object.keys(state?.records?.[dataset]||{}).length,attempted:ctx.requests,succeeded:ctx.pages,failed:blocked?1:0,error_code:blocked?(error.code||error.reasonCode||'COLLECTION_FAILED'):null,error_message:blocked?String(error.message).slice(0,500):null,coverage:state?coverage(state,complete,indexProfile?totals.sourceTotal:state.source_ids?.length??null):{scope,complete:false,source_total:null},checkpoint_path:ctx.statePath,checkpoint_status:state?'persisted':'not-created',receipts,receipt:receipts[dataset]||null,source_discovery:state?.discovery||null,progress:indexProfile?{queries:Object.fromEntries(Object.entries(state?.queries||{}).map(([key,q])=>[key,{complete:q.complete,tabs:Object.fromEntries(Object.entries(q.tabs).map(([id,t])=>[id,{total:t.total,next_page:t.next_page,collected_ids:t.ids.length,collected_pages:t.pages_proof.length,complete:t.complete,last_page:t.pages_proof.at(-1)||null,reconciliation:t.reconciliation||null}]))}])),source_total_estimate:totals.sourceTotal,discovered_total_so_far:totals.tabs.reduce((n,t)=>n+t.total,0)}:{cursor:state?.cursor??0,total:state?.source_ids?.length??null,current_id:state?.work?.id??null,dependency:state?.dependency||null},basic_validation:blocked?'not-passed':'passed',human_semantic_validation:'pending' };
 }
+
+// Explicit legacy entry point retained for callers that are still validating
+// the v1 enrichment path. Production dispatch chooses runKccEnrichmentV2.
+export const runKccCollectionV1 = runKccCollection;

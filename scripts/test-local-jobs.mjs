@@ -4,8 +4,9 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
-import { processOne, validateRequest, verifyCollectorReceipt, dependencyReady } from './local-job-worker.mjs';
+import { processOne, validateRequest, verifyCollectorReceipt, dependencyReady, readCollectorCommit, collectionAdvanced } from './local-job-worker.mjs';
 import { LocalStore } from '../src/local/store.mjs';
+import { packKccV2Record } from '../src/local/kcc-payload.mjs';
 
 const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'TEST-kcg-jobs-'));
 const previousEnrichmentEnabled = process.env.KCG_ENRICHMENT_ENABLED;
@@ -84,6 +85,27 @@ try {
   fs.writeFileSync(path.join(queue, 'receipts', 'c'.repeat(64) + '.json'),
     JSON.stringify({ profile: 'kcc-meetings-full', status: 'succeeded', store_readback: completeMeetingReceipt }));
   assert.equal(await dependencyReady(queue, 'kcc-meetings-full', data), true);
+  assert.equal((await readCollectorCommit(data, { dataset: 'kcc-meetings', record_count: 1, receipt: completeMeetingReceipt }, 'kcc-meetings-full')).release.snapshot_id, completeMeetingReceipt.snapshot_id);
+  const derivedBytes = Buffer.from('TEST original detail');
+  const derivedSha = crypto.createHash('sha256').update(derivedBytes).digest('hex');
+  await store.putRawObject({ sha256: derivedSha, bytes_base64: derivedBytes.toString('base64') });
+  const v2Receipts = {};
+  for (const dataset of ['kcc-proposal-details', 'kcc-proposal-attachments']) {
+    const record = { id: '123', title: 'TEST detail', text: 'TEST body', data: { proposal_id: '123', title: 'TEST detail', content: 'TEST body', attachments: [] }, source_url: 'https://cissearch.kcc.gov.tw/System/Proposal/Detail.aspx?id=123', retrieved_at: '2026-10-15T00:00:00Z', raw_sha256: derivedSha };
+    const packed = await packKccV2Record(store.derivedStore, { dataset, record });
+    v2Receipts[dataset] = await store.importV2({ schema_version: 'local-snapshot-v2', dataset, snapshot_id: 'TEST-worker-v2-' + dataset, coverage: { scope: 'TEST', complete: true, source_total: 1 }, parser_version: 'TEST', validator_version: 'TEST', validation_status: 'passed', records: [packed.descriptor] });
+  }
+  const publishedResult = { dataset: 'kcc-proposal-details', record_count: 1, receipt: v2Receipts['kcc-proposal-details'], receipts: v2Receipts };
+  const checked = await readCollectorCommit(data, publishedResult, 'kcc-proposal-details');
+  assert.equal(checked.release.snapshot_id, publishedResult.receipt.snapshot_id);
+  assert.equal(Object.keys(checked.releases).length, 2, 'both detail datasets need native readback');
+  await assert.rejects(() => readCollectorCommit(data, { ...publishedResult, receipts: {} }, 'kcc-proposal-details'), /COMMIT_READBACK_MISMATCH/);
+  const changedReceipts = { ...v2Receipts, 'kcc-proposal-attachments': { ...v2Receipts['kcc-proposal-attachments'], manifest_sha256: 'f'.repeat(64) } };
+  await assert.rejects(() => readCollectorCommit(data, { ...publishedResult, receipts: changedReceipts }, 'kcc-proposal-details'), /COMMIT_READBACK_MISMATCH/);
+  const priorSegment = { collector: { attempted: 0, record_count: 1, prepared_count: 4, progress: { prepared_cursor: 4, committed_cursor: 1 } } };
+  assert.equal(collectionAdvanced(priorSegment, { collector: { ...priorSegment.collector, prepared_count: 5 } }), true, 'unpublished preparation is forward progress');
+  assert.equal(collectionAdvanced(priorSegment, structuredClone(priorSegment)), false);
+  assert.equal(collectionAdvanced(priorSegment, { collector: { ...priorSegment.collector, attempted: 1 } }), true);
   store.close();
 
   process.env.KCG_ENRICHMENT_ENABLED = 'false';

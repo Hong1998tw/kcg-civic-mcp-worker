@@ -1,5 +1,6 @@
 import { TOOL_REGISTRY as SOURCE_REGISTRY } from "../mcp/tools.ts";
 import { LocalStoreError } from "./store.mjs";
+import { KCC_V2_DATASETS, hydrateKccV2Record, readKccV2PageText, verifyKccV2Envelope } from "./kcc-payload.mjs";
 
 const LOCAL_PROVIDER = "kaohsiung_civic_mcp";
 const MAX_SCAN_ROWS = 1000;
@@ -163,8 +164,71 @@ function boundedLimit(value, fallback = 10, max = 100) {
   return Math.min(limit, max);
 }
 
-async function search(store, dataset, { keyword = "", limit = MAX_SCAN_ROWS, offset = 0, predicate = () => true, orderBy } = {}) {
-  return await store.queryRecords(dataset, { keyword, limit: Math.min(limit, MAX_SCAN_ROWS), offset, predicate, orderBy });
+async function search(store, dataset, options = {}) {
+  const { keyword = "", limit = MAX_SCAN_ROWS, offset = 0, predicate = () => true, orderBy } = options;
+  const bounded = { ...options, keyword, limit: Math.min(limit, MAX_SCAN_ROWS), offset, predicate, orderBy };
+  if (KCC_V2_DATASETS.has(dataset) && typeof store.getDatasetVersion === "function" &&
+      await store.getDatasetVersion(dataset) === "v2" && typeof store.queryV2 === "function") {
+    return await store.queryV2(dataset, { ...bounded, metadataOnly: true, includePageRefs: true });
+  }
+  return await store.queryRecords(dataset, bounded);
+}
+
+function isV2Record(record) {
+  return !!record && isObject(record.descriptor) && isObject(record.envelope);
+}
+
+function isV2Result(result) {
+  return result?.release?.schema_version === "local-snapshot-v2" || result?.records?.some(isV2Record) === true;
+}
+
+async function hydrateIfV2(store, dataset, record) {
+  if (!isV2Record(record)) return record;
+  return { ...record, ...await hydrateKccV2Record(store, dataset, record) };
+}
+
+async function hasLocalDataset(store, dataset) {
+  if (typeof store.getDatasetVersion === "function") return (await store.getDatasetVersion(dataset)) !== null;
+  return typeof store.hasDataset === "function" && await store.hasDataset(dataset);
+}
+
+function selectedV2Pages(record, slot = "data.pages") {
+  const { envelope } = verifyKccV2Envelope(record, record.envelope.dataset);
+  const versionId = envelope.page_sets[slot];
+  if (!versionId) return { version_id: null, pages: [] };
+  const pages = envelope.pages.filter((page) => page.version_id === versionId)
+    .sort((left, right) => left.page_number - right.page_number);
+  return { version_id: versionId, pages };
+}
+
+function assertV2PageSearchMatches(record, matches, versionId, { limit = 1000 } = {}) {
+  if (!versionId) return [];
+  const { envelope } = verifyKccV2Envelope(record, record.envelope.dataset);
+  const pageMap = new Map(envelope.pages.filter((page) => page.version_id === versionId).map((page) => [page.page_number, page]));
+  const selected = [];
+  const seen = new Set();
+  for (const match of matches || []) {
+    if (match.id !== record.id || match.version_id !== versionId || !Number.isInteger(match.page_number) ||
+        !Number.isInteger(match.match_count) || match.match_count < 1 || !Array.isArray(match.snippets) ||
+        match.snippets.some((snippet) => typeof snippet !== "string")) {
+      localError("SNAPSHOT_UNVERIFIED", `record ${record.id} page search match 格式無效`);
+    }
+    const page = pageMap.get(match.page_number);
+    if (!page || seen.has(match.page_number) || !isObject(match.page_ref) ||
+        page.ref.sha256 !== match.page_ref.sha256 || page.ref.byte_length !== match.page_ref.byte_length ||
+        page.source !== match.source || page.raw_sha256 !== match.raw_sha256) {
+      localError("SNAPSHOT_UNVERIFIED", `record ${record.id} 第 ${match.page_number} 頁 search projection 未綁定 envelope`);
+    }
+    seen.add(match.page_number);
+    selected.push({ page: match.page_number, match_count: match.match_count, snippets: match.snippets });
+    if (selected.length >= limit) break;
+  }
+  return selected;
+}
+
+function noIndexedPagesAllowed(record) {
+  return ["unindexed_non_pdf", "no_original_published"].includes(record.data.content_index_status) &&
+    record.data.fulltext_complete === false && record.data.originals_complete === true;
 }
 
 function addFieldFilter(filters, name, expected, paths, mode = "exact") {
@@ -480,7 +544,7 @@ const handlers = {
     if (!record) localError("LOCAL_DATA_UNAVAILABLE", "指定法規未出現在本機 snapshot");
     const law = assertLawRecord(record);
     if (law.articles_unavailable === true || law.fulltext_complete === false) {
-      localError("SOURCE_FULLTEXT_UNAVAILABLE", `官方目前只提供廢止／停止適用公告，未提供條文全文：${law.official_url}`);
+      localError("SOURCE_FULLTEXT_UNAVAILABLE", `官方目前未提供可驗證的完整條文全文：${law.official_url}`);
     }
     return envelope(result, {
       ...recordWithEvidence(record, result.release),
@@ -534,9 +598,65 @@ const handlers = {
     if (args.legislator_name) localError("FEATURE_UNAVAILABLE", "同頁文字命中不能證明發言者歸屬；本機版不接受議員歸屬篩選");
     // The store evaluates predicates over the entire verified snapshot, including
     // rows without this keyword, so omitted non-PDF material stays visible.
+    const limit = boundedLimit(args.limit, 10, 50);
     let unindexedRecords = 0;
     const result = await search(store, "kcc-meeting-records", { keyword, limit: MAX_SCAN_ROWS,
-      predicate: (record) => { if (record.data.fulltext_complete === false) unindexedRecords++; return true; } });
+      predicate: (record) => { if (record.data.fulltext_complete === false) unindexedRecords++; return true; },
+      pageSearch: {
+        keyword,
+        allMatchingRecords: true,
+        slots: ["data.pages"],
+        maxMatches: limit,
+        snippetsPerPage: 1,
+        maxSnippets: limit,
+        perRecordMax: limit,
+        snippetBefore: 80,
+        snippetAfter: 120,
+        normalizeWhitespace: false,
+      },
+    });
+    if (isV2Result(result)) {
+      const hitRows = [];
+      for (const record of result.records) {
+        const selected = selectedV2Pages(record);
+        const pageMatches = (result.page_matches || []).filter((match) => match.id === record.id);
+        const matches = assertV2PageSearchMatches(record, pageMatches, selected.version_id, { limit });
+        const term = Number(record.data.term);
+        const date = record.data.date ?? record.data.meeting_date;
+        const meetingName = record.data.meeting_name ?? record.data.meeting;
+        if (matches.length && (!Number.isInteger(term) || typeof date !== "string" || typeof meetingName !== "string")) {
+          localError("LOCAL_DATA_UNAVAILABLE", `record ${record.id} 缺少屆期、日期或會議名稱欄位`);
+        }
+        for (const match of matches) {
+          hitRows.push({
+            record_id: recordId(record),
+            term,
+            legislator_name: "未結構化標註",
+            topic: keyword,
+            content_summary: (match.snippets[0] || "").trim(),
+            date,
+            meeting_name: meetingName,
+            page: match.page,
+            local_provenance: recordWithEvidence(record, result.release).local_provenance,
+          });
+          if (hitRows.length >= limit) break;
+        }
+        if (hitRows.length >= limit) break;
+      }
+      const totalMatchedPages = Number(result.matched_pages_count || 0);
+      const scanTruncated = result.page_scan_scope !== "entire_verified_snapshot" && result.local_match_count > result.records.length;
+      const pageRowsComplete = result.page_search_complete !== false && totalMatchedPages <= hitRows.length;
+      const complete = result.release.coverage.complete && !scanTruncated && !unindexedRecords && pageRowsComplete;
+      const data = hitRows.slice(0, limit);
+      return envelope({ ...result, local_match_count: totalMatchedPages }, data, {
+        query_keyword: keyword,
+        query_legislator: "all",
+        omitted_local_matches: Math.max(0, totalMatchedPages - data.length),
+        unindexed_records: unindexedRecords,
+        ...(scanTruncated ? { local_match_count_lower_bound: totalMatchedPages, scan_truncated: true } : {}),
+        note: "結果是議事錄頁面文字命中，不代表發言者歸屬。",
+      }, complete ? undefined : "partial");
+    }
     const hits = [];
     for (const record of result.records) {
       for (const page of readPages(record)) {
@@ -560,7 +680,6 @@ const handlers = {
         });
       }
     }
-    const limit = boundedLimit(args.limit, 10, 50);
     const data = hits.slice(0, limit);
     const scanTruncated = result.local_match_count > result.records.length;
     const complete = result.release.coverage.complete && !scanTruncated && !unindexedRecords && hits.length === data.length;
@@ -640,33 +759,36 @@ const handlers = {
     const id = asString(args.proposal_sn);
     if (!id) localError("INVALID_ARGUMENT", "proposal_sn 不可為空");
     const result = await findProposalDetail(store, id);
-    const record = result.records[0];
+    const record = await hydrateIfV2(store, "kcc-proposal-details", result.records[0]);
     const detailUrl = await assertProposalDetailRecord(record, store);
     verifyDetailUrl(args.detail_url, detailUrl, record.source_url);
-    return envelope(result, { ...proposalWithEvidence(record, result.release), detail_url: detailUrl }, { query_proposal_sn: id });
+    return envelope({ ...result, records: [record] }, { ...proposalWithEvidence(record, result.release), detail_url: detailUrl }, { query_proposal_sn: id });
   },
 
   kcc_get_attachments: async (store, args) => {
     const id = asString(args.proposal_sn);
     if (!id) localError("INVALID_ARGUMENT", "proposal_sn 不可為空");
     let result;
-    if (await store.hasDataset("kcc-proposal-attachments")) {
+    if (await hasLocalDataset(store, "kcc-proposal-attachments")) {
       result = await search(store, "kcc-proposal-attachments", { limit: MAX_SCAN_ROWS, predicate: (record) => String(record.data.proposal_sn ?? record.data.parent_id ?? "") === id });
       if (!result.records.length) localError("LOCAL_DATA_UNAVAILABLE", `proposal_sn=${id} 未出現在本機附件 snapshot`);
-      const attachments = result.records.flatMap((record) => {
+      const records = [];
+      for (const record of result.records) records.push(await hydrateIfV2(store, "kcc-proposal-attachments", record));
+      const attachments = records.flatMap((record) => {
         const items = Array.isArray(record.data.attachments) ? record.data.attachments : [record.data];
         return validateKccAttachments(items, { id, data: { proposal_sn: id }, source_url: record.source_url });
       });
-      return envelope({ ...result, local_match_count: attachments.length }, { proposal_sn: id, attachments: attachments.map((item, index) => ({
+      return envelope({ ...result, records, local_match_count: attachments.length }, { proposal_sn: id, attachments: attachments.map((item, index) => ({
         ...item,
-        local_provenance: recordWithEvidence(result.records[Math.min(index, result.records.length - 1)], result.release).local_provenance,
+        local_provenance: recordWithEvidence(records[Math.min(index, records.length - 1)], result.release).local_provenance,
       })) }, { local_match_count: attachments.length });
     }
     const proposal = await findProposalDetail(store, id);
-    const data = proposal.records[0].data;
+    const record = await hydrateIfV2(store, "kcc-proposal-details", proposal.records[0]);
+    const data = record.data;
     if (!Array.isArray(data.attachments)) localError("LOCAL_DATA_UNAVAILABLE", "本機 proposal snapshot 未包含附件清單");
-    const attachments = validateKccAttachments(data.attachments, proposal.records[0]);
-    return envelope(proposal, { proposal_sn: id, attachments }, { local_match_count: attachments.length });
+    const attachments = validateKccAttachments(data.attachments, record);
+    return envelope({ ...proposal, records: [record] }, { proposal_sn: id, attachments }, { local_match_count: attachments.length });
   },
 
   kcc_search_meeting_records: async (store, args) => {
@@ -713,7 +835,7 @@ const handlers = {
     const id = asString(args.proposal_sn);
     if (!id) localError("INVALID_ARGUMENT", "proposal_sn 不可為空");
     const result = await findProposalDetail(store, id);
-    const record = result.records[0];
+    const record = await hydrateIfV2(store, "kcc-proposal-details", result.records[0]);
     const detailUrl = await assertProposalDetailRecord(record, store);
     verifyDetailUrl(args.detail_url, detailUrl, record.source_url);
     const data = {
@@ -727,7 +849,7 @@ const handlers = {
       detail_url: detailUrl,
       local_provenance: recordWithEvidence(record, result.release).local_provenance,
     };
-    return envelope(result, data, { note: "只回傳來源明載欄位，不推導市府辦理或議會審議事實。" });
+    return envelope({ ...result, records: [record] }, data, { note: "只回傳來源明載欄位，不推導市府辦理或議會審議事實。" });
   },
 
   kcc_search_temporary_proposals: async (store, args) => {
@@ -757,8 +879,82 @@ const handlers = {
     if (!/^\d{1,20}$/.test(id)) localError("INVALID_ARGUMENT", "record_id 必須是數字識別碼");
     if (args.page !== undefined && (!Number.isInteger(args.page) || args.page < 1)) localError("INVALID_ARGUMENT", "page 必須是正整數");
     const keyword = asString(args.keyword);
-    const result = await search(store, "kcc-meeting-records", { limit: MAX_SCAN_ROWS, predicate: (record) => recordId(record) === id || record.id === id });
+    const result = await search(store, "kcc-meeting-records", {
+      limit: MAX_SCAN_ROWS,
+      predicate: (record) => recordId(record) === id || record.id === id,
+      pageSearch: {
+        keyword,
+        slots: ["data.pages"],
+        maxMatches: MAX_SCAN_ROWS,
+        snippetsPerPage: 1,
+        maxSnippets: MAX_SCAN_ROWS,
+        perRecordMax: 100,
+        snippetBefore: 60,
+        snippetAfter: 60,
+        normalizeWhitespace: true,
+      },
+    });
     if (!result.records.length) localError("LOCAL_DATA_UNAVAILABLE", `record_id=${id} 未出現在本機 snapshot`);
+    if (isV2Result(result)) {
+      if (result.records.length !== 1) localError("SOURCE_ID_MISMATCH", `record_id=${id} 在 v2 snapshot 中不是唯一記錄`);
+      const record = result.records[0];
+      const selected = selectedV2Pages(record);
+      let pages = selected.pages;
+      let legacyFullRecord = null;
+      if (!pages.length && Number.isInteger(Number(record.data.page)) && Number(record.data.page) > 0) {
+        legacyFullRecord = await hydrateIfV2(store, "kcc-meeting-records", record);
+        pages = readPages(legacyFullRecord).map((page) => ({ ...page, legacy_text: page.text }));
+        assertPageSequence(pages, legacyFullRecord.data.total_pages);
+      } else if (!pages.length && !noIndexedPagesAllowed(record)) {
+        localError("LOCAL_DATA_UNAVAILABLE", `議事錄 record ${record.id} 沒有頁面文字`);
+      }
+      if (!pages.length) localError("SOURCE_FULLTEXT_UNAVAILABLE", `此議事原件尚無可查詢文字層，請由議事索引取得原件：${record.source_url}`);
+      if (record.data.total_pages !== undefined && record.data.total_pages !== null && record.data.total_pages !== pages.length) {
+        localError("PARTIAL_SCAN", "本機議事錄文字層頁數與來源宣告不一致");
+      }
+      const pdfUrl = assertKccPdfUrl(record);
+      if (args.pdf_url) {
+        let requestedUrl;
+        try { requestedUrl = new URL(args.pdf_url, record.source_url).href; } catch { localError("SOURCE_ID_MISMATCH", "輸入PDF URL無效"); }
+        if (requestedUrl !== pdfUrl) localError("SOURCE_ID_MISMATCH", "輸入PDF URL與已驗證原件不一致");
+      }
+      const selectedPage = args.page ? pages.find((page) => (page.page_number ?? page.page) === args.page) : null;
+      if (args.page && !selectedPage) localError("LOCAL_DATA_UNAVAILABLE", `record_id=${id} 的本機文字層沒有第 ${args.page} 頁`);
+      const indexedMatches = legacyFullRecord
+        ? pages.filter((page) => keyword && page.legacy_text.includes(keyword)).map((page) => ({
+          page: page.page, match_count: page.legacy_text.split(keyword).length - 1, snippets: [snippet(page.legacy_text, keyword)],
+        }))
+        : assertV2PageSearchMatches(record, result.page_matches, selected.version_id, { limit: MAX_SCAN_ROWS });
+      const matches = indexedMatches.map((page) => ({ page: page.page, match_count: page.match_count, snippets: page.snippets.slice(0, 1) }));
+      const selectedPageText = selectedPage
+        ? (selectedPage.legacy_text ?? await readKccV2PageText(store, "kcc-meeting-records", record, selectedPage))
+        : undefined;
+      const unsearchablePages = legacyFullRecord
+        ? pages.filter((page) => !page.legacy_text.trim()).length
+        : Number(result.empty_text_page_count || 0);
+      const unindexedOriginals = (legacyFullRecord || record).data.fulltext_complete === false;
+      const data = {
+        record_id: id,
+        pdf_url: pdfUrl,
+        total_pages: pages.length,
+        from_cache: true,
+        keyword: keyword || undefined,
+        matched_pages_count: matches.length,
+        matches,
+        page_content: selectedPageText,
+        local_provenance: recordWithEvidence(record, result.release).local_provenance,
+      };
+      const omittedSnippets = matches.filter((page) => !page.snippets.length).length;
+      const omittedMatches = Math.max(0, Number(result.matched_pages_count || 0) - matches.length) + omittedSnippets;
+      const partial = unsearchablePages > 0 || unindexedOriginals || omittedMatches > 0 || result.page_search_complete === false;
+      return envelope(result, data, {
+        local_match_count: matches.length,
+        ocr_pending_pages: unsearchablePages,
+        unindexed_originals: unindexedOriginals,
+        ...(omittedMatches ? { omitted_local_matches: omittedMatches } : {}),
+        note: partial ? "部分原件或頁面缺少已索引文字；未命中不代表完整全文無相關內容。" : undefined,
+      }, partial ? "partial" : undefined);
+    }
     const pages = result.records.flatMap(readPages).sort((a, b) => a.page - b.page);
     if (!pages.length) localError("SOURCE_FULLTEXT_UNAVAILABLE", `此議事原件尚無可查詢文字層，請由議事索引取得原件：${result.records[0].source_url}`);
     const declaredTotals = new Set(result.records.map((record) => record.data.total_pages).filter((value) => value !== undefined));
@@ -796,12 +992,79 @@ const handlers = {
     const requested = args.limit_records === undefined ? 8 : Number(args.limit_records);
     if (!Number.isInteger(requested) || requested < 1) localError("INVALID_ARGUMENT", "limit_records 必須是正整數");
     const limitRecords = Math.min(requested, 15);
+    const v2 = typeof store.getDatasetVersion === "function" && await store.getDatasetVersion("kcc-meeting-records") === "v2";
     let oneRowPerRecord = true;
-    const result = await search(store, "kcc-meeting-records", { limit: MAX_SCAN_ROWS,
+    const result = await search(store, "kcc-meeting-records", { limit: v2 ? limitRecords : MAX_SCAN_ROWS,
       predicate: (record) => { oneRowPerRecord = oneRowPerRecord && record.id === recordId(record); return true; },
-      orderBy: { field: "date", descending: true } });
+      orderBy: { field: "date", descending: true },
+      pageSearch: {
+        keyword,
+        slots: ["data.pages"],
+        maxMatches: MAX_SCAN_ROWS,
+        snippetsPerPage: 1,
+        maxSnippets: MAX_SCAN_ROWS,
+        perRecordMax: 100,
+        snippetBefore: 60,
+        snippetAfter: 60,
+        normalizeWhitespace: true,
+      },
+    });
     if (result.local_match_count > result.records.length && (result.order_by?.scope !== "entire_verified_snapshot" || !oneRowPerRecord)) {
       localError("PARTIAL_SCAN", "無法確認全部議事錄的最新排序與單筆完整頁面");
+    }
+    if (isV2Result(result)) {
+      const selected = result.records.map((record) => ({
+        record,
+        pageSet: selectedV2Pages(record),
+        matches: [],
+      }));
+      const selectedById = new Map(selected.map((item) => [item.record.id, item]));
+      for (const pageMatch of result.page_matches || []) {
+        const item = selectedById.get(pageMatch.id);
+        if (!item) localError("SNAPSHOT_UNVERIFIED", `page search 回傳未選入的 record ${pageMatch.id}`);
+        item.matches.push(pageMatch);
+      }
+      for (const item of selected) {
+        item.matches = assertV2PageSearchMatches(item.record, item.matches, item.pageSet.version_id, { limit: MAX_SCAN_ROWS });
+      }
+      const unsearchablePages = Number(result.empty_text_page_count || 0);
+      const unindexedRecords = selected.filter(({ record, pageSet }) => !pageSet.pages.length || record.data.fulltext_complete === false).length;
+      const dataRecords = selected.filter(({ matches }) => matches.length).map(({ record, matches }) => ({
+        record_id: recordId(record),
+        meeting: record.data.meeting_name ?? record.data.meeting ?? record.title,
+        date: record.data.date ?? record.data.meeting_date ?? "",
+        pdf_url: assertKccPdfUrl(record),
+        from_cache: true,
+        matched_pages_count: matches.length,
+        matches,
+        local_provenance: recordWithEvidence(record, result.release).local_provenance,
+      }));
+      const totalGroups = result.local_match_count;
+      const truncated = totalGroups > selected.length;
+      const omittedSnippets = selected.reduce((count, item) => count + item.matches.filter((match) => !match.snippets.length).length, 0);
+      const status = result.release.coverage.complete && !truncated && !unsearchablePages && !unindexedRecords && !omittedSnippets && result.page_search_complete !== false
+        ? undefined : "partial";
+      return envelope({ ...result, local_match_count: dataRecords.length }, {
+        keyword,
+        scan_status: status === "partial" ? "partial" : "success",
+        attempted_records_count: selected.length,
+        succeeded_records_count: selected.length - selected.filter(({ pageSet }) => !pageSet.pages.length).length,
+        failed_records_count: selected.filter(({ pageSet }) => !pageSet.pages.length).length,
+        scanned_records_count: selected.length - selected.filter(({ pageSet }) => !pageSet.pages.length).length,
+        matched_records_count: dataRecords.length,
+        failures: selected.filter(({ pageSet }) => !pageSet.pages.length).map(({ record }) => ({
+          record_id: record.id,
+          reason_code: "SOURCE_FULLTEXT_UNAVAILABLE",
+        })),
+        records: dataRecords,
+      }, {
+        limit_records: limitRecords,
+        omitted_local_records: Math.max(0, totalGroups - selected.length),
+        ...(omittedSnippets ? { omitted_local_matches: omittedSnippets } : {}),
+        ocr_pending_pages: unsearchablePages,
+        unindexed_records: unindexedRecords,
+        note: unindexedRecords ? "部分官方原件尚未建立文字索引；未命中不代表全文無相關內容。" : result.release.coverage.complete ? undefined : "搜尋只涵蓋目前不完整的本機 snapshot。",
+      }, status);
     }
     const allGroups = new Map();
     for (const record of result.records) {
@@ -869,7 +1132,7 @@ async function proposalDataset(store) {
 }
 
 async function findProposalDetail(store, id) {
-  if (!await store.hasDataset("kcc-proposal-details")) {
+  if (!await hasLocalDataset(store, "kcc-proposal-details")) {
     localError("LOCAL_DATA_UNAVAILABLE", "本機尚無獨立擷取的議案 Detail.aspx snapshot");
   }
   const result = await search(store, "kcc-proposal-details", { limit: MAX_SCAN_ROWS, predicate: (record) => proposalId(record) === id });

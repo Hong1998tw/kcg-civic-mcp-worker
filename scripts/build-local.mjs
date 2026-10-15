@@ -31,7 +31,19 @@ export async function buildLocal(options = {}) {
     sourcemap: false,
     logLevel: "warning",
   });
-  return { outfile };
+  const registryFile = path.join(outdir, "registry.mjs");
+  await build({
+    entryPoints: [path.join(ROOT, "src/local/registry.mjs")],
+    outfile: registryFile,
+    bundle: true,
+    platform: "node",
+    target: "node24",
+    format: "esm",
+    packages: "external",
+    sourcemap: false,
+    logLevel: "warning",
+  });
+  return { outfile, registryFile };
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

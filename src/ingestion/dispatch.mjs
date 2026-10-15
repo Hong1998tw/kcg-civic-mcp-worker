@@ -1,5 +1,5 @@
 import { CollectorError, PROFILE_MANIFEST, parseCollectorArgs, runCollection } from './collector.mjs';
-import { KCC_PROFILE_MANIFEST, runKccCollection } from './kcc-collector.mjs';
+import { KCC_PROFILE_MANIFEST, runKccCollection, runKccEnrichmentV2 } from './kcc-collector.mjs';
 import { OFFICIAL_PROFILES, runOfficialCollection } from './official-collection.mjs';
 
 export const COLLECTION_PROFILES = Object.freeze({ ...PROFILE_MANIFEST, ...KCC_PROFILE_MANIFEST, ...OFFICIAL_PROFILES });
@@ -34,7 +34,10 @@ export async function runDispatchedCollection(options, dependencies = {}) {
   if (!options.run) return { profile, dataset: COLLECTION_DATASETS[profile], status: 'pending', dry_run: true, commit_state: 'not-started', continuation_required: false };
   let result;
   if (Object.hasOwn(KCC_PROFILE_MANIFEST, profile)) {
-    result = await runKccCollection({ profile, root, maxRequests: options.maxRequests ?? 25, maxDurationMs: 75000 }, dependencies);
+    const input = { profile, root, maxRequests: options.maxRequests ?? 25, maxDurationMs: 75000 };
+    result = ['kcc-proposal-details', 'kcc-meeting-records'].includes(profile)
+      ? await runKccEnrichmentV2(input, dependencies)
+      : await runKccCollection(input, dependencies);
   } else {
     result = await runOfficialCollection({ profile, root, maxRequests: options.maxRequests ?? 25, maxRecords: 50, maxPages: 100, resume: true, commit: true, downloadAttachments: true }, dependencies);
   }

@@ -72,6 +72,39 @@ export function verifyCollectorReceipt(result, profile, exitCode) {
   return true;
 }
 
+export async function readCollectorCommit(root, result, profile) {
+  const { LocalStore } = await import('../src/local/store.mjs');
+  const readback = new LocalStore(root, { readOnly: true });
+  try {
+    const version = await readback.getDatasetVersion(result.dataset);
+    const datasets = version === 'v2' && profile === 'kcc-proposal-details'
+      ? ['kcc-proposal-details', 'kcc-proposal-attachments'] : [result.dataset];
+    const releases = {};
+    for (const dataset of datasets) {
+      const receipt = dataset === result.dataset ? result.receipt : result.receipts?.[dataset];
+      if (!receipt || receipt.dataset !== dataset || !ID.test(receipt.manifest_sha256 || '') || receipt.record_count !== result.record_count) {
+        throw new Error('COMMIT_READBACK_MISMATCH');
+      }
+      const actualVersion = await readback.getDatasetVersion(dataset);
+      if (version === 'v2' && actualVersion !== 'v2') throw new Error('COMMIT_READBACK_MISMATCH');
+      const stored = actualVersion === 'v2'
+        ? await readback.queryV2(dataset, { limit: 0, metadataOnly: true })
+        : await readback.queryRecords(dataset, { limit: 0 });
+      if (stored.release.snapshot_id !== receipt.snapshot_id || stored.release.record_count !== receipt.record_count ||
+          stored.release.manifest_sha256 !== receipt.manifest_sha256) throw new Error('COMMIT_READBACK_MISMATCH');
+      releases[dataset] = stored.release;
+    }
+    return { release: releases[result.dataset], releases };
+  } finally { readback.close(); }
+}
+
+export function collectionAdvanced(previous, result) {
+  if (!previous?.collector || result.collector?.attempted > 0) return true;
+  const prior = previous.collector, next = result.collector;
+  return ['record_count', 'prepared_count'].some((key) => prior[key] !== next?.[key]) ||
+    ['committed_cursor', 'prepared_cursor', 'current_id', 'batch_records'].some((key) => prior.progress?.[key] !== next?.progress?.[key]);
+}
+
 export function runCollector(profile, root) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [path.join(here, 'local-collect.mjs'), '--profile', profile, '--root', root, '--run'], {
@@ -99,14 +132,8 @@ export function runCollector(profile, root) {
           const uncertain = ['unknown', 'partial', 'committed'].includes(result.commit_state) || result.needs_reconciliation === true;
           return resolve({ status: uncertain ? 'outcome_unknown' : 'failed', reason_code: uncertain ? 'COLLECTOR_RECONCILIATION_REQUIRED' : result.error_code || 'COLLECTOR_RECEIPT_INVALID', collector: result });
         }
-        const { LocalStore } = await import('../src/local/store.mjs');
-        const readback = new LocalStore(root, { readOnly: true });
-        try {
-          const stored = await readback.queryRecords(result.dataset, { limit: 1 });
-          if (stored.release.snapshot_id !== result.receipt.snapshot_id || stored.release.record_count !== result.record_count ||
-              stored.release.manifest_sha256 !== result.receipt.manifest_sha256) throw new Error('COMMIT_READBACK_MISMATCH');
-          resolve({ status: continuing ? 'running' : 'succeeded', collector: result, store_readback: stored.release });
-        } finally { readback.close(); }
+        const stored = await readCollectorCommit(root, result, profile);
+        resolve({ status: continuing ? 'running' : 'succeeded', collector: result, store_readback: stored.release, store_readbacks: stored.releases });
       } catch { resolve({ status: 'outcome_unknown', reason_code: 'COLLECTOR_RECONCILIATION_REQUIRED' }); }
     });
   });
@@ -166,7 +193,7 @@ async function processClaimed(queueRoot, dataRoot) {
       if (result.status === 'running') {
         let previous = null;
         try { previous = JSON.parse(regular(progressFile, 131072)); } catch (error) { if (error.code !== 'ENOENT') throw error; }
-        const stalled = (result.collector?.attempted ?? 0) === 0 && previous?.collector?.record_count === result.collector?.record_count;
+        const stalled = !collectionAdvanced(previous, result);
         const stallCount = stalled ? (previous.stall_count || 0) + 1 : 0;
         if (stallCount >= 3) {
           receipt.status = 'outcome_unknown'; receipt.reason_code = 'COLLECTION_STALLED_RECONCILE_CHECKPOINT';
