@@ -271,6 +271,47 @@ async function testRegistryAndSchemas(bundle, root) {
   assert.equal(proposals.data.proposals[0].period, undefined);
   assert.equal(proposals.data.proposals[0].local_provenance.confirmed_query_scope.period, "07");
   assert.equal(proposals.meta.omitted_local_matches, 1);
+  assert.equal(proposals.data.offset, 0);
+  assert.equal(proposals.data.next_offset, 20);
+  assert.match(proposals.data.notice, /共 21 筆符合，本次回傳第 1–20 筆；續查請帶 offset=20。/);
+
+  const firstIds = proposals.data.proposals.map((item) => item.proposal_sn);
+  const secondPage = await tool("kcc_search_proposals").handler({ keyword: "TEST", offset: 20 });
+  assert.equal(secondPage.data.returned_count, 1);
+  assert.equal(secondPage.data.total_count, 21);
+  assert.equal(secondPage.data.next_offset, null);
+  assert.equal(secondPage.data.is_complete, false);
+  assert.equal(secondPage.meta.omitted_local_matches, 20);
+  assert.ok(!firstIds.includes(secondPage.data.proposals[0].proposal_sn), "offset page must not repeat first-page records");
+  assert.match(secondPage.data.notice, /本次回傳第 21–21 筆。$/);
+
+  const smallPages = [];
+  for (let offset = 0; offset !== null;) {
+    const page = await tool("kcc_search_proposals").handler({ keyword: "TEST", limit: 8, offset });
+    assert.ok(page.data.returned_count <= 8);
+    smallPages.push(...page.data.proposals.map((item) => item.proposal_sn));
+    offset = page.data.next_offset;
+  }
+  assert.equal(smallPages.length, 21);
+  assert.equal(new Set(smallPages).size, 21);
+
+  const wide = await tool("kcc_search_proposals").handler({ keyword: "TEST", limit: 100 });
+  assert.equal(wide.data.returned_count, 21);
+  assert.equal(wide.data.next_offset, null);
+  const beyond = await tool("kcc_search_proposals").handler({ keyword: "TEST", offset: 50 });
+  assert.equal(beyond.data.returned_count, 0);
+  assert.match(beyond.data.notice, /offset=50 已超出結果範圍/);
+  await expectLocalError(tool("kcc_search_proposals").handler({ keyword: "TEST", limit: 101 }), "INVALID_ARGUMENT");
+  await expectLocalError(tool("kcc_search_proposals").handler({ keyword: "TEST", limit: 0 }), "INVALID_ARGUMENT");
+  await expectLocalError(tool("kcc_search_proposals").handler({ keyword: "TEST", offset: -1 }), "INVALID_ARGUMENT");
+  await expectLocalError(tool("kcc_search_proposals").handler({ keyword: "TEST", limit: 2.5 }), "INVALID_ARGUMENT");
+
+  const councilorPage = await tool("kcc_get_councilor_proposals").handler({ councilor: "TEST 議員", limit: 5, offset: 5 });
+  assert.equal(councilorPage.data.total_count, 21);
+  assert.equal(councilorPage.data.returned_count, 5);
+  assert.equal(councilorPage.data.offset, 5);
+  assert.equal(councilorPage.data.next_offset, 10);
+  assert.deepEqual(councilorPage.data.proposals.map((item) => item.proposal_sn), smallPages.slice(5, 10));
 
   await assert.rejects(tool("kcc_search_proposals").handler({ keyword: "TEST", ignored_filter: "x" }),
     (error) => errorCode(error) === "UNSUPPORTED_FILTER");
@@ -391,6 +432,14 @@ async function testHttp(root, buildDir, bundle) {
     assert.equal(toolResult.isError, undefined);
     assert.equal(toolResult.structuredContent.data.total_count, 21);
     assert.equal(toolResult.structuredContent.status, "partial");
+    for (const name of ["kcc_search_proposals", "kcc_get_councilor_proposals"]) {
+      const listedSchema = listed.tools.find((item) => item.name === name).inputSchema;
+      assert.deepEqual(Object.keys(listedSchema.properties).filter((key) => key === "limit" || key === "offset"), ["limit", "offset"]);
+    }
+    const pagedResult = await client.callTool({ name: "kcc_search_proposals", arguments: { keyword: "TEST", limit: 5, offset: 20 } });
+    assert.equal(pagedResult.isError, undefined);
+    assert.equal(pagedResult.structuredContent.data.returned_count, 1);
+    assert.equal(pagedResult.structuredContent.data.next_offset, null);
 
     const lawResult = await client.callTool({ name: "get_kcg_law_detail", arguments: { law_id: "LAW-TEST-1" } });
     assert.equal(lawResult.structuredContent.data.articles[0].content, "保障公共運輸資訊透明。");

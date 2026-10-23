@@ -750,9 +750,10 @@ const handlers = {
     addCouncilorFilter(filters, args.councilor);
     addFieldFilter(filters, "category", kccCategoryLabel(args.category), ["category"], "contains");
     const predicate = makePredicate(filters);
-    const result = await search(store, dataset, { keyword, limit: MAX_SCAN_ROWS, predicate });
+    const page = proposalPage(args);
+    const result = await search(store, dataset, { keyword, limit: page.limit, offset: page.offset, predicate });
     assertFiltersSupported(predicate);
-    return proposalResult(result, result.records, { keyword, councilor: asString(args.councilor) }, args.limit);
+    return proposalResult(result, { keyword, councilor: asString(args.councilor) }, page);
   },
 
   kcc_get_proposal: async (store, args) => {
@@ -826,9 +827,10 @@ const handlers = {
     addFieldFilter(filters, "session", args.session, ["session", "session_code"]);
     addFieldFilter(filters, "meeting", args.meeting, ["meeting", "meeting_code"]);
     const predicate = makePredicate(filters);
-    const result = await search(store, dataset, { limit: MAX_SCAN_ROWS, predicate });
+    const page = proposalPage(args);
+    const result = await search(store, dataset, { limit: page.limit, offset: page.offset, predicate });
     assertFiltersSupported(predicate);
-    return proposalResult(result, result.records, { councilor: name }, undefined);
+    return proposalResult(result, { councilor: name }, page);
   },
 
   kcc_get_proposal_result: async (store, args) => {
@@ -1140,23 +1142,42 @@ async function findProposalDetail(store, id) {
   return { ...result, records: result.records.slice(0, 1), local_match_count: result.local_match_count };
 }
 
-function proposalResult(result, matched, query, limitValue) {
-  const limit = boundedLimit(limitValue, 20, 100);
-  const selected = matched.slice(0, limit);
-    const proposals = selected.map((record) => proposalWithEvidence(record, result.release));
-  const localMatchCount = result.local_match_count;
-  const complete = result.release.coverage.complete && localMatchCount <= matched.length && proposals.length >= localMatchCount;
-  return envelope({ ...result, records: matched, local_match_count: localMatchCount }, {
+function proposalPage(args) {
+  return { limit: boundedLimit(args.limit, 20, 100), offset: args.offset ?? 0 };
+}
+
+function proposalNotice({ coverageComplete, total, offset, returned, nextOffset }) {
+  const parts = [];
+  if (!coverageComplete) parts.push("本機快照的來源覆蓋範圍尚未確認完整；total_count 只代表本機快照中的符合筆數。");
+  if (total > 0 && returned === 0) parts.push(`共 ${total} 筆符合，offset=${offset} 已超出結果範圍。`);
+  else if (total > 0 && (offset > 0 || nextOffset !== null)) {
+    parts.push(`共 ${total} 筆符合，本次回傳第 ${offset + 1}–${offset + returned} 筆${nextOffset === null ? "。" : `；續查請帶 offset=${nextOffset}。`}`);
+  }
+  return parts.length ? parts.join("") : null;
+}
+
+function proposalResult(result, query, { limit, offset }) {
+  const proposals = result.records.slice(0, limit).map((record) => proposalWithEvidence(record, result.release));
+  const total = result.local_match_count;
+  const coverageComplete = result.release.coverage.complete;
+  const end = offset + proposals.length;
+  const nextOffset = end < total ? end : null;
+  const complete = coverageComplete && offset === 0 && nextOffset === null;
+  return envelope({ ...result, local_match_count: total }, {
     returned_count: proposals.length,
-    total_count: localMatchCount,
+    total_count: total,
     is_complete: complete,
+    offset,
+    next_offset: nextOffset,
     official_url: sourceUrl(result, "https://cissearch.kcc.gov.tw/System/Proposal/Default.aspx"),
-    notice: complete ? null : "total_count 是本機符合筆數；來源官方總數或 coverage 尚未確認。",
+    notice: proposalNotice({ coverageComplete, total, offset, returned: proposals.length, nextOffset }),
     keyword: query.keyword ?? "",
     councilor: query.councilor ?? "",
     proposals,
   }, {
-    omitted_local_matches: Math.max(0, localMatchCount - proposals.length),
+    omitted_local_matches: Math.max(0, total - proposals.length),
+    offset,
+    next_offset: nextOffset,
     source_total_scope: result.release.coverage.scope,
   }, complete ? undefined : "partial");
 }
@@ -1185,25 +1206,54 @@ function snippet(text, keyword, padding = 60) {
   return text.slice(Math.max(0, index - padding), Math.min(text.length, index + keyword.length + padding)).replace(/\s+/g, " ").trim();
 }
 
+// Proposal listings page through the local snapshot; the legacy Worker schemas stay unchanged.
+const PROPOSAL_PAGING_TOOLS = new Set(["kcc_search_proposals", "kcc_get_councilor_proposals"]);
+const PROPOSAL_PAGING_INPUT = {
+  limit: { type: "integer", minimum: 1, maximum: 100, description: "選填，本次回傳筆數；預設 20，最多 100" },
+  offset: { type: "integer", minimum: 0, description: "選填，從第幾筆符合結果開始回傳（0 起算）；續查時帶入上次回傳的 next_offset" },
+};
+const PROPOSAL_PAGING_OUTPUT = {
+  offset: { type: "number", description: "本次回傳的起始位置（0 起算）" },
+  next_offset: { type: ["number", "null"], description: "下一頁的 offset；null 表示已無更多符合結果" },
+  notice: { type: ["string", "null"], description: "分頁或覆蓋範圍說明" },
+};
+
+function localInputSchema(tool) {
+  if (!PROPOSAL_PAGING_TOOLS.has(tool.name)) return tool.inputSchema;
+  return { ...tool.inputSchema, properties: { ...tool.inputSchema.properties, ...PROPOSAL_PAGING_INPUT } };
+}
+
+function localDescription(name) {
+  let description = "本機快照查詢；來源 URL、原始 SHA-256、擷取時間與 coverage 會隨結果提供。";
+  if (name === "kcc_search_speeches") description += "發言歸屬未驗證，工具會明確拒絕推論。";
+  if (PROPOSAL_PAGING_TOOLS.has(name)) {
+    description += "total_count 是本機快照中的符合總筆數；每次預設回傳 20 筆、最多 100 筆，next_offset 不為 null 時請帶 offset 續查，不可把 returned_count 當作總數。";
+  }
+  return description;
+}
+
 export function createLocalRegistry(store) {
   const missing = SOURCE_REGISTRY.filter((tool) => !handlers[tool.name]);
   if (missing.length) throw new Error(`Local registry missing handlers: ${missing.map((tool) => tool.name).join(", ")}`);
-  return SOURCE_REGISTRY.map((tool) => ({
-    name: tool.name,
-    description: `本機快照查詢；來源 URL、原始 SHA-256、擷取時間與 coverage 會隨結果提供。${tool.name === "kcc_search_speeches" ? "發言歸屬未驗證，工具會明確拒絕推論。" : ""}`,
-    inputSchema: tool.inputSchema,
-    outputSchema: localOutputSchema(tool.outputSchema, tool.name),
-    handler: async (args) => {
-      const validated = validateArgs(tool.inputSchema, args || {}, tool.name);
-      return await handlers[tool.name](store, validated);
-    },
-  }));
+  return SOURCE_REGISTRY.map((tool) => {
+    const inputSchema = localInputSchema(tool);
+    return {
+      name: tool.name,
+      description: localDescription(tool.name),
+      inputSchema,
+      outputSchema: localOutputSchema(tool.outputSchema, tool.name),
+      handler: async (args) => {
+        const validated = validateArgs(inputSchema, args || {}, tool.name);
+        return await handlers[tool.name](store, validated);
+      },
+    };
+  });
 }
 
 export const LOCAL_TOOL_NAMES = SOURCE_REGISTRY.map((tool) => tool.name);
 export const LOCAL_SOURCE_TOOL_SCHEMAS = SOURCE_REGISTRY.map((tool) => ({
   name: tool.name,
-  inputSchema: tool.inputSchema,
+  inputSchema: localInputSchema(tool),
   outputSchema: tool.outputSchema,
 }));
 
@@ -1213,5 +1263,6 @@ function localOutputSchema(source, name) {
     schema.properties.status.enum = ["success", "partial"];
   }
   if (name === "get_kcg_council_meetings") schema.properties.data.items.properties.pdf_url.type = ["string", "null"];
+  if (PROPOSAL_PAGING_TOOLS.has(name) && schema?.properties) Object.assign(schema.properties, structuredClone(PROPOSAL_PAGING_OUTPUT));
   return schema;
 }
