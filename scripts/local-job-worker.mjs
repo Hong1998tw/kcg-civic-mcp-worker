@@ -76,6 +76,13 @@ export function verifyCollectorReceipt(result, profile, exitCode) {
   return true;
 }
 
+export function collectorBlockedAfterConfirmedCommit(result, profile, exitCode) {
+  return exitCode === 2 && result?.status === 'blocked' && /^[A-Z][A-Z0-9_]{2,63}$/.test(result.error_code || '') &&
+    result.needs_reconciliation === false && result.checkpoint_status === 'persisted' &&
+    result.publication_status === 'confirmed' && (result.uncertain_datasets || []).length === 0 &&
+    verifyCollectorReceipt({ ...result, status: 'partial', failed: 0 }, profile, 0);
+}
+
 export async function readCollectorCommit(root, result, profile) {
   const { LocalStore } = await import('../src/local/store.mjs');
   const readback = new LocalStore(root, { readOnly: true });
@@ -202,6 +209,12 @@ export function runCollector(profile, root, {
             return resolve({ status: 'running', collector: result, store_readback: release, store_readbacks: { 'kcg-news': release } });
           }
           if (!result.receipt && result.commit_state === 'not-committed') return resolve({ status: 'running', collector: result });
+        }
+        if (collectorBlockedAfterConfirmedCommit(result, profile, code)) {
+          // The collector stopped on a named source problem after its earlier work was committed and
+          // confirmed; keep its own reason instead of reporting an unknown outcome.
+          const stored = await readCollectorCommit(root, result, profile);
+          return resolve({ status: 'blocked', reason_code: result.error_code, collector: result, store_readback: stored.release, store_readbacks: stored.releases });
         }
         if (!verifyCollectorReceipt(result, profile, code)) {
           const uncertain = ['unknown', 'partial', 'committed'].includes(result.commit_state) || result.needs_reconciliation === true;

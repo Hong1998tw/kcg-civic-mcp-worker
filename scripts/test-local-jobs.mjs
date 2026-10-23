@@ -125,6 +125,34 @@ try {
   await assert.rejects(() => readCollectorCommit(data, { ...publishedResult, receipts: {} }, 'kcc-proposal-details'), /COMMIT_READBACK_MISMATCH/);
   const changedReceipts = { ...v2Receipts, 'kcc-proposal-attachments': { ...v2Receipts['kcc-proposal-attachments'], manifest_sha256: 'f'.repeat(64) } };
   await assert.rejects(() => readCollectorCommit(data, { ...publishedResult, receipts: changedReceipts }, 'kcc-proposal-details'), /COMMIT_READBACK_MISMATCH/);
+
+  const blockedScript = path.join(root, 'blocked-collector-fixture.mjs');
+  const writeBlocked = (value, exitCode = 2) => fs.writeFileSync(blockedScript, `console.log(${JSON.stringify(JSON.stringify(value))});\nprocess.exitCode = ${exitCode};\n`);
+  const blockedResult = { ...publishedResult, profile: 'kcc-proposal-details', status: 'blocked', dry_run: false, basic_validation: 'passed',
+    error_code: 'HTTP_STATUS', error_message: '官方來源回應 HTTP 404。', commit_state: 'committed', checkpoint_status: 'persisted',
+    publication_status: 'confirmed', needs_reconciliation: false, uncertain_datasets: [], failed: 1, attempted: 2, succeeded: 1 };
+  writeBlocked(blockedResult);
+  const namedBlock = await runCollector('kcc-proposal-details', data, { collectorScript: blockedScript });
+  assert.equal(namedBlock.status, 'blocked', 'a confirmed commit followed by a named source stop keeps the named reason');
+  assert.equal(namedBlock.reason_code, 'HTTP_STATUS');
+  assert.equal(namedBlock.store_readback.snapshot_id, publishedResult.receipt.snapshot_id);
+  for (const [label, variant, exitCode] of [
+    ['reconciliation flagged', { ...blockedResult, needs_reconciliation: true }, 2],
+    ['publication unconfirmed', { ...blockedResult, publication_status: 'pending' }, 2],
+    ['checkpoint not persisted', { ...blockedResult, checkpoint_status: 'unknown' }, 2],
+    ['uncertain dataset', { ...blockedResult, uncertain_datasets: ['kcc-proposal-attachments'] }, 2],
+    ['readback mismatch', { ...blockedResult, receipts: changedReceipts }, 2],
+    ['unexpected exit code', blockedResult, 1],
+  ]) {
+    writeBlocked(variant, exitCode);
+    const unsure = await runCollector('kcc-proposal-details', data, { collectorScript: blockedScript });
+    assert.equal(unsure.status, 'outcome_unknown', `${label} still requires reconciliation`);
+    assert.equal(unsure.reason_code, 'COLLECTOR_RECONCILIATION_REQUIRED');
+  }
+  writeBlocked({ ...blockedResult, commit_state: 'not-committed', receipt: null, receipts: {} });
+  const nothingCommitted = await runCollector('kcc-proposal-details', data, { collectorScript: blockedScript });
+  assert.equal(nothingCommitted.status, 'failed', 'a stop before any commit stays a plain failure');
+  assert.equal(nothingCommitted.reason_code, 'HTTP_STATUS');
   const priorSegment = { collector: { attempted: 0, record_count: 1, prepared_count: 4, progress: { prepared_cursor: 4, committed_cursor: 1 } } };
   assert.equal(collectionAdvanced(priorSegment, { collector: { ...priorSegment.collector, prepared_count: 5 } }), true, 'unpublished preparation is forward progress');
   assert.equal(collectionAdvanced(priorSegment, structuredClone(priorSegment)), false);

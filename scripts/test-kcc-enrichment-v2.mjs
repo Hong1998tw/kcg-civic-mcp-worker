@@ -316,6 +316,88 @@ async function testDispatchedNativeCollectorResume(root) {
   } finally { readback.close(); }
 }
 
+async function seedProposalIndex(dataRoot, ids) {
+  const store = new LocalStore(dataRoot, { readOnly: false });
+  const raw = Buffer.from(`official proposal index ${ids.join(',')}`);
+  const rawSha = sha(raw);
+  await store.putRawObject({ sha256: rawSha, bytes_base64: raw.toString('base64') });
+  await store.importSnapshot({
+    dataset: 'kcc-proposals', snapshot_id: `index-${ids.join('-')}`,
+    records: ids.map((id) => ({ id, title: `提案${id}`, text: `提案${id}`, data: { proposal_sn: id, detail_url: `https://cissearch.kcc.gov.tw/System/Proposal/Detail.aspx?s=ENC${id}` }, source_url: 'https://cissearch.kcc.gov.tw/System/Proposal/Default.aspx', retrieved_at: '2026-10-15T00:00:00.000Z', raw_sha256: rawSha })),
+    coverage: { scope: 'missing-attachment-fixture', complete: true, source_total: ids.length }, raw_objects: [], parser_version: 'fixture', validator_version: 'fixture', validation_status: 'passed',
+  });
+  store.close();
+}
+
+function detailHtml(id) {
+  return `<input name="ctl00$ContentPlaceHolder1$uscAttachment$hidDataSN" value="${id}"><input name="ctl00$ContentPlaceHolder1$uscAttachment$hidDataType" value="1"><tr><td>案由</td><td>提案${id}標題</td></tr>`;
+}
+
+function attachmentListHtml(id, name) {
+  return `共 1 個檔案<table><tr><th>序號</th><th>說明</th><th>名稱</th><th>大小</th></tr><tr><td>1</td><td>${name}</td><td><a href="/Upload/Attachment/Proposal/${id}/file-${id}" download="${name}">${name}</a></td><td>10 KB</td></tr></table>`;
+}
+
+async function testOfficialMissingAttachment(root) {
+  const dataRoot = path.join(root, 'official-missing-attachment');
+  await seedProposalIndex(dataRoot, ['104918', '104919']);
+  const html = { headers: { 'content-type': 'text/html;charset=utf-8' } };
+  const fetchImpl = async (requested) => {
+    const url = String(requested);
+    if (url.includes('Detail.aspx')) return new Response(detailHtml(new URL(url).searchParams.get('s').slice(3)), html);
+    if (url.includes('GetAttachmentList.ashx')) {
+      const id = new URL(url).searchParams.get('s');
+      return new Response(attachmentListHtml(id, id === '104918' ? '處分清冊' : '附件'), html);
+    }
+    if (url.endsWith('/file-104918')) return new Response('<html>not found</html>', { status: 404, headers: { 'content-type': 'text/html' } });
+    if (url.endsWith('/file-104919')) return new Response(Buffer.from('%PDF-attachment'), { headers: { 'content-type': 'application/pdf' } });
+    throw new Error(`unexpected official request ${url}`);
+  };
+  const args = parseDispatchArgs(['--profile', 'kcc-proposal-details', '--root', dataRoot, '--run', '--max-requests', '20']);
+  const result = await runDispatchedCollection(args, { storeFactory: async (location) => new LocalStore(location, { readOnly: false }), fetchImpl });
+  assert.equal(result.status, 'complete');
+  assert.equal(result.error_code, null);
+  assert.equal(result.record_count, 2);
+  const readback = new LocalStore(dataRoot);
+  try {
+    const attachments = await readback.queryV2('kcc-proposal-attachments', { limit: 10, metadataOnly: true, includePageRefs: true });
+    const details = await readback.queryV2('kcc-proposal-details', { limit: 10, metadataOnly: true, includePageRefs: true });
+    const byId = async (dataset, result) => Object.fromEntries(await Promise.all(result.records.map(async (record) => [record.id, await hydrateKccV2Record(readback, dataset, record)])));
+    const attachmentRecords = await byId('kcc-proposal-attachments', attachments);
+    const detailRecords = await byId('kcc-proposal-details', details);
+    const missing = attachmentRecords['104918'].data;
+    assert.equal(missing.attachment_originals_complete, false);
+    assert.equal(missing.official_missing_attachments, 1);
+    assert.equal(missing.attachments[0].download_status, 'official_404');
+    assert.equal(missing.attachments[0].http_status, 404);
+    assert.equal(missing.attachments[0].raw_sha256, null);
+    assert.equal(typeof missing.attachments[0].checked_at, 'string');
+    assert.equal(detailRecords['104918'].data.attachment_originals_complete, false);
+    const present = attachmentRecords['104919'].data;
+    assert.equal(present.attachment_originals_complete, true);
+    assert.equal(Object.hasOwn(present, 'official_missing_attachments'), false);
+    assert.equal(present.attachments[0].raw_sha256, sha(Buffer.from('%PDF-attachment')));
+    assert.equal(Object.hasOwn(present.attachments[0], 'download_status'), false);
+    assert.equal(Object.hasOwn(detailRecords['104919'].data, 'attachment_originals_complete'), false);
+  } finally { readback.close(); }
+
+  for (const [label, failing] of [['detail-404', 'Detail.aspx'], ['list-404', 'GetAttachmentList.ashx'], ['attachment-500', '/file-']]) {
+    const blockedRoot = path.join(root, `official-${label}`);
+    await seedProposalIndex(blockedRoot, ['200']);
+    const blockedFetch = async (requested) => {
+      const url = String(requested);
+      if (url.includes(failing)) return new Response('error', { status: label.endsWith('500') ? 500 : 404, headers: { 'content-type': 'text/html' } });
+      if (url.includes('Detail.aspx')) return new Response(detailHtml('200'), html);
+      if (url.includes('GetAttachmentList.ashx')) return new Response(attachmentListHtml('200', '附件'), html);
+      return new Response(Buffer.from('%PDF-attachment'), { headers: { 'content-type': 'application/pdf' } });
+    };
+    const blockedArgs = parseDispatchArgs(['--profile', 'kcc-proposal-details', '--root', blockedRoot, '--run', '--max-requests', '20']);
+    const blocked = await runDispatchedCollection(blockedArgs, { storeFactory: async (location) => new LocalStore(location, { readOnly: false }), fetchImpl: blockedFetch });
+    assert.equal(blocked.status, 'blocked', `${label} must stop the collection`);
+    assert.equal(blocked.error_code, 'HTTP_STATUS');
+    assert.equal(blocked.record_count, 0);
+  }
+}
+
 function legacyReceipt(dataset) {
   return { status: 'imported', dataset, snapshot_id: `legacy-${dataset}`, record_count: 1, manifest_sha256: sha(`legacy-${dataset}-manifest`) };
 }
@@ -369,6 +451,7 @@ async function main() {
     await testResumedTerminalUnindexedBatch(path.join(root, 'resume-unindexed'));
     await testNativeLocalStoreAndCodec(root);
     await testDispatchedNativeCollectorResume(root);
+    await testOfficialMissingAttachment(root);
     const migrated = await runLegacyMigration(path.join(root, 'legacy-committed'), { cursor: 1, withWork: false });
     assert.equal(migrated.migration_receipts['kcc-proposal-details'].record_count, 1);
     const resumedWork = await runLegacyMigration(path.join(root, 'legacy-work'), { cursor: 0, withWork: true });

@@ -413,22 +413,32 @@ function contentIndexed(record) {
   return record.data.content_index_status === 'indexed' || (!record.data.content_index_status && record.data.text_layer_status === 'present' && Array.isArray(record.data.pages) && record.data.pages.length > 0);
 }
 const allContentIndexed = (state) => Object.values(state.records['kcc-meeting-records'] || {}).every(contentIndexed);
+// Non-PDF meeting originals are archived by container signature only; their text is not indexed.
+const NON_PDF_VALIDATION={doc:'cfbf-magic-8-v1',docx:'ooxml-zip-v1'};
+const nonPdfValidated=(version)=>Boolean(NON_PDF_VALIDATION[version.file_type])&&version.format_validation?.status==='passed'&&version.format_validation?.validation_version===NON_PDF_VALIDATION[version.file_type];
 function validateNonPdfOriginal(bytes,fileType,contentType='') {
   const head=bytes.subarray(0,1024).toString('utf8').replace(/^\uFEFF/,'').trimStart();
   if(/^text\/html/i.test(contentType)||/^(?:<!doctype\s+html|<html\b|<head\b|<body\b)/i.test(head))throw new CollectorError('ORIGINAL_SIGNATURE_INVALID','非PDF下載回應是HTML，不能當原件歸檔完成');
-  if(fileType!=='doc')throw new CollectorError('ORIGINAL_FORMAT_UNSUPPORTED',`尚未驗證議事錄${fileType||'unknown'}格式，raw已保留但不宣稱原件完整`);
-  if(bytes.length<8||bytes.subarray(0,8).toString('hex')!=='d0cf11e0a1b11ae1')throw new CollectorError('ORIGINAL_SIGNATURE_INVALID','DOC原件缺少完整8-byte CFBF檔頭');
-  return {status:'passed',validation_version:'cfbf-magic-8-v1',declared_file_type:'doc',detected_container:'CFBF'};
+  if(fileType==='doc'){
+    if(bytes.length<8||bytes.subarray(0,8).toString('hex')!=='d0cf11e0a1b11ae1')throw new CollectorError('ORIGINAL_SIGNATURE_INVALID','DOC原件缺少完整8-byte CFBF檔頭');
+    return {status:'passed',validation_version:NON_PDF_VALIDATION.doc,declared_file_type:'doc',detected_container:'CFBF'};
+  }
+  if(fileType==='docx'){
+    if(bytes.length<30||bytes.subarray(0,4).toString('hex')!=='504b0304')throw new CollectorError('ORIGINAL_SIGNATURE_INVALID','DOCX原件缺少ZIP本地檔頭');
+    if(bytes.indexOf('[Content_Types].xml')<0||bytes.indexOf('word/document.xml')<0)throw new CollectorError('ORIGINAL_SIGNATURE_INVALID','DOCX原件缺少OOXML必要成員');
+    return {status:'passed',validation_version:NON_PDF_VALIDATION.docx,declared_file_type:'docx',detected_container:'OOXML-ZIP'};
+  }
+  throw new CollectorError('ORIGINAL_FORMAT_UNSUPPORTED',`尚未驗證議事錄${fileType||'unknown'}格式，raw已保留但不宣稱原件完整`);
 }
 async function verifyStoredNonPdf(ctx,version) {
-  if(version.format_validation?.status==='passed'&&version.format_validation?.validation_version==='cfbf-magic-8-v1'&&version.file_type==='doc')return;
+  if(nonPdfValidated(version))return;
   const bytes=typeof ctx.store.readRawObject==='function'?await ctx.store.readRawObject(version.raw_sha256):await readFile(path.join(ctx.rawDirectory,`${version.raw_sha256}.bin`));
   if(sha256Bytes(bytes)!==version.raw_sha256)throw new CollectorError('STAGING_COLLISION','既存非PDF原件hash不一致');
   version.format_validation=validateNonPdfOriginal(bytes,version.file_type);
 }
 async function collectPdfs(ctx) {
   const rows = await initializeEnrichment(ctx, 'kcc-meetings');
-  const legacyRecords=Object.values(ctx.state.records['kcc-meeting-records']||{}).filter((record)=>(record.data.original_versions||[]).some((version)=>!version.pdf_url&&(version.file_type!=='doc'||version.format_validation?.status!=='passed'||version.format_validation?.validation_version!=='cfbf-magic-8-v1')));
+  const legacyRecords=Object.values(ctx.state.records['kcc-meeting-records']||{}).filter((record)=>(record.data.original_versions||[]).some((version)=>!version.pdf_url&&!nonPdfValidated(version)));
   if(legacyRecords.length){
     const next=structuredClone(ctx.state);
     for(const record of legacyRecords)for(const version of next.records['kcc-meeting-records'][record.id].data.original_versions)if(!version.pdf_url)await verifyStoredNonPdf(ctx,version);
@@ -710,15 +720,29 @@ async function captureAndPrepareDetail(ctx, stage, row, cursor) {
   while (work.downloaded < work.attachments.length) {
     const attachment = work.attachments[work.downloaded];
     assertOriginalIdentity(attachment.download_url, attachment.download_url, 'Proposal', id);
-    const response = await capture(ctx, attachment.download_url, { maxBytes: 64 * 1024 * 1024, headers: { Referer: work.detail.source_url } });
+    let response;
+    try {
+      response = await capture(ctx, attachment.download_url, { maxBytes: 64 * 1024 * 1024, headers: { Referer: work.detail.source_url } });
+    } catch (error) {
+      // An attachment the official list names but the site answers 404 for is recorded as missing at
+      // the source; the proposal is then marked incomplete instead of blocking every later proposal.
+      if (!(error instanceof CollectorError && error.code === 'HTTP_STATUS' && error.httpStatus === 404)) throw error;
+      Object.assign(attachment, { download_status: 'official_404', http_status: 404, checked_at: new Date(ctx.now()).toISOString(), raw_sha256: null });
+      work.downloaded += 1;
+      await stage.saveWork(id, work);
+      continue;
+    }
     assertOriginalIdentity(attachment.download_url, response.url, 'Proposal', id);
     if (!response.bytes.length || /^text\/html/i.test(response.headers?.get?.('content-type') || '')) throw new CollectorError('ATTACHMENT_CONTENT_INVALID', '附件回應不是有效原件');
     Object.assign(attachment, { raw_sha256: response.sha256, byte_length: response.bytes.length, retrieved_at: response.retrieved_at, source_url: response.url });
     work.downloaded += 1; work.estimated_bytes += response.bytes.length;
     await stage.saveWork(id, work);
   }
+  const missing = work.attachments.filter((item) => item.download_status === 'official_404').length;
   const detail = structuredClone(work.detail); detail.data.attachments = work.attachments; detail.data.attachment_list_raw_sha256 = work.list.raw_sha256;
-  const attachmentRecord = { id, title: `${work.detail.title} 附件清單`, text: work.attachments.map((item) => item.name).join('\n') || '官方來源明示無附件', data: { proposal_sn: id, attachments: work.attachments, total_files: work.attachments.length, attachment_originals_complete: true }, ...work.list };
+  const missingFlags = missing ? { attachment_originals_complete: false, official_missing_attachments: missing } : {};
+  Object.assign(detail.data, missingFlags);
+  const attachmentRecord = { id, title: `${work.detail.title} 附件清單`, text: work.attachments.map((item) => item.name).join('\n') || '官方來源明示無附件', data: { proposal_sn: id, attachments: work.attachments, total_files: work.attachments.length, attachment_originals_complete: true, ...missingFlags }, ...work.list };
   const detailPacked = await packRecordV2(ctx, 'kcc-proposal-details', detail);
   const attachmentPacked = await packRecordV2(ctx, 'kcc-proposal-attachments', attachmentRecord);
   await stage.prepareRecord({ id, cursor, descriptors: [

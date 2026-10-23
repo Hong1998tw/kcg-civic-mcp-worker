@@ -48,10 +48,11 @@ const RETRYABLE_HTTP = new Set([408, 425, 429, 500, 502, 503, 504]);
 const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
 
 export class CollectorError extends Error {
-  constructor(code, message) {
+  constructor(code, message, { httpStatus } = {}) {
     super(message);
     this.name = "CollectorError";
     this.code = code;
+    if (httpStatus !== undefined) this.httpStatus = httpStatus;
   }
 }
 
@@ -216,7 +217,7 @@ export async function fetchBounded(inputUrl, options = {}, dependencies = {}) {
       continue;
     }
     if (!response.ok) {
-      throw new CollectorError("HTTP_STATUS", `官方來源回應 HTTP ${response.status}。`);
+      throw new CollectorError("HTTP_STATUS", `官方來源回應 HTTP ${response.status}。`, { httpStatus: response.status });
     }
     return {
       bytes,
