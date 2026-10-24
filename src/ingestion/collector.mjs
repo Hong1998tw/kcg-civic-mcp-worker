@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, mkdir, readFile, readdir, realpath, rename, writeFile } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, readdir, realpath, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { stripTypeScriptTypes } from "node:module";
 import { fileURLToPath } from "node:url";
@@ -48,11 +48,11 @@ const RETRYABLE_HTTP = new Set([408, 425, 429, 500, 502, 503, 504]);
 const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
 
 export class CollectorError extends Error {
-  constructor(code, message, { httpStatus } = {}) {
+  constructor(code, message, extra = {}) {
     super(message);
     this.name = "CollectorError";
     this.code = code;
-    if (httpStatus !== undefined) this.httpStatus = httpStatus;
+    Object.assign(this, extra);
   }
 }
 
@@ -95,12 +95,13 @@ export function validateOfficialUrl(value, allowedHosts) {
   return url;
 }
 
-async function readBoundedBody(response, maxBytes) {
+async function readBoundedBody(response, maxBytes, streamTo) {
   const declaredLength = Number(response.headers?.get?.("content-length") || "0");
   if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
     await response.body?.cancel?.().catch?.(() => {});
-    throw new CollectorError("BYTE_LIMIT", `回應超過 ${maxBytes} bytes 上限。`);
+    throw new CollectorError("BYTE_LIMIT", `回應超過 ${maxBytes} bytes 上限。`, { declaredBytes: declaredLength });
   }
+  if (streamTo) return await streamBoundedBody(response, maxBytes, streamTo);
   if (!response.body) return Buffer.alloc(0);
   const reader = response.body.getReader();
   const chunks = [];
@@ -121,6 +122,33 @@ async function readBoundedBody(response, maxBytes) {
     reader.releaseLock?.();
   }
   return Buffer.concat(chunks, total);
+}
+
+// Streams the body into a file while hashing it, so a large original never sits in memory.
+async function streamBoundedBody(response, maxBytes, streamTo) {
+  const file = await open(streamTo, "w", 0o600);
+  const hash = createHash("sha256");
+  const reader = response.body?.getReader?.();
+  let total = 0;
+  try {
+    while (reader) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = Buffer.from(value);
+      total += chunk.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => {});
+        throw new CollectorError("BYTE_LIMIT", `回應超過 ${maxBytes} bytes 上限。`, { streamedBytes: total });
+      }
+      hash.update(chunk);
+      await file.write(chunk);
+    }
+    await file.sync();
+  } finally {
+    reader?.releaseLock?.();
+    await file.close();
+  }
+  return { byte_length: total, sha256: hash.digest("hex") };
 }
 
 function retryDelayMs(attempt, response) {
@@ -206,7 +234,7 @@ export async function fetchBounded(inputUrl, options = {}, dependencies = {}) {
 
     let bytes;
     try {
-      bytes = await readBoundedBody(response, maxBytes);
+      bytes = await readBoundedBody(response, maxBytes, options.streamTo);
     } catch (error) {
       if (error instanceof CollectorError && error.code === "BYTE_LIMIT") throw error;
       throw new CollectorError("SOURCE_BODY_FAILED", "讀取官方回應失敗。 ");
@@ -220,7 +248,8 @@ export async function fetchBounded(inputUrl, options = {}, dependencies = {}) {
       throw new CollectorError("HTTP_STATUS", `官方來源回應 HTTP ${response.status}。`, { httpStatus: response.status });
     }
     return {
-      bytes,
+      bytes: options.streamTo ? undefined : bytes,
+      stream: options.streamTo ? bytes : undefined,
       status: response.status,
       headers: response.headers,
       url: validateOfficialUrl(response.url || currentUrl.toString(), allowedHosts).toString(),

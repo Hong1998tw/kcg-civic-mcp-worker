@@ -6,6 +6,7 @@ import path from 'node:path';
 import { KccEnrichmentStage, enrichmentBatchReady } from '../src/ingestion/kcc-enrichment-stage.mjs';
 import { runKccEnrichmentV2, publishKccEnrichmentV2Stage } from '../src/ingestion/kcc-collector.mjs';
 import { runDispatchedCollection, parseDispatchArgs } from '../src/ingestion/dispatch.mjs';
+import { fetchBounded } from '../src/ingestion/collector.mjs';
 import { LocalStore } from '../src/local/store.mjs';
 import { hydrateKccV2Record, packKccV2PdfPage, packKccV2Record } from '../src/local/kcc-payload.mjs';
 
@@ -339,26 +340,38 @@ function attachmentListHtml(id, name) {
 
 async function testOfficialMissingAttachment(root) {
   const dataRoot = path.join(root, 'official-missing-attachment');
-  await seedProposalIndex(dataRoot, ['104918', '104919']);
+  await seedProposalIndex(dataRoot, ['104918', '104919', '104920']);
   const html = { headers: { 'content-type': 'text/html;charset=utf-8' } };
+  // 3 MiB of varying bytes so the streamed path really writes multiple chunks.
+  const largeAttachment = Buffer.alloc(3 * 1024 * 1024);
+  for (let i = 0; i < largeAttachment.length; i += 1) largeAttachment[i] = (i * 31 + 7) & 0xff;
+  largeAttachment.write('%PDF-', 0);
   const fetchImpl = async (requested) => {
     const url = String(requested);
     if (url.includes('Detail.aspx')) return new Response(detailHtml(new URL(url).searchParams.get('s').slice(3)), html);
     if (url.includes('GetAttachmentList.ashx')) {
       const id = new URL(url).searchParams.get('s');
-      return new Response(attachmentListHtml(id, id === '104918' ? '處分清冊' : '附件'), html);
+      return new Response(attachmentListHtml(id, id === '104918' ? '處分清冊' : id === '104920' ? '超大附件' : '附件'), html);
     }
     if (url.endsWith('/file-104918')) return new Response('<html>not found</html>', { status: 404, headers: { 'content-type': 'text/html' } });
-    if (url.endsWith('/file-104919')) return new Response(Buffer.from('%PDF-attachment'), { headers: { 'content-type': 'application/pdf' } });
+    if (url.endsWith('/file-104919')) return new Response(largeAttachment, { headers: { 'content-type': 'application/pdf' } });
+    if (url.endsWith('/file-104920')) return new Response(Buffer.from('%PDF-'), { headers: { 'content-type': 'application/pdf', 'content-length': String(300 * 1024 * 1024) } });
     throw new Error(`unexpected official request ${url}`);
   };
   const args = parseDispatchArgs(['--profile', 'kcc-proposal-details', '--root', dataRoot, '--run', '--max-requests', '20']);
   const result = await runDispatchedCollection(args, { storeFactory: async (location) => new LocalStore(location, { readOnly: false }), fetchImpl });
   assert.equal(result.status, 'complete');
   assert.equal(result.error_code, null);
-  assert.equal(result.record_count, 2);
+  assert.equal(result.record_count, 3);
   const readback = new LocalStore(dataRoot);
   try {
+    const oversize = (await hydrateKccV2Record(readback, 'kcc-proposal-attachments', (await readback.queryV2('kcc-proposal-attachments', { limit: 10, metadataOnly: true, includePageRefs: true })).records.find((record) => record.id === '104920'))).data;
+    assert.equal(oversize.attachment_originals_complete, false);
+    assert.equal(oversize.official_missing_attachments, 1);
+    assert.equal(oversize.attachments[0].download_status, 'official_oversize');
+    assert.equal(oversize.attachments[0].declared_bytes, 300 * 1024 * 1024);
+    assert.equal(oversize.attachments[0].archive_limit_bytes, 256 * 1024 * 1024);
+    assert.equal(oversize.attachments[0].raw_sha256, null);
     const attachments = await readback.queryV2('kcc-proposal-attachments', { limit: 10, metadataOnly: true, includePageRefs: true });
     const details = await readback.queryV2('kcc-proposal-details', { limit: 10, metadataOnly: true, includePageRefs: true });
     const byId = async (dataset, result) => Object.fromEntries(await Promise.all(result.records.map(async (record) => [record.id, await hydrateKccV2Record(readback, dataset, record)])));
@@ -375,10 +388,19 @@ async function testOfficialMissingAttachment(root) {
     const present = attachmentRecords['104919'].data;
     assert.equal(present.attachment_originals_complete, true);
     assert.equal(Object.hasOwn(present, 'official_missing_attachments'), false);
-    assert.equal(present.attachments[0].raw_sha256, sha(Buffer.from('%PDF-attachment')));
+    assert.equal(present.attachments[0].raw_sha256, sha(largeAttachment));
+    assert.equal(present.attachments[0].byte_length, largeAttachment.length);
     assert.equal(Object.hasOwn(present.attachments[0], 'download_status'), false);
     assert.equal(Object.hasOwn(detailRecords['104919'].data, 'attachment_originals_complete'), false);
+    assert.ok((await readback.readRawObject(present.attachments[0].raw_sha256)).equals(largeAttachment), 'streamed attachment must be stored byte-for-byte in the raw store');
   } finally { readback.close(); }
+
+  // Streaming without a Content-Length header still enforces the limit while the body arrives.
+  const streamRoot = path.join(root, 'stream-limit');
+  await mkdir(streamRoot, { recursive: true });
+  const chunked = new ReadableStream({ start(controller) { for (let i = 0; i < 4; i += 1) controller.enqueue(new Uint8Array(8)); controller.close(); } });
+  await assert.rejects(() => fetchBounded('https://cissearch.kcc.gov.tw/Upload/Attachment/Proposal/1/x', { allowedHosts: ['cissearch.kcc.gov.tw'], maxBytes: 20, maxRetries: 0, streamTo: path.join(streamRoot, 'partial.tmp') }, { fetchImpl: async () => new Response(chunked), sleep: async () => {} }),
+    (error) => error.code === 'BYTE_LIMIT' && error.streamedBytes === 24);
 
   for (const [label, failing] of [['detail-404', 'Detail.aspx'], ['list-404', 'GetAttachmentList.ashx'], ['attachment-500', '/file-']]) {
     const blockedRoot = path.join(root, `official-${label}`);
@@ -396,6 +418,61 @@ async function testOfficialMissingAttachment(root) {
     assert.equal(blocked.error_code, 'HTTP_STATUS');
     assert.equal(blocked.record_count, 0);
   }
+}
+
+async function seedMeetingIndex(dataRoot, rows) {
+  const store = new LocalStore(dataRoot, { readOnly: false });
+  const raw = Buffer.from(`official meeting index ${rows.map((row) => row.id).join(',')}`);
+  const rawSha = sha(raw);
+  await store.putRawObject({ sha256: rawSha, bytes_base64: raw.toString('base64') });
+  await store.importSnapshot({
+    dataset: 'kcc-meetings', snapshot_id: `meetings-${rows.map((row) => row.id).join('-')}`,
+    records: rows.map((row) => ({ id: row.id, title: `會議${row.id}`, text: `會議${row.id}`, data: { record_id: row.id, pdf_url: row.pdf, pdf_urls: [row.pdf], original_files: [{ download_url: row.pdf, file_type: 'pdf' }] }, source_url: 'https://cissearch.kcc.gov.tw/System/meetingrecord/default.aspx', retrieved_at: '2026-10-15T00:00:00.000Z', raw_sha256: rawSha })),
+    coverage: { scope: 'missing-original-fixture', complete: true, source_total: rows.length }, raw_objects: [], parser_version: 'fixture', validator_version: 'fixture', validation_status: 'passed',
+  });
+  store.close();
+}
+
+async function testOfficialMissingMeetingOriginal(root) {
+  const dataRoot = path.join(root, 'official-missing-meeting-original');
+  const pdfUrl = (id) => `https://cissearch.kcc.gov.tw/Upload/Attachment/MeetingRecord/${id}/${id}.pdf`;
+  await seedMeetingIndex(dataRoot, [{ id: '9876', pdf: pdfUrl('9876') }, { id: '9878', pdf: pdfUrl('9878') }]);
+  const fetchImpl = async (requested) => {
+    const url = String(requested);
+    if (url.endsWith('/9876.pdf')) return new Response(Buffer.from('%PDF-meeting'), { headers: { 'content-type': 'application/pdf' } });
+    if (url.endsWith('/9878.pdf')) return new Response('<html>not found</html>', { status: 404, headers: { 'content-type': 'text/html' } });
+    throw new Error(`unexpected official request ${url}`);
+  };
+  const dependencies = { storeFactory: async (location) => new LocalStore(location, { readOnly: false }), fetchImpl, pdfExtractor: async () => ({ total_pages: 1, pages: [{ page: 1, text: '會議文字', has_text_layer: true }] }) };
+  const args = parseDispatchArgs(['--profile', 'kcc-meeting-records', '--root', dataRoot, '--run', '--max-requests', '20']);
+  const result = await runDispatchedCollection(args, dependencies);
+  assert.equal(result.error_code, null, `a 404 original must not block the collection: ${result.error_message}`);
+  assert.equal(result.record_count, 2);
+  assert.equal(result.fulltext_complete, false, 'a record whose original is missing keeps the dataset from being fulltext-complete');
+  assert.equal(result.coverage.complete, false);
+  const readback = new LocalStore(dataRoot);
+  try {
+    const listed = await readback.queryV2('kcc-meeting-records', { limit: 10, metadataOnly: true, includePageRefs: true });
+    const byId = Object.fromEntries(await Promise.all(listed.records.map(async (record) => [record.id, await hydrateKccV2Record(readback, 'kcc-meeting-records', record)])));
+    const missing = byId['9878'].data;
+    assert.equal(missing.originals_complete, false);
+    assert.equal(missing.official_missing_originals, 1);
+    assert.equal(missing.content_index_status, 'no_original_published');
+    assert.equal(missing.pdf_url, null);
+    assert.equal(missing.original_versions[0].download_status, 'official_404');
+    assert.equal(missing.original_versions[0].raw_sha256, null);
+    const present = byId['9876'].data;
+    assert.equal(present.originals_complete, true);
+    assert.equal(Object.hasOwn(present, 'official_missing_originals'), false);
+    assert.equal(present.content_index_status, 'indexed');
+  } finally { readback.close(); }
+
+  const blockedRoot = path.join(root, 'official-meeting-500');
+  await seedMeetingIndex(blockedRoot, [{ id: '9876', pdf: pdfUrl('9876') }]);
+  const blocked = await runDispatchedCollection(parseDispatchArgs(['--profile', 'kcc-meeting-records', '--root', blockedRoot, '--run', '--max-requests', '20']),
+    { ...dependencies, fetchImpl: async () => new Response('error', { status: 500, headers: { 'content-type': 'text/html' } }) });
+  assert.equal(blocked.status, 'blocked');
+  assert.equal(blocked.error_code, 'HTTP_STATUS');
 }
 
 function legacyReceipt(dataset) {
@@ -452,6 +529,7 @@ async function main() {
     await testNativeLocalStoreAndCodec(root);
     await testDispatchedNativeCollectorResume(root);
     await testOfficialMissingAttachment(root);
+    await testOfficialMissingMeetingOriginal(root);
     const migrated = await runLegacyMigration(path.join(root, 'legacy-committed'), { cursor: 1, withWork: false });
     assert.equal(migrated.migration_receipts['kcc-proposal-details'].record_count, 1);
     const resumedWork = await runLegacyMigration(path.join(root, 'legacy-work'), { cursor: 0, withWork: true });

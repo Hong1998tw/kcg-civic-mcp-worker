@@ -80,7 +80,9 @@ export function collectorBlockedAfterConfirmedCommit(result, profile, exitCode) 
   return exitCode === 2 && result?.status === 'blocked' && /^[A-Z][A-Z0-9_]{2,63}$/.test(result.error_code || '') &&
     result.needs_reconciliation === false && result.checkpoint_status === 'persisted' &&
     result.publication_status === 'confirmed' && (result.uncertain_datasets || []).length === 0 &&
-    verifyCollectorReceipt({ ...result, status: 'partial', failed: 0 }, profile, 0);
+    // A blocked run reports basic_validation 'not-passed' for the run as a whole; the committed
+    // part is judged by its receipt and native readback instead.
+    verifyCollectorReceipt({ ...result, status: 'partial', failed: 0, basic_validation: 'passed' }, profile, 0);
 }
 
 export async function readCollectorCommit(root, result, profile) {

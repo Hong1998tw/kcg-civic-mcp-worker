@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { open, mkdir, readFile, link, unlink, rename } from "node:fs/promises";
-import { constants as fsConstants, lstatSync, mkdirSync as makeDirSync } from "node:fs";
+import { constants as fsConstants, createReadStream, lstatSync, mkdirSync as makeDirSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
 import { DerivedStore, MAX_DERIVED_OBJECT_BYTES } from "./derived-store.mjs";
@@ -50,6 +50,12 @@ export class LocalStoreError extends Error {
 
 function fail(code, message) {
   throw new LocalStoreError(code, message);
+}
+
+async function hashFile(file) {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(file)) hash.update(chunk);
+  return hash.digest("hex");
 }
 
 function sha256(bytes) {
@@ -687,6 +693,22 @@ export class LocalStore {
     return await this.#writeRawBytes(expectedHash.toLowerCase(), bytes);
   }
 
+  // Same guarantees as putRawObject, but the bytes come from a regular file and are hashed and
+  // copied as a stream, so large originals never have to fit in memory.
+  async putRawObjectFromFile({ sha256: expectedHash, path: sourcePath }) {
+    this.#assertWritable();
+    if (typeof expectedHash !== "string" || !SHA256_RE.test(expectedHash) || typeof sourcePath !== "string" || !sourcePath) {
+      fail("SNAPSHOT_UNVERIFIED", "raw object 欄位格式無效");
+    }
+    const info = lstatSync(sourcePath);
+    if (info.isSymbolicLink() || !info.isFile() || info.size < 1) fail("SNAPSHOT_UNVERIFIED", "raw object 來源檔案無效");
+    const hash = expectedHash.toLowerCase();
+    if (await hashFile(sourcePath) !== hash) fail("SNAPSHOT_UNVERIFIED", `raw object ${expectedHash} 的 SHA-256 不一致`);
+    return await this.#writeRaw(hash, async (file) => {
+      for await (const chunk of createReadStream(sourcePath)) await file.write(chunk);
+    });
+  }
+
   async readRawObject(hash, maxBytes = 32 * 1024 * 1024) {
     if (!SHA256_RE.test(hash) || !Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 32 * 1024 * 1024) {
       fail("SNAPSHOT_UNVERIFIED", "原始檔讀取參數無效");
@@ -700,6 +722,10 @@ export class LocalStore {
   }
 
   async #writeRawBytes(hash, bytes) {
+    return await this.#writeRaw(hash, async (file) => { await file.writeFile(bytes); });
+  }
+
+  async #writeRaw(hash, writeTemporary) {
     const destination = this.#rawPath(hash);
     assertExistingDirectoriesSync([
       this.root,
@@ -714,8 +740,7 @@ export class LocalStore {
     try {
       const info = lstatSync(destination);
       if (info.isSymbolicLink() || !info.isFile()) fail("SNAPSHOT_UNVERIFIED", `既有 raw object ${hash} 不是一般檔案`);
-      const existing = await readFile(destination);
-      if (sha256(existing) !== hash) fail("SNAPSHOT_UNVERIFIED", `既有 raw object ${hash} 內容遭竄改`);
+      if (await hashFile(destination) !== hash) fail("SNAPSHOT_UNVERIFIED", `既有 raw object ${hash} 內容遭竄改`);
       return { sha256: hash, stored: false };
     } catch (error) {
       if (error?.code !== "ENOENT") throw error;
@@ -723,7 +748,7 @@ export class LocalStore {
     const temporary = `${destination}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
     const file = await open(temporary, "wx", 0o600);
     try {
-      await file.writeFile(bytes);
+      await writeTemporary(file);
       await file.sync();
     } finally {
       await file.close();

@@ -128,7 +128,8 @@ try {
 
   const blockedScript = path.join(root, 'blocked-collector-fixture.mjs');
   const writeBlocked = (value, exitCode = 2) => fs.writeFileSync(blockedScript, `console.log(${JSON.stringify(JSON.stringify(value))});\nprocess.exitCode = ${exitCode};\n`);
-  const blockedResult = { ...publishedResult, profile: 'kcc-proposal-details', status: 'blocked', dry_run: false, basic_validation: 'passed',
+  // A blocked collector reports basic_validation 'not-passed' for the run, as the real receipts do.
+  const blockedResult = { ...publishedResult, profile: 'kcc-proposal-details', status: 'blocked', dry_run: false, basic_validation: 'not-passed',
     error_code: 'HTTP_STATUS', error_message: '官方來源回應 HTTP 404。', commit_state: 'committed', checkpoint_status: 'persisted',
     publication_status: 'confirmed', needs_reconciliation: false, uncertain_datasets: [], failed: 1, attempted: 2, succeeded: 1 };
   writeBlocked(blockedResult);
@@ -142,6 +143,7 @@ try {
     ['checkpoint not persisted', { ...blockedResult, checkpoint_status: 'unknown' }, 2],
     ['uncertain dataset', { ...blockedResult, uncertain_datasets: ['kcc-proposal-attachments'] }, 2],
     ['readback mismatch', { ...blockedResult, receipts: changedReceipts }, 2],
+    ['dry run', { ...blockedResult, dry_run: true }, 2],
     ['unexpected exit code', blockedResult, 1],
   ]) {
     writeBlocked(variant, exitCode);

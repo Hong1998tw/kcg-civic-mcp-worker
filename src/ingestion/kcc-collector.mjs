@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, readFile, writeFile, rename, lstat, unlink, realpath } from 'node:fs/promises';
+import { mkdir, readFile, writeFile, rename, lstat, link, unlink, realpath } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
 import path from 'node:path';
 import { CollectorError, fetchBounded, loadTypeScriptParser, sha256Bytes } from './collector.mjs';
 import { PROPOSAL_URL, MEETING_URL, KCC_HOST, PREFIX, MEETING_PREFIX, controls, optionsFor, assertQuery, parseProposalTabs, parseMeetingPage, parseDetail, parseAttachments, official } from './kcc-html.mjs';
@@ -144,6 +145,34 @@ async function capture(ctx, url, options = {}) {
   const cookieParts = result.headers?.getSetCookie?.() || [];
   for (const part of cookieParts) { const pair = part.split(';')[0], eq = pair.indexOf('='); if (eq > 0) ctx.cookies.set(pair.slice(0, eq), pair.slice(eq + 1)); }
   return { ...result, sha256: hash, retrieved_at: time, html: result.bytes.toString('utf8') };
+}
+const ATTACHMENT_MAX_BYTES = 256 * 1024 * 1024;
+const LARGE_CAPTURE_TIMEOUT_MS = 300000;
+async function hashFile(file) { const hash = createHash('sha256'); for await (const chunk of createReadStream(file)) hash.update(chunk); return hash.digest('hex'); }
+// Like capture(), but the body streams straight into the raw store; only one chunk is ever held in
+// memory, so official originals up to ATTACHMENT_MAX_BYTES can be archived.
+async function captureToStore(ctx, url, options = {}) {
+  if (ctx.requests >= ctx.config.maxRequests || ctx.now() - ctx.started >= ctx.config.maxDurationMs) throw pause();
+  const temporary = path.join(ctx.rawDirectory, `.stream-${randomUUID()}.tmp`);
+  try {
+    const result = await fetchBounded(url, { allowedHosts: [KCC_HOST], maxBytes: options.maxBytes || ATTACHMENT_MAX_BYTES, timeoutMs: LARGE_CAPTURE_TIMEOUT_MS, maxRetries: 0, maxRedirects: 2, streamTo: temporary, headers: { 'User-Agent': 'kcg-civic-local-collector/0.2 (public archival client; 1 request/second)', Accept: '*/*', ...(options.headers || {}) } }, {
+      fetchImpl: async (...args) => {
+        if (ctx.requests >= ctx.config.maxRequests || ctx.now() - ctx.started >= ctx.config.maxDurationMs) throw pause();
+        ctx.requests++; return ctx.fetchImpl(...args);
+      }, sleep: ctx.sleep, now: ctx.now, rateLimiter: ctx.rateLimiter,
+    });
+    const { sha256: hash, byte_length: byteLength } = result.stream;
+    const filename = path.join(ctx.rawDirectory, `${hash}.bin`);
+    try { await link(temporary, filename); }
+    catch (error) { if (error.code !== 'EEXIST') throw error; await plain(filename); if (await hashFile(filename) !== hash) throw new CollectorError('STAGING_COLLISION', 'raw原件hash不一致'); }
+    const time = new Date(ctx.now()).toISOString();
+    await atomicJson(path.join(ctx.captureDirectory, `${randomUUID()}.json`), { source_url: result.url, retrieved_at: time, sha256: hash, byte_length: byteLength, status: result.status });
+    if (typeof ctx.store.putRawObjectFromFile === 'function') await ctx.store.putRawObjectFromFile({ sha256: hash, path: filename });
+    else await ctx.store.putRawObject({ sha256: hash, bytes_base64: (await readFile(filename)).toString('base64') });
+    const cookieParts = result.headers?.getSetCookie?.() || [];
+    for (const part of cookieParts) { const pair = part.split(';')[0], eq = pair.indexOf('='); if (eq > 0) ctx.cookies.set(pair.slice(0, eq), pair.slice(eq + 1)); }
+    return { url: result.url, status: result.status, headers: result.headers, sha256: hash, retrieved_at: time, byte_length: byteLength };
+  } finally { await unlink(temporary).catch(() => {}); }
 }
 function postForm(html, query, target, tab, page, pageSize) {
   const form = controls(html);
@@ -722,23 +751,29 @@ async function captureAndPrepareDetail(ctx, stage, row, cursor) {
     assertOriginalIdentity(attachment.download_url, attachment.download_url, 'Proposal', id);
     let response;
     try {
-      response = await capture(ctx, attachment.download_url, { maxBytes: 64 * 1024 * 1024, headers: { Referer: work.detail.source_url } });
+      response = await captureToStore(ctx, attachment.download_url, { headers: { Referer: work.detail.source_url } });
     } catch (error) {
-      // An attachment the official list names but the site answers 404 for is recorded as missing at
-      // the source; the proposal is then marked incomplete instead of blocking every later proposal.
-      if (!(error instanceof CollectorError && error.code === 'HTTP_STATUS' && error.httpStatus === 404)) throw error;
-      Object.assign(attachment, { download_status: 'official_404', http_status: 404, checked_at: new Date(ctx.now()).toISOString(), raw_sha256: null });
+      // The official list sometimes names an attachment the site answers 404 for, or one larger than
+      // the archive limit. Both are recorded on the attachment and the proposal is marked incomplete,
+      // instead of blocking every later proposal.
+      const missing404 = error instanceof CollectorError && error.code === 'HTTP_STATUS' && error.httpStatus === 404;
+      const oversize = error instanceof CollectorError && error.code === 'BYTE_LIMIT';
+      if (!missing404 && !oversize) throw error;
+      const checkedAt = new Date(ctx.now()).toISOString();
+      Object.assign(attachment, missing404
+        ? { download_status: 'official_404', http_status: 404, checked_at: checkedAt, raw_sha256: null }
+        : { download_status: 'official_oversize', declared_bytes: error.declaredBytes ?? error.streamedBytes ?? null, archive_limit_bytes: ATTACHMENT_MAX_BYTES, checked_at: checkedAt, raw_sha256: null });
       work.downloaded += 1;
       await stage.saveWork(id, work);
       continue;
     }
     assertOriginalIdentity(attachment.download_url, response.url, 'Proposal', id);
-    if (!response.bytes.length || /^text\/html/i.test(response.headers?.get?.('content-type') || '')) throw new CollectorError('ATTACHMENT_CONTENT_INVALID', '附件回應不是有效原件');
-    Object.assign(attachment, { raw_sha256: response.sha256, byte_length: response.bytes.length, retrieved_at: response.retrieved_at, source_url: response.url });
-    work.downloaded += 1; work.estimated_bytes += response.bytes.length;
+    if (!response.byte_length || /^text\/html/i.test(response.headers?.get?.('content-type') || '')) throw new CollectorError('ATTACHMENT_CONTENT_INVALID', '附件回應不是有效原件');
+    Object.assign(attachment, { raw_sha256: response.sha256, byte_length: response.byte_length, retrieved_at: response.retrieved_at, source_url: response.url });
+    work.downloaded += 1; work.estimated_bytes += response.byte_length;
     await stage.saveWork(id, work);
   }
-  const missing = work.attachments.filter((item) => item.download_status === 'official_404').length;
+  const missing = work.attachments.filter((item) => typeof item.download_status === 'string' && item.download_status.startsWith('official_')).length;
   const detail = structuredClone(work.detail); detail.data.attachments = work.attachments; detail.data.attachment_list_raw_sha256 = work.list.raw_sha256;
   const missingFlags = missing ? { attachment_originals_complete: false, official_missing_attachments: missing } : {};
   Object.assign(detail.data, missingFlags);
@@ -794,7 +829,17 @@ async function captureAndPrepareMeeting(ctx, stage, row, cursor) {
     const url = official(file.download_url, MEETING_URL);
     if (work.versions.some((version) => (version.source_url || version.pdf_url) === url)) continue;
     assertOriginalIdentity(url, url, 'MeetingRecord', id);
-    const response = await capture(ctx, url, { maxBytes: 96 * 1024 * 1024 });
+    let response;
+    try {
+      response = await capture(ctx, url, { maxBytes: 96 * 1024 * 1024 });
+    } catch (error) {
+      // The index lists an original the site answers 404 for: record it as missing at the source and
+      // keep the meeting record, instead of blocking every later record.
+      if (!(error instanceof CollectorError && error.code === 'HTTP_STATUS' && error.httpStatus === 404)) throw error;
+      work.versions.push({ source_url: url, download_url: url, file_type: file.file_type, download_status: 'official_404', http_status: 404, checked_at: new Date(ctx.now()).toISOString(), raw_sha256: null, byte_length: 0, pages: [], extraction_status: 'official_missing', extraction_complete: true });
+      await stage.saveWork(id, work);
+      continue;
+    }
     assertOriginalIdentity(url, response.url, 'MeetingRecord', id);
     const isPdf = file.file_type === 'pdf';
     if (!isPdf) validateNonPdfOriginal(response.bytes, file.file_type, response.headers?.get?.('content-type') || '');
@@ -815,22 +860,24 @@ async function captureAndPrepareMeeting(ctx, stage, row, cursor) {
   }
   work.estimated_bytes = Buffer.byteLength(JSON.stringify(row.data), 'utf8') + work.versions.reduce((total, version) => total + (version.estimated_page_bytes || version.byte_length || 0), 0);
   delete stage.currentWork;
-  const pdfs = work.versions.filter((version) => version.pdf_url), selected = pdfs.at(-1), original = selected || work.versions.at(-1);
-  const unindexed = work.versions.filter((version) => !version.pdf_url || version.text_layer_status !== 'present').length;
-  const contentStatus = selected ? (unindexed ? 'partial_text_layer' : 'indexed') : work.versions.length ? 'unindexed_non_pdf' : 'no_original_published';
+  const present = work.versions.filter((version) => !version.download_status), missing = work.versions.length - present.length;
+  const pdfs = present.filter((version) => version.pdf_url), selected = pdfs.at(-1), original = selected || present.at(-1);
+  const unindexed = present.filter((version) => !version.pdf_url || version.text_layer_status !== 'present').length;
+  const contentStatus = selected ? (unindexed ? 'partial_text_layer' : 'indexed') : present.length ? 'unindexed_non_pdf' : 'no_original_published';
   const data = {
     ...row.data,
     ...(selected || {}),
     record_id: id, pdf_url: selected?.pdf_url || null,
     pages: selected?.pages || [], total_pages: selected?.total_pages ?? null,
     pdf_versions: pdfs, original_versions: work.versions,
-    originals_complete: true, pdf_originals_complete: true,
+    originals_complete: missing === 0, pdf_originals_complete: missing === 0,
+    ...(missing ? { official_missing_originals: missing } : {}),
     content_index_status: contentStatus, fulltext_complete: contentStatus === 'indexed',
     unindexed_original_count: unindexed, selected_version_policy: 'last-official-listed-pdf', speaker_attribution: 'not-inferred',
   };
   const record = {
     id, title: row.title,
-    text: selected ? '' : (work.versions.length ? '官方原件已保存；此列無已索引PDF文字，尚未處理非PDF文字。' : '官方索引列未發布原件，沒有可索引文字。'),
+    text: selected ? '' : (present.length ? '官方原件已保存；此列無已索引PDF文字，尚未處理非PDF文字。' : missing ? '官方索引列的原件連結回應 404，原件未取得，沒有可索引文字。' : '官方索引列未發布原件，沒有可索引文字。'),
     ...(selected ? { text_recipe: { kind: 'page-join', slot: 'data.pages', separator: '\n' } } : {}),
     data, source_url: original?.source_url || original?.pdf_url || row.source_url,
     retrieved_at: original?.retrieved_at || row.retrieved_at,
