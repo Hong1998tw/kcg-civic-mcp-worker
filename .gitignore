@@ -5,3 +5,6 @@ node_modules/
 .env.*
 .DS_Store
 dist/
+.local-build/
+.data-local/
+dist-local/

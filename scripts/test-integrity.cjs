@@ -89,8 +89,8 @@ async function rejectsCode(objects, code) {
   assert.deepEqual(parsePager("共 59 筆 1 / 6 頁 共 21 筆 共 4 筆 共 1 筆"), {
     total: null, page: 1, pages: 6, tabCounts: [59, 21, 4, 1],
   });
-  assert.equal(selectedControlValue(`<select name="ddlPeriod"><option selected="selected" value="07">第四屆</option></select>`, "ddlPeriod"), "07");
-  assert.equal(selectedControlValue(`<input value="不存在測試ZZZ" name="txtKeyword">`, "txtKeyword"), "不存在測試ZZZ");
+  assert.equal(selectedControlValue(`<select name="ctl00$ContentPlaceHolder1$uscPeriodSessionMeeting$ddlPeriod" id="ContentPlaceHolder1_uscPeriodSessionMeeting_ddlPeriod"><option selected="selected" value="07">第四屆</option></select>`, "ddlPeriod"), "07");
+  assert.equal(selectedControlValue(`<input value="不存在測試ZZZ" name="ctl00$ContentPlaceHolder1$txtKeyword" id="ContentPlaceHolder1_txtKeyword">`, "txtKeyword"), "不存在測試ZZZ");
 
   const mutationRows = parseProposalRows(`<table><tr>
     <td><input name="hidProposalSN" value="145223"></td><td>客決算案</td><td>民政</td>

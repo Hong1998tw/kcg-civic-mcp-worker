@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const EXPECTED_WRANGLER_VERSION = '4.129.0';
+const EXPECTED_WRANGLER_VERSION = '4.151.0';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, '..');
 const wranglerPackage = path.join(repoRoot, 'node_modules', 'wrangler', 'package.json');
