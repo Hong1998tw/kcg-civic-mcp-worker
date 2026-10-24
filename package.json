@@ -16,7 +16,7 @@
     "build:local": "node scripts/build-local.mjs",
     "start:local": "node scripts/build-local.mjs && node dist-local/server.mjs",
     "test:local": "node scripts/test-local.mjs",
-    "test:local-all": "npm run test:local && npm run test:local-readback && node scripts/test-local-collector.mjs && npm run test:kcc-ingestion && npm run test:official-ingestion && npm run test:local-oauth && npm run test:local-oauth-integration && npm run test:local-ingress && node scripts/test-local-jobs.mjs && npm run test:enrichment-v2 && npm run test:official-news-round && npm run test:kcc-readall && npm run test:capacity-identity",
+    "test:local-all": "npm run test:local && npm run test:local-readback && npm run test:local-concurrency && node scripts/test-local-collector.mjs && npm run test:kcc-ingestion && npm run test:official-ingestion && npm run test:local-oauth && npm run test:local-oauth-integration && npm run test:local-ingress && node scripts/test-local-jobs.mjs && npm run test:enrichment-v2 && npm run test:official-news-round && npm run test:kcc-readall && npm run test:capacity-identity",
     "test:kcc-filters": "node scripts/test-kcc-filter-controls.mjs",
     "test:kcc-ingestion": "node scripts/test-kcc-ingestion.mjs",
     "test:official-ingestion": "node scripts/test-official-ingestion.mjs",
@@ -27,7 +27,8 @@
     "test:enrichment-v2": "node scripts/test-local-v2-store.mjs && node scripts/test-kcc-payload-v2.mjs && node scripts/test-local-v2-registry.mjs && node scripts/test-kcc-enrichment-v2.mjs",
     "test:official-news-round": "node scripts/test-official-news-round.mjs",
     "test:kcc-readall": "node scripts/test-kcc-readall-fastpath.mjs",
-    "test:capacity-identity": "node scripts/test-capacity-process-identity.mjs"
+    "test:capacity-identity": "node scripts/test-capacity-process-identity.mjs",
+    "test:local-concurrency": "node scripts/test-local-concurrency.mjs"
   },
   "description": "Open-source MCP infrastructure providing structured, source-verifiable access to Kaohsiung municipal laws, budgets, council records, news, and public datasets.",
   "keywords": [

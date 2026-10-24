@@ -6,6 +6,12 @@ import path from "node:path";
 import { DerivedStore, MAX_DERIVED_OBJECT_BYTES } from "./derived-store.mjs";
 
 const DB_NAME = "index.sqlite";
+// The query runtime reads while the ingestion process rewrites a whole release. Under DELETE
+// journaling a writer that spills its page cache takes the EXCLUSIVE lock for the rest of its
+// transaction, which made queries fail with "database is locked" during every batch publish.
+// The writer therefore keeps dirty pages in memory (cache_spill=OFF), so readers only wait out
+// the commit itself, and both sides wait for locks instead of failing after 3 seconds.
+export const SQLITE_BUSY_TIMEOUT_MS = 30000;
 const MAX_RECORDS = 100_000;
 const MAX_RECORD_TEXT_BYTES = 16 * 1024 * 1024;
 const MAX_SNAPSHOT_BYTES = 256 * 1024 * 1024;
@@ -634,13 +640,14 @@ export class LocalStore {
       mkdirSync(this.root);
       if (pathEntryIsSymlink(this.dbPath)) fail("SNAPSHOT_UNVERIFIED", "index.sqlite 不可為 symlink");
       this.db = new DatabaseSync(this.dbPath);
-      this.db.exec("PRAGMA busy_timeout=3000");
+      this.db.exec(`PRAGMA busy_timeout=${SQLITE_BUSY_TIMEOUT_MS}; PRAGMA cache_spill=OFF`);
       this.db.exec(SCHEMA);
     } else {
       try {
         assertPlainDirectorySync(this.root, "本機資料根目錄");
         if (!isFile(this.dbPath)) fail("LOCAL_DATA_UNAVAILABLE", "本機資料庫尚未初始化");
         this.db = new DatabaseSync(this.dbPath, { readOnly: true });
+        this.db.exec(`PRAGMA busy_timeout=${SQLITE_BUSY_TIMEOUT_MS}`);
       } catch (error) {
         if (error instanceof LocalStoreError) throw error;
         fail("LOCAL_DATA_UNAVAILABLE", "無法以唯讀模式開啟本機資料庫");
@@ -1229,7 +1236,7 @@ export class LocalStore {
     if (!V2_DATASETS.has(dataset)) fail("FEATURE_UNAVAILABLE", `dataset=${dataset} 未啟用 local-snapshot-v2`);
     const reader = new DatabaseSync(this.dbPath, { readOnly: true });
     try {
-      reader.exec("PRAGMA busy_timeout=3000; BEGIN DEFERRED");
+      reader.exec(`PRAGMA busy_timeout=${SQLITE_BUSY_TIMEOUT_MS}; BEGIN DEFERRED`);
       this.#assertV2Schema(reader);
       return await this.#queryV2Snapshot(dataset, options, reader);
     } finally {
@@ -1665,7 +1672,7 @@ export class LocalStore {
     const reader = new DatabaseSync(this.dbPath, { readOnly: true });
     let source;
     try {
-      reader.exec("PRAGMA busy_timeout=3000; BEGIN DEFERRED");
+      reader.exec(`PRAGMA busy_timeout=${SQLITE_BUSY_TIMEOUT_MS}; BEGIN DEFERRED`);
       this.#assertV2Schema(reader);
       const release = reader.prepare("SELECT snapshot_id,manifest_sha256 FROM v2_releases WHERE dataset=?").get(dataset);
       if (!release || release.snapshot_id !== selectedRecord.snapshot_id || release.manifest_sha256 !== selectedRecord.manifest_sha256) {
@@ -1823,7 +1830,7 @@ export class LocalStore {
     if (!this.db) fail("LOCAL_DATA_UNAVAILABLE", "本機資料庫未開啟");
     const reader = new DatabaseSync(this.dbPath, { readOnly: true });
     try {
-      reader.exec("PRAGMA busy_timeout=3000; BEGIN DEFERRED");
+      reader.exec(`PRAGMA busy_timeout=${SQLITE_BUSY_TIMEOUT_MS}; BEGIN DEFERRED`);
       return await this.#queryRecordsSnapshot(dataset, options, reader);
     } finally {
       try { reader.exec("ROLLBACK"); } catch {}
@@ -1976,7 +1983,7 @@ export class LocalStore {
     }
     const reader = new DatabaseSync(this.dbPath, { readOnly: true });
     try {
-      reader.exec("PRAGMA busy_timeout=3000; BEGIN DEFERRED");
+      reader.exec(`PRAGMA busy_timeout=${SQLITE_BUSY_TIMEOUT_MS}; BEGIN DEFERRED`);
       const tables = new Set(reader.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((row) => row.name));
       if (V2_DATASETS.has(dataset) && tables.has("v2_releases") &&
           reader.prepare("SELECT 1 FROM v2_releases WHERE dataset=?").get(dataset)) return "v2";
