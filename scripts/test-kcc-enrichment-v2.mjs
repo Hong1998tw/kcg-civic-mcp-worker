@@ -420,6 +420,41 @@ async function testOfficialMissingAttachment(root) {
   }
 }
 
+async function testAttachmentListRedirectRetry(root) {
+  const listUrl = (id) => `https://cissearch.kcc.gov.tw/Common/GetAttachmentList.ashx?f=1&s=${id}&t=False`;
+  const html = { headers: { 'content-type': 'text/html;charset=utf-8' } };
+  const run = async (label, loopWithoutCookie) => {
+    const dataRoot = path.join(root, `list-redirect-${label}`);
+    await seedProposalIndex(dataRoot, ['110906']);
+    const listRequests = [];
+    const fetchImpl = async (requested, options = {}) => {
+      const url = String(requested);
+      if (url.includes('Detail.aspx')) return new Response(detailHtml('110906'), { headers: { 'content-type': 'text/html;charset=utf-8', 'set-cookie': 'ASP.NET_SessionId=stale; path=/' } });
+      if (url.includes('GetAttachmentList.ashx')) {
+        const cookie = new Headers(options.headers).get('cookie') || '';
+        listRequests.push(cookie);
+        if (cookie.includes('stale') || loopWithoutCookie) return new Response(null, { status: 302, headers: { location: listUrl('110906') } });
+        return new Response('共 0 個檔案，總大小 0 bytes', html);
+      }
+      throw new Error(`unexpected official request ${url}`);
+    };
+    const args = parseDispatchArgs(['--profile', 'kcc-proposal-details', '--root', dataRoot, '--run', '--max-requests', '20']);
+    const result = await runDispatchedCollection(args, { storeFactory: async (location) => new LocalStore(location, { readOnly: false }), fetchImpl });
+    return { result, listRequests };
+  };
+
+  const recovered = await run('stale-session', false);
+  assert.equal(recovered.result.status, 'complete', 'a redirect loop caused by the session cookie is retried without it');
+  assert.equal(recovered.result.record_count, 1);
+  assert.ok(recovered.listRequests[0].includes('stale'), 'the first list request carries the session cookie');
+  assert.equal(recovered.listRequests.at(-1), '', 'the retry goes out without any cookie');
+
+  const persistent = await run('persistent-loop', true);
+  assert.equal(persistent.result.status, 'blocked', 'a redirect loop that does not depend on the cookie still stops the run');
+  assert.equal(persistent.result.error_code, 'REDIRECT_LIMIT');
+  assert.equal(persistent.result.record_count, 0);
+}
+
 async function seedMeetingIndex(dataRoot, rows) {
   const store = new LocalStore(dataRoot, { readOnly: false });
   const raw = Buffer.from(`official meeting index ${rows.map((row) => row.id).join(',')}`);
@@ -530,6 +565,7 @@ async function main() {
     await testDispatchedNativeCollectorResume(root);
     await testOfficialMissingAttachment(root);
     await testOfficialMissingMeetingOriginal(root);
+    await testAttachmentListRedirectRetry(root);
     const migrated = await runLegacyMigration(path.join(root, 'legacy-committed'), { cursor: 1, withWork: false });
     assert.equal(migrated.migration_receipts['kcc-proposal-details'].record_count, 1);
     const resumedWork = await runLegacyMigration(path.join(root, 'legacy-work'), { cursor: 0, withWork: true });

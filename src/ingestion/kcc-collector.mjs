@@ -739,7 +739,17 @@ async function captureAndPrepareDetail(ctx, stage, row, cursor) {
   }
   if (work.attachments === null) {
     const url = `https://${KCC_HOST}/Common/GetAttachmentList.ashx?f=1&s=${id}&t=False`;
-    const response = await capture(ctx, url, { headers: { Referer: work.detail.source_url, 'X-Requested-With': 'XMLHttpRequest', Cookie: [...ctx.cookies].map(([key, value]) => `${key}=${value}`).join('; ') } });
+    const headers = { Referer: work.detail.source_url, 'X-Requested-With': 'XMLHttpRequest' };
+    let response;
+    try {
+      response = await capture(ctx, url, { headers: { ...headers, Cookie: [...ctx.cookies].map(([key, value]) => `${key}=${value}`).join('; ') } });
+    } catch (error) {
+      // The list endpoint has answered with a redirect loop for a stale session; the same URL
+      // without the session cookie answers normally, so retry once without it.
+      if (!(error instanceof CollectorError && error.code === 'REDIRECT_LIMIT')) throw error;
+      ctx.cookies.clear();
+      response = await capture(ctx, url, { headers });
+    }
     const actual = new URL(response.url);
     if (actual.pathname !== '/Common/GetAttachmentList.ashx' || actual.searchParams.get('s') !== id) throw new CollectorError('SOURCE_ID_MISMATCH', '附件清單來源不一致');
     work.attachments = parseAttachments(response.html, id); work.list = { source_url: response.url, raw_sha256: response.sha256, retrieved_at: response.retrieved_at };
