@@ -332,6 +332,40 @@ async function testNativeV2OnlyRouting(createLocalRegistry, temp) {
     assert.equal(attachmentOutput.data.attachments.length, 1);
     assert.equal(attachmentOutput.data.attachments[0].name, "TEST file");
     assert.equal(payloadReads, 1, "only a full attachment response hydrates its selected payload");
+
+    // Ingestion republishes the release after the tool selected the record but before it reads it.
+    const republished = { ...attachmentRecord, data: { ...attachmentRecord.data, attachments: [{ name: "TEST file v2", url: "https://cissearch.kcc.gov.tw/Download/Attachment/ABC123/file.pdf" }] } };
+    const packedRepublished = await packKccV2Record(store.derivedStore, { dataset: "kcc-proposal-attachments", record: republished });
+    let switched = false;
+    const queryV2 = store.queryV2.bind(store);
+    store.queryV2 = async (...args) => {
+      const selected = await queryV2(...args);
+      if (!switched && args[0] === "kcc-proposal-attachments") {
+        switched = true;
+        await store.importV2({
+          schema_version: "local-snapshot-v2", dataset: "kcc-proposal-attachments", snapshot_id: "TEST-native-attachments-v3",
+          coverage: { scope: "TEST attachment fixture", complete: true, source_total: 1 },
+          parser_version: "TEST", validator_version: "TEST", validation_status: "passed",
+          records: [packedRepublished.descriptor],
+        });
+      }
+      return selected;
+    };
+    // A record selected from one release must not be read once another release is active.
+    const stale = (await queryV2("kcc-proposal-attachments", { limit: 1, metadataOnly: true, includePageRefs: true })).records[0];
+    await store.importV2({
+      schema_version: "local-snapshot-v2", dataset: "kcc-proposal-attachments", snapshot_id: "TEST-native-attachments-v4",
+      coverage: { scope: "TEST attachment fixture", complete: true, source_total: 1 },
+      parser_version: "TEST", validator_version: "TEST", validation_status: "passed",
+      records: [packedAttachment.descriptor],
+    });
+    await assert.rejects(() => hydrateV2("kcc-proposal-attachments", stale),
+      (error) => error.reasonCode === "SNAPSHOT_UNVERIFIED" && error.releaseChanged === true);
+    switched = false;
+    const retried = await attachmentTool.handler({ proposal_sn: "ABC123" });
+    assert.equal(switched, true, "the release really changed between selection and hydration");
+    assert.equal(retried.data.attachments[0].name, "TEST file v2", "the tool answers from the newly published release");
+    assert.equal(retried.provenance.source_id, "TEST-native-attachments-v3");
   } finally {
     store.close();
   }

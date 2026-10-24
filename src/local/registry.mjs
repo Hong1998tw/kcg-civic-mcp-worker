@@ -1206,6 +1206,8 @@ function snippet(text, keyword, padding = 60) {
   return text.slice(Math.max(0, index - padding), Math.min(text.length, index + keyword.length + padding)).replace(/\s+/g, " ").trim();
 }
 
+const RELEASE_CHANGE_RETRIES = 2;
+
 // Proposal listings page through the local snapshot; the legacy Worker schemas stay unchanged.
 const PROPOSAL_PAGING_TOOLS = new Set(["kcc_search_proposals", "kcc_get_councilor_proposals"]);
 const PROPOSAL_PAGING_INPUT = {
@@ -1244,7 +1246,15 @@ export function createLocalRegistry(store) {
       outputSchema: localOutputSchema(tool.outputSchema, tool.name),
       handler: async (args) => {
         const validated = validateArgs(inputSchema, args || {}, tool.name);
-        return await handlers[tool.name](store, validated);
+        // A release can be republished between selecting records and reading them; redo the
+        // whole query on the new release rather than mixing two releases in one answer.
+        for (let attempt = 0; ; attempt += 1) {
+          try {
+            return await handlers[tool.name](store, validated);
+          } catch (error) {
+            if (!error?.releaseChanged || attempt >= RELEASE_CHANGE_RETRIES) throw error;
+          }
+        }
       },
     };
   });

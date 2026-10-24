@@ -1676,7 +1676,11 @@ export class LocalStore {
       this.#assertV2Schema(reader);
       const release = reader.prepare("SELECT snapshot_id,manifest_sha256 FROM v2_releases WHERE dataset=?").get(dataset);
       if (!release || release.snapshot_id !== selectedRecord.snapshot_id || release.manifest_sha256 !== selectedRecord.manifest_sha256) {
-        fail("SNAPSHOT_UNVERIFIED", "hydrateV2 selected record 已不屬於目前 v2 snapshot");
+        // Ingestion published a newer release between selecting and reading this record; callers
+        // may redo the whole query against the new release.
+        const error = new LocalStoreError("SNAPSHOT_UNVERIFIED", "hydrateV2 selected record 已不屬於目前 v2 snapshot");
+        error.releaseChanged = true;
+        throw error;
       }
       const current = reader.prepare("SELECT descriptor_json FROM v2_records WHERE dataset=? AND id=?").get(dataset, descriptor.id);
       if (!current || current.descriptor_json !== canonical(descriptor)) fail("SNAPSHOT_UNVERIFIED", "hydrateV2 descriptor 不屬於目前 release");
