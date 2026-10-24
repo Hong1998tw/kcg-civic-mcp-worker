@@ -633,6 +633,7 @@ export class LocalStore {
     this.readOnly = options.readOnly !== false;
     this.rawVerificationCache = new Map();
     this.v2RawVerificationCache = new Map();
+    this.releaseVerificationCache = new Map();
     this.dbPath = path.join(this.root, DB_NAME);
     if (!this.readOnly) {
       // The ingestion process is the only writer. DELETE journaling keeps the
@@ -782,6 +783,30 @@ export class LocalStore {
   #rawPath(hash) {
     if (!SHA256_RE.test(hash)) fail("SNAPSHOT_UNVERIFIED", "raw SHA-256 格式無效");
     return path.join(this.root, "raw", "sha256", hash.slice(0, 2), hash.toLowerCase());
+  }
+
+  // Verifying a release means hashing every row against its manifest, which grows with the
+  // dataset. A passed verification is remembered per release and per index.sqlite file state:
+  // any commit changes the file's size or timestamps, so the next query verifies in full again.
+  // The signature is taken while the reader holds its SHARED lock, so no commit can land between
+  // taking it and finishing the verification.
+  #databaseSignature() {
+    const info = lstatSync(this.dbPath, { bigint: true });
+    return [info.dev, info.ino, info.size, info.mtimeNs, info.ctimeNs].join(":");
+  }
+
+  #verifiedRelease(kind, dataset, releaseRow, signature) {
+    const entry = this.releaseVerificationCache.get(`${kind}:${dataset}`);
+    if (!entry || entry.signature !== signature || entry.snapshot_id !== releaseRow.snapshot_id ||
+        entry.manifest_sha256 !== releaseRow.manifest_sha256 || entry.record_count !== releaseRow.record_count) return null;
+    return entry;
+  }
+
+  #rememberVerifiedRelease(kind, dataset, releaseRow, signature, facts = {}) {
+    if (this.#databaseSignature() !== signature) return;
+    this.releaseVerificationCache.set(`${kind}:${dataset}`, {
+      signature, snapshot_id: releaseRow.snapshot_id, manifest_sha256: releaseRow.manifest_sha256, record_count: releaseRow.record_count, ...facts,
+    });
   }
 
   async #verifyRawObject(hash) {
@@ -1279,14 +1304,16 @@ export class LocalStore {
       validator_version: releaseRow.validator_version,
       validation_status: "passed",
     };
+    const signature = this.#databaseSignature();
+    const verified = this.#verifiedRelease("v2", dataset, releaseRow, signature);
     const manifestHash = createHash("sha256");
     manifestHash.update(canonical(releaseHeader));
     let verifiedRecordCount = 0;
     let verifiedBlockCount = 0;
-    let sourceUrl = "";
-    let latestRetrievedAt = "";
+    let sourceUrl = verified?.source_url ?? "";
+    let latestRetrievedAt = verified?.retrieved_at ?? "";
     let previousId = "";
-    const descriptors = reader.prepare("SELECT id,descriptor_json FROM v2_records WHERE dataset=? ORDER BY id COLLATE BINARY").iterate(dataset);
+    const descriptors = verified ? [] : reader.prepare("SELECT id,descriptor_json FROM v2_records WHERE dataset=? ORDER BY id COLLATE BINARY").iterate(dataset);
     for (const row of descriptors) {
       let descriptor;
       try { descriptor = normalizeV2Descriptor(JSON.parse(row.descriptor_json)); } catch (error) {
@@ -1304,14 +1331,17 @@ export class LocalStore {
       sourceUrl ||= mirror.record.source_url;
       if (!latestRetrievedAt || Date.parse(mirror.record.retrieved_at) > Date.parse(latestRetrievedAt)) latestRetrievedAt = mirror.record.retrieved_at;
     }
-    const countRows = (table) => reader.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE dataset=?`).get(dataset).count;
-    const actualBlockCount = countRows("v2_search_blocks");
-    if (verifiedRecordCount !== releaseRow.record_count ||
-        countRows("v2_envelopes") !== releaseRow.record_count ||
-        countRows("v2_search_manifests") !== releaseRow.record_count ||
-        actualBlockCount !== verifiedBlockCount ||
-        manifestHash.digest("hex") !== releaseRow.manifest_sha256) {
-      fail("SNAPSHOT_UNVERIFIED", `dataset=${dataset} v2 資料列或 manifest 不一致`);
+    if (!verified) {
+      const countRows = (table) => reader.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE dataset=?`).get(dataset).count;
+      const actualBlockCount = countRows("v2_search_blocks");
+      if (verifiedRecordCount !== releaseRow.record_count ||
+          countRows("v2_envelopes") !== releaseRow.record_count ||
+          countRows("v2_search_manifests") !== releaseRow.record_count ||
+          actualBlockCount !== verifiedBlockCount ||
+          manifestHash.digest("hex") !== releaseRow.manifest_sha256) {
+        fail("SNAPSHOT_UNVERIFIED", `dataset=${dataset} v2 資料列或 manifest 不一致`);
+      }
+      this.#rememberVerifiedRelease("v2", dataset, releaseRow, signature, { source_url: sourceUrl, retrieved_at: latestRetrievedAt });
     }
 
     // Filtering starts only after the complete descriptor manifest, every envelope,
@@ -1394,7 +1424,7 @@ export class LocalStore {
         schema_version: "local-snapshot-v2",
         dataset,
         snapshot_id: releaseRow.snapshot_id,
-        record_count: verifiedRecordCount,
+        record_count: verified ? releaseRow.record_count : verifiedRecordCount,
         coverage,
         manifest_sha256: releaseRow.manifest_sha256,
         parser_version: releaseRow.parser_version,
@@ -1878,6 +1908,8 @@ export class LocalStore {
     };
     const keyword = typeof options.keyword === "string" ? options.keyword.trim() : "";
     if (keyword.length > 200) fail("FILTER_NOT_CONFIRMED", "keyword 不可超過 200 字元");
+    const signature = this.#databaseSignature();
+    const verified = this.#verifiedRelease("v1", dataset, releaseRow, signature);
     const hash = createHash("sha256");
     hash.update(canonical({
       dataset,
@@ -1914,18 +1946,20 @@ export class LocalStore {
         retrieved_at: normalizeRetrievedAt(row.retrieved_at),
         raw_sha256: row.raw_sha256.toLowerCase(),
       };
-      hash.update("\n");
-      hash.update(canonical({
-        id: record.id,
-        title: record.title,
-        text: record.text,
-        json: record.data,
-        source_url: record.source_url,
-        retrieved_at: record.retrieved_at,
-        raw_sha256: record.raw_sha256,
-      }));
-      if (recordCount > 0) normalizedHash.update(",");
-      normalizedHash.update(canonical(record.data));
+      if (!verified) {
+        hash.update("\n");
+        hash.update(canonical({
+          id: record.id,
+          title: record.title,
+          text: record.text,
+          json: record.data,
+          source_url: record.source_url,
+          retrieved_at: record.retrieved_at,
+          raw_sha256: record.raw_sha256,
+        }));
+        if (recordCount > 0) normalizedHash.update(",");
+        normalizedHash.update(canonical(record.data));
+      }
       recordCount += 1;
       totalBytes += Buffer.byteLength(record.title) + Buffer.byteLength(record.text) + Buffer.byteLength(record.json);
       if (totalBytes > MAX_SNAPSHOT_BYTES) fail("SNAPSHOT_UNVERIFIED", "資料庫 snapshot 超過大小上限");
@@ -1943,13 +1977,14 @@ export class LocalStore {
       } else if (!order && localMatchCount >= offset && selected.length < limit) selected.push(record);
       localMatchCount += 1;
     }
-    normalizedHash.update("]");
-    assertNotRevoked(dataset, normalizedHash.digest("hex"));
-    const actualDigest = hash.digest("hex");
-    if (recordCount !== releaseRow.record_count || actualDigest !== releaseRow.manifest_sha256) {
-      fail("SNAPSHOT_UNVERIFIED", `dataset=${dataset} 資料列與 manifest 不一致`);
+    if (recordCount !== releaseRow.record_count) fail("SNAPSHOT_UNVERIFIED", `dataset=${dataset} 資料列與 manifest 不一致`);
+    if (!verified) {
+      normalizedHash.update("]");
+      assertNotRevoked(dataset, normalizedHash.digest("hex"));
+      if (hash.digest("hex") !== releaseRow.manifest_sha256) fail("SNAPSHOT_UNVERIFIED", `dataset=${dataset} 資料列與 manifest 不一致`);
     }
     if (recordCount === 0) fail("LOCAL_DATA_UNAVAILABLE", `dataset=${dataset} snapshot 沒有可查資料`);
+    if (!verified) this.#rememberVerifiedRelease("v1", dataset, releaseRow, signature);
     const outputRecords = order ? selected.slice(offset, offset + limit) : selected;
     const verifiedRaw = new Set();
     for (const record of outputRecords) {

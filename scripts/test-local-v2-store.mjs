@@ -253,9 +253,19 @@ async function main() {
     const restored = await writer.restoreSnapshotV2("kcc-meeting-records", "TEST-v2-1");
     assert.equal(restored.status, "imported");
 
+    // A long-lived reader that already verified this release must still notice a later tamper.
+    const cachedReader = new LocalStore(dataRoot, { readOnly: true });
+    const verifiedOnce = await cachedReader.queryV2("kcc-meeting-records", { keyword: "不存在" });
+    const servedFromCache = await cachedReader.queryV2("kcc-meeting-records", { keyword: "不存在" });
+    assert.equal(cachedReader.releaseVerificationCache.size, 1, "a passed v2 verification is remembered");
+    assert.deepEqual(servedFromCache.release, verifiedOnce.release, "a cached verification returns the same release facts");
+
     const db = new DatabaseSync(path.join(dataRoot, "index.sqlite"));
     db.prepare("UPDATE v2_search_blocks SET text=? WHERE dataset=? AND id=? AND block_index=0").run("TAMPERED", "kcc-meeting-records", "MEET-1");
     db.close();
+    try {
+      await expectStoreError(cachedReader.queryV2("kcc-meeting-records", { keyword: "不存在" }), "SNAPSHOT_UNVERIFIED");
+    } finally { cachedReader.close(); }
     const tamperedReader = new LocalStore(dataRoot, { readOnly: true });
     try {
       await expectStoreError(tamperedReader.queryV2("kcc-meeting-records", { keyword: "TAMPERED" }), "SNAPSHOT_UNVERIFIED");

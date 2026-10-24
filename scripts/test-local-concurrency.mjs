@@ -42,6 +42,47 @@ function lockedForImmediateReader(dbPath) {
   } finally { reader.close(); }
 }
 
+// A passed release verification is reused until index.sqlite changes, and any change, whether a
+// new publish or a tamper, forces a full verification again.
+async function testReleaseVerificationCache(root) {
+  const writer = new LocalStore(root, { readOnly: false });
+  const raw = Buffer.from('TEST cache proposal index');
+  const rawSha = sha(raw);
+  await writer.putRawObject({ sha256: rawSha, bytes_base64: raw.toString('base64') });
+  const records = Array.from({ length: 6000 }, (_, i) => ({ id: String(100000 + i), title: `提案${i}`, text: `提案內容 ${i} ${'道路'.repeat(20)}`, data: { proposal_sn: String(100000 + i), subject: `提案${i}` }, source_url: 'https://cissearch.kcc.gov.tw/System/Proposal/Default.aspx', retrieved_at: '2026-10-24T00:00:00.000Z', raw_sha256: rawSha }));
+  const snapshot = { dataset: 'kcc-proposals', snapshot_id: 'TEST-cache-v1', records, coverage: { scope: 'TEST', complete: true, source_total: records.length }, raw_objects: [], parser_version: 'TEST', validator_version: 'TEST', validation_status: 'passed' };
+  await writer.importSnapshot(snapshot);
+  writer.close();
+
+  const reader = new LocalStore(root, { readOnly: true });
+  try {
+    const time = async (fn) => { const start = process.hrtime.bigint(); const value = await fn(); return [value, Number(process.hrtime.bigint() - start) / 1e6]; };
+    const [first, firstMs] = await time(() => reader.queryRecords('kcc-proposals', { keyword: '提案5999', limit: 5 }));
+    const [second, secondMs] = await time(() => reader.queryRecords('kcc-proposals', { keyword: '提案5999', limit: 5 }));
+    assert.equal(reader.releaseVerificationCache.size, 1, 'a passed v1 verification is remembered');
+    assert.deepEqual(second.release, first.release);
+    assert.deepEqual(second.records.map((record) => record.id), first.records.map((record) => record.id));
+    assert.ok(secondMs < firstMs / 1.5, `a cached query skips the manifest hashing (first ${firstMs.toFixed(0)} ms, cached ${secondMs.toFixed(0)} ms)`);
+
+    // Tamper with one row through SQLite while the reader keeps its cache.
+    const db = new DatabaseSync(path.join(root, 'index.sqlite'));
+    db.prepare('UPDATE collections SET text=? WHERE dataset=? AND id=?').run('TAMPERED', 'kcc-proposals', '100001');
+    db.close();
+    await assert.rejects(() => reader.queryRecords('kcc-proposals', { keyword: '提案5999', limit: 5 }), (error) => error.reasonCode === 'SNAPSHOT_UNVERIFIED',
+      'a cached reader must re-verify after the database file changes');
+  } finally { reader.close(); }
+
+  // A new release replaces the cached one and is verified on its own.
+  const republisher = new LocalStore(root, { readOnly: false });
+  await republisher.importSnapshot({ ...snapshot, snapshot_id: 'TEST-cache-v2' });
+  republisher.close();
+  const fresh = new LocalStore(root, { readOnly: true });
+  try {
+    assert.equal((await fresh.queryRecords('kcc-proposals', { limit: 1 })).release.snapshot_id, 'TEST-cache-v2');
+    assert.equal((await fresh.queryRecords('kcc-proposals', { limit: 1 })).release.snapshot_id, 'TEST-cache-v2');
+  } finally { fresh.close(); }
+}
+
 async function main() {
   const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'kcg-concurrency-')));
   try {
@@ -75,7 +116,9 @@ async function main() {
     } finally { configured.close(); }
     const readOnly = new LocalStore(root, { readOnly: true });
     try { assert.equal(readOnly.db.prepare('PRAGMA busy_timeout').get().timeout, 30000); } finally { readOnly.close(); }
-    process.stdout.write('PASS local store readers keep reading committed releases while the writer rewrites a release\n');
+
+    await testReleaseVerificationCache(path.join(root, 'cache'));
+    process.stdout.write('PASS local store readers keep reading committed releases while the writer rewrites a release; verified releases are cached until index.sqlite changes\n');
   } finally {
     await rm(root, { recursive: true, force: true });
   }
