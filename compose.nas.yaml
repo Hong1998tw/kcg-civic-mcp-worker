@@ -1,0 +1,142 @@
+services:
+  jobs:
+    image: "${CIVIC_LOCAL_IMAGE:?Set CIVIC_LOCAL_IMAGE to an image built from Dockerfile.local}"
+    pull_policy: never
+    user: "1000:1000"
+    command: ["node", "/app/scripts/local-job-worker.mjs"]
+    environment:
+      KCG_JOB_ROOT: /jobs
+      KCG_DATA_ROOT: /data/kcg-civic
+      KCG_ENRICHMENT_ENABLED: "${CIVIC_ENRICHMENT_ENABLED:-false}"
+      TZ: Asia/Taipei
+    volumes:
+      - type: bind
+        source: "${CIVIC_DATA_DIR:?Set CIVIC_DATA_DIR to a NAS-native data directory}"
+        target: /data/kcg-civic
+        read_only: false
+      - type: bind
+        source: "${CIVIC_QUEUE_DIR:?Set CIVIC_QUEUE_DIR to a NAS-native queue directory}"
+        target: /jobs
+        read_only: false
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m,mode=1777
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 1024m
+    cpus: 1.5
+    pids_limit: 96
+    stop_grace_period: 1200s
+    restart: unless-stopped
+    healthcheck:
+      disable: true
+    networks:
+      - ingestion
+
+  query:
+    image: "${CIVIC_LOCAL_IMAGE:?Set CIVIC_LOCAL_IMAGE to an image built from Dockerfile.local}"
+    pull_policy: never
+    user: "1000:1000"
+    init: true
+    environment:
+      BIND_HOST: 0.0.0.0
+      PORT: "8787"
+      LOCAL_PRIVATE_BIND: "true"
+      LOCAL_ALLOWED_HOSTS: "query:8787,127.0.0.1:8787,${CIVIC_PUBLIC_HOST:?Set CIVIC_PUBLIC_HOST to the exact public hostname}"
+      KCG_CIVIC_DATA_DIR: /data/kcg-civic
+      MCP_ACCESS_KEY_FILE: /run/secrets/mcp_access_key
+      OAUTH_ISSUER_URL: "https://${CIVIC_PUBLIC_HOST:?Set CIVIC_PUBLIC_HOST to the exact public hostname}"
+      OAUTH_DATA_ROOT: /auth
+      OAUTH_OWNER_LOGIN_KEY_FILE: /run/secrets/oauth_owner_key
+      MCP_ALLOWED_ORIGINS: "https://${CIVIC_PUBLIC_HOST:?Set CIVIC_PUBLIC_HOST to the exact public hostname}"
+      PUBLIC_HOST: "${CIVIC_PUBLIC_HOST:?Set CIVIC_PUBLIC_HOST to the exact public hostname}"
+      TZ: Asia/Taipei
+    volumes:
+      - type: bind
+        source: "${CIVIC_DATA_DIR:?Set CIVIC_DATA_DIR to a NAS-native data directory}"
+        target: /data/kcg-civic
+        read_only: true
+      - type: bind
+        source: "${CIVIC_AUTH_DIR:?Set CIVIC_AUTH_DIR to a private NAS-native auth directory}"
+        target: /auth
+        read_only: false
+    secrets:
+      - mcp_access_key
+      - oauth_owner_key
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 384m
+    cpus: 0.75
+    pids_limit: 96
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - --input-type=module
+        - -e
+        - "import http from 'node:http';const r=http.get('http://127.0.0.1:8787/health',{headers:{host:process.env.PUBLIC_HOST}},s=>{s.resume();s.once('end',()=>process.exit(s.statusCode===200?0:1));});r.setTimeout(3000,()=>r.destroy());r.once('error',()=>process.exit(1));"
+      interval: 30s
+      timeout: 5s
+      start_period: 5s
+      retries: 3
+    networks:
+      - local_private
+
+  ingress:
+    image: "${CIVIC_LOCAL_IMAGE:?Set CIVIC_LOCAL_IMAGE to an image built from Dockerfile.local}"
+    pull_policy: never
+    profiles: ["tunnel"]
+    user: "1000:1000"
+    init: true
+    command: ["node", "/app/scripts/local-ingress.mjs"]
+    environment:
+      PUBLIC_HOST: "${CIVIC_PUBLIC_HOST:?Set CIVIC_PUBLIC_HOST to the exact public hostname}"
+      LOCAL_INGRESS_UPSTREAM: "http://query:8787"
+      LOCAL_INGRESS_PORT: "8788"
+      TZ: Asia/Taipei
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=8m,mode=1777
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+    cpus: 0.5
+    pids_limit: 64
+    restart: unless-stopped
+    depends_on:
+      query:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - --input-type=module
+        - -e
+        - "import http from 'node:http';const r=http.get('http://127.0.0.1:8788/health',{headers:{host:process.env.PUBLIC_HOST}},s=>{s.resume();s.once('end',()=>process.exit(s.statusCode===200?0:1));});r.setTimeout(3000,()=>r.destroy());r.once('error',()=>process.exit(1));"
+      interval: 30s
+      timeout: 5s
+      start_period: 5s
+      retries: 3
+    networks:
+      local_private: {}
+      tunnel_ingress:
+        aliases:
+          - kcg-civic-ingress
+
+secrets:
+  mcp_access_key:
+    file: "${CIVIC_MCP_ACCESS_KEY_FILE:?Set CIVIC_MCP_ACCESS_KEY_FILE to a private NAS-native secret file}"
+  oauth_owner_key:
+    file: "${CIVIC_OAUTH_OWNER_KEY_FILE:?Set CIVIC_OAUTH_OWNER_KEY_FILE to a private NAS-native secret file}"
+
+networks:
+  ingestion: {}
+  local_private:
+    internal: true
+  tunnel_ingress:
+    external: true
+    name: "${CIVIC_TUNNEL_NETWORK:?Set CIVIC_TUNNEL_NETWORK to the existing tunnel Docker network name}"

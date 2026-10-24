@@ -131,8 +131,10 @@ export function parseProposalRows(html: string): KccProposalSearchResult[] {
     if (!/^\d+$/.test(sn)) continue;
     const kindInput = row.match(/<input\b[^>]*name=["'][^"']*hidProposalKind[^"']*["'][^>]*>/i)?.[0] || "";
     const kind = attr(kindInput, "value") || null;
-    const detailMatch = row.match(/Detail\.aspx\?([^"'\s<>]+)/i);
-    const detailUrl = detailMatch ? decodeHtml(`Detail.aspx?${detailMatch[1]}`) : `Detail.aspx?s=${encodeURIComponent(sn)}`;
+    // onclick uses HTML-encoded apostrophes. Decode first so the closing
+    // &#39; cannot become part of the encrypted query parameter.
+    const detailMatch = decodeHtml(row).match(/Detail\.aspx\?([^"'\s<>]+)/i);
+    const detailUrl = detailMatch ? `Detail.aspx?${detailMatch[1]}` : `Detail.aspx?s=${encodeURIComponent(sn)}`;
     const rawCells: string[] = [];
     const cellRegex = /<td\b[^>]*>([\s\S]*?)<\/td>/gi;
     let cell: RegExpExecArray | null;
@@ -167,14 +169,41 @@ export function parsePager(html: string): { total: number | null; page: number |
 }
 
 export function selectedControlValue(html: string, suffix: string): string {
-  const select = html.match(new RegExp(`<select\\b[^>]*(?:name|id)=["'][^"']*${suffix}[^"']*["'][^>]*>([\\s\\S]*?)<\\/select>`, "i"))?.[1];
-  if (select) {
-    const selected = (select.match(/<option\b[^>]*>/gi) || []).find((option) => /\bselected\b/i.test(option)) || "";
-    return attr(selected, "value").trim();
+  const meetingControls = ["ddlPeriod", "ddlSession", "ddlMeeting"];
+  const queryControls = ["ddlCouncilor", "ddlCategory", "txtKeyword"];
+  if (![...meetingControls, ...queryControls].includes(suffix)) return "";
+  const nested = meetingControls.includes(suffix) ? "uscPeriodSessionMeeting" : "";
+  const expectedName = ["ctl00", "ContentPlaceHolder1", nested, suffix].filter(Boolean).join("$");
+  const expectedId = ["ContentPlaceHolder1", nested, suffix].filter(Boolean).join("_");
+  const controlAttr = (element: string, name: string): string | undefined => {
+    const match = element.match(new RegExp(`(?:^|\\s)${name}\\s*=\\s*(["'])(.*?)\\1`, "i"));
+    return match ? decodeHtml(match[2]) : undefined;
+  };
+  // The master page also contains txtKeyword. Only the proposal form's exact
+  // WebForms name/id can confirm a query; duplicate or conflicting controls fail closed.
+  const candidates = (html.match(/<(?:input|select)\b[^>]*>/gi) || []).filter((element) => {
+    const name = controlAttr(element, "name");
+    const id = controlAttr(element, "id");
+    if (name !== expectedName && id !== expectedId) return false;
+    if ((name !== undefined && name !== expectedName) || (id !== undefined && id !== expectedId)) {
+      throw new Error(`PARSER_CONTRACT_CHANGED: ${suffix} 控制項身分不一致`);
+    }
+    return true;
+  });
+  if (candidates.length > 1) throw new Error(`PARSER_CONTRACT_CHANGED: ${suffix} 控制項不唯一`);
+  const control = candidates[0];
+  if (!control) return "";
+  if (/^<select\b/i.test(control)) {
+    const start = html.indexOf(control) + control.length;
+    const closingOffset = html.slice(start).search(/<\/select\s*>/i);
+    if (closingOffset === -1) throw new Error(`PARSER_CONTRACT_CHANGED: ${suffix} 下拉選單未結束`);
+    const end = start + closingOffset;
+    const selected = (html.slice(start, end).match(/<option\b[^>]*>/gi) || [])
+      .filter((option) => /(?:^|\s)selected(?:\s|=|>)/i.test(option));
+    if (selected.length > 1) throw new Error(`PARSER_CONTRACT_CHANGED: ${suffix} 選取值不唯一`);
+    return controlAttr(selected[0] || "", "value")?.trim() || "";
   }
-  const input = (html.match(/<input\b[^>]*>/gi) || []).find((element) =>
-    new RegExp(`(?:name|id)=["'][^"']*${suffix}[^"']*["']`, "i").test(element)) || "";
-  return attr(input, "value").trim();
+  return controlAttr(control, "value")?.trim() || "";
 }
 
 export async function searchKccProposals(args: ProposalSearchArgs = {}): Promise<KccProposalSearchResponse> {

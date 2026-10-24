@@ -204,3 +204,13 @@ The source code and project documentation in this repository are licensed under 
 ## Disclaimer
 
 This is an independent civic-technology/open-source project. It is **not an official service of Kaohsiung City Government, Kaohsiung City Council, or any other government agency**. For legally authoritative or time-sensitive decisions, verify the underlying record with the responsible public institution and the canonical source linked by the tool.
+
+## NAS 在地化
+
+新增 Node.js 24 的唯讀本機 MCP、SQLite／原始檔與歷史快照、固定 profile 採集 CLI。建置及測試：`npm run build:local`、`npm run test:local-all`；官方表單條件回歸已納入 `npm test`。
+
+部署、來源範圍與正式切換 Gate 見 [NAS 設計](docs/nas-localization.md) 與 [在地採集](docs/local-ingestion.md)。`Dockerfile.local`／`compose.local.yaml` 是私網候選；21 個工具名稱不代表全部來源已遷移。正式主檔與接續定位見上述文件。
+
+常駐部署使用 `compose.nas.yaml`。n8n 以固定冪等鍵提交六類工作後，由 NAS 的單一 job worker 自主分段續作；聊天或 n8n 提交 execution 結束不會中斷已交接的工作。重按同一工作流可讀取原工作回執與進度。框架驗收、資料收錄 coverage 與全文索引完整性分開記錄。
+
+詳情與議事原件採 [v2 批次及原件儲存](docs/kcc-enrichment-v2.md)，容量測試見 [合成 fixture](docs/enrichment-v2-capacity-fixture.md)。官方新聞來源總數變動採[同工作索引回合](docs/official-ingestion.md)，以有界恢復保留舊原件及已發布快照；來源身分或完整性無法確認時保留明確失敗回執。
